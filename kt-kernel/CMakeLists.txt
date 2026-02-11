@@ -574,11 +574,41 @@ else()
 endif()
 
 include(FindPkgConfig)
-if(PKG_CONFIG_FOUND)
+if(WIN32 AND NOT PKG_CONFIG_FOUND)
+    # Auto-download pre-built hwloc on Windows when pkg-config is not available
+    set(HWLOC_VERSION "2.11.2")
+    set(HWLOC_ZIP "hwloc-win64-build-${HWLOC_VERSION}.zip")
+    set(HWLOC_URL "https://download.open-mpi.org/release/hwloc/v2.11/${HWLOC_ZIP}")
+    set(HWLOC_DIR "${CMAKE_BINARY_DIR}/_deps/hwloc")
+
+    if(NOT EXISTS "${HWLOC_DIR}/lib/libhwloc.lib")
+        message(STATUS "Downloading hwloc ${HWLOC_VERSION} for Windows...")
+        file(DOWNLOAD "${HWLOC_URL}" "${CMAKE_BINARY_DIR}/${HWLOC_ZIP}"
+             STATUS HWLOC_DL_STATUS SHOW_PROGRESS)
+        list(GET HWLOC_DL_STATUS 0 HWLOC_DL_RC)
+        if(NOT HWLOC_DL_RC EQUAL 0)
+            message(FATAL_ERROR "Failed to download hwloc: ${HWLOC_DL_STATUS}")
+        endif()
+        file(ARCHIVE_EXTRACT INPUT "${CMAKE_BINARY_DIR}/${HWLOC_ZIP}"
+             DESTINATION "${CMAKE_BINARY_DIR}/_deps")
+        file(RENAME "${CMAKE_BINARY_DIR}/_deps/hwloc-win64-build-${HWLOC_VERSION}" "${HWLOC_DIR}")
+        file(REMOVE "${CMAKE_BINARY_DIR}/${HWLOC_ZIP}")
+    endif()
+
+    add_library(PkgConfig::HWLOC SHARED IMPORTED)
+    set_target_properties(PkgConfig::HWLOC PROPERTIES
+        IMPORTED_IMPLIB "${HWLOC_DIR}/lib/libhwloc.lib"
+        IMPORTED_LOCATION "${HWLOC_DIR}/bin/libhwloc-15.dll"
+        INTERFACE_INCLUDE_DIRECTORIES "${HWLOC_DIR}/include"
+    )
+    # Copy DLL to output directory so it can be found at runtime
+    file(COPY "${HWLOC_DIR}/bin/libhwloc-15.dll" DESTINATION "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+    message(STATUS "Using auto-downloaded hwloc ${HWLOC_VERSION}")
+elseif(PKG_CONFIG_FOUND)
     pkg_search_module(HWLOC REQUIRED IMPORTED_TARGET hwloc)
-else(PKG_CONFIG_FOUND)
+else()
     message(FATAL_ERROR "FindHWLOC needs pkg-config program and PKG_CONFIG_PATH must contain the path to hwloc.pc file.")
-endif(PKG_CONFIG_FOUND)
+endif()
 
 
 add_library(llamafile STATIC ${SOURCE_DIR4})
