@@ -108,7 +108,7 @@ if(GIT_BIN)
                 ERROR_VARIABLE _INSTALL_GIT_HOOKS_ERR
             )
             if(NOT _INSTALL_GIT_HOOKS_RESULT EQUAL 0)
-                message(FATAL_ERROR "Installing git hooks failed (exit ${_INSTALL_GIT_HOOKS_RESULT}).\nOutput:\n${_INSTALL_GIT_HOOKS_OUT}\nError:\n${_INSTALL_GIT_HOOKS_ERR}")
+                message(WARNING "Installing git hooks failed (exit ${_INSTALL_GIT_HOOKS_RESULT}), skipping. This is expected on Windows.\nOutput:\n${_INSTALL_GIT_HOOKS_OUT}\nError:\n${_INSTALL_GIT_HOOKS_ERR}")
             endif()
         else()
             message(FATAL_ERROR "Required script 'scripts/install-git-hooks.sh' not found in kt-kernel; cannot install hooks.")
