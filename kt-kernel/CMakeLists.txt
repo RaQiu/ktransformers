@@ -98,20 +98,27 @@ if(GIT_BIN)
         ERROR_QUIET
     )
     if(_GIT_RV EQUAL 0 AND EXISTS "${_GIT_TOP}/.git" AND IS_DIRECTORY "${_GIT_TOP}/.git")
-        if(EXISTS "${CMAKE_SOURCE_DIR}/scripts/install-git-hooks.sh")
-            message(STATUS "Detected git worktree at ${_GIT_TOP}; installing hooks from kt-kernel/.githooks")
+        message(STATUS "Detected git worktree at ${_GIT_TOP}; installing hooks from kt-kernel/.githooks")
+        if(WIN32)
+            set(_HOOKS_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/install-git-hooks.bat")
+            set(_HOOKS_CMD cmd /c "${_HOOKS_SCRIPT}")
+        else()
+            set(_HOOKS_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/install-git-hooks.sh")
+            set(_HOOKS_CMD sh "${_HOOKS_SCRIPT}")
+        endif()
+        if(EXISTS "${_HOOKS_SCRIPT}")
             execute_process(
-                COMMAND sh "${CMAKE_SOURCE_DIR}/scripts/install-git-hooks.sh"
+                COMMAND ${_HOOKS_CMD}
                 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
                 RESULT_VARIABLE _INSTALL_GIT_HOOKS_RESULT
                 OUTPUT_VARIABLE _INSTALL_GIT_HOOKS_OUT
                 ERROR_VARIABLE _INSTALL_GIT_HOOKS_ERR
             )
             if(NOT _INSTALL_GIT_HOOKS_RESULT EQUAL 0)
-                message(WARNING "Installing git hooks failed (exit ${_INSTALL_GIT_HOOKS_RESULT}), skipping. This is expected on Windows.\nOutput:\n${_INSTALL_GIT_HOOKS_OUT}\nError:\n${_INSTALL_GIT_HOOKS_ERR}")
+                message(FATAL_ERROR "Installing git hooks failed (exit ${_INSTALL_GIT_HOOKS_RESULT}).\nOutput:\n${_INSTALL_GIT_HOOKS_OUT}\nError:\n${_INSTALL_GIT_HOOKS_ERR}")
             endif()
         else()
-            message(FATAL_ERROR "Required script 'scripts/install-git-hooks.sh' not found in kt-kernel; cannot install hooks.")
+            message(WARNING "Hook install script not found at ${_HOOKS_SCRIPT}; skipping.")
         endif()
     else()
         message(STATUS "No git worktree detected; skipping git hooks installation")
