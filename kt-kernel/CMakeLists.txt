@@ -98,22 +98,20 @@ if(GIT_BIN)
         ERROR_QUIET
     )
     if(_GIT_RV EQUAL 0 AND EXISTS "${_GIT_TOP}/.git" AND IS_DIRECTORY "${_GIT_TOP}/.git")
-        set(_HOOKS_SRC "${CMAKE_SOURCE_DIR}/.githooks")
-        set(_HOOKS_DEST "${_GIT_TOP}/.git/hooks")
-        if(IS_DIRECTORY "${_HOOKS_SRC}")
+        if(EXISTS "${CMAKE_SOURCE_DIR}/scripts/install-git-hooks.sh")
             message(STATUS "Detected git worktree at ${_GIT_TOP}; installing hooks from kt-kernel/.githooks")
-            file(GLOB _HOOK_FILES "${_HOOKS_SRC}/*")
-            foreach(_HOOK ${_HOOK_FILES})
-                get_filename_component(_HOOK_NAME "${_HOOK}" NAME)
-                file(COPY "${_HOOK}" DESTINATION "${_HOOKS_DEST}")
-                # Ensure executable on Unix
-                if(NOT WIN32)
-                    file(CHMOD "${_HOOKS_DEST}/${_HOOK_NAME}" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-                endif()
-                message(STATUS "  Installed hook: ${_HOOK_NAME}")
-            endforeach()
+            execute_process(
+                COMMAND sh "${CMAKE_SOURCE_DIR}/scripts/install-git-hooks.sh"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                RESULT_VARIABLE _INSTALL_GIT_HOOKS_RESULT
+                OUTPUT_VARIABLE _INSTALL_GIT_HOOKS_OUT
+                ERROR_VARIABLE _INSTALL_GIT_HOOKS_ERR
+            )
+            if(NOT _INSTALL_GIT_HOOKS_RESULT EQUAL 0)
+                message(WARNING "Installing git hooks failed (exit ${_INSTALL_GIT_HOOKS_RESULT}), skipping. This is expected on Windows.\nOutput:\n${_INSTALL_GIT_HOOKS_OUT}\nError:\n${_INSTALL_GIT_HOOKS_ERR}")
+            endif()
         else()
-            message(STATUS "No .githooks directory found; skipping git hooks installation")
+            message(FATAL_ERROR "Required script 'scripts/install-git-hooks.sh' not found in kt-kernel; cannot install hooks.")
         endif()
     else()
         message(STATUS "No git worktree detected; skipping git hooks installation")
