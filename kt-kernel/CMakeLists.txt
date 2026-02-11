@@ -723,6 +723,8 @@ endif()
 
 
 if(WIN32)
+    # Prevent windows.h from defining min/max macros that conflict with std::min/std::max
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
     # Windows has built-in NUMA support via Windows API (kernel32.dll), no libnuma needed
     message(STATUS "Windows detected - using built-in NUMA support (kernel32)")
 else()

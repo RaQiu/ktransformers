@@ -3,8 +3,10 @@
 #ifdef FORWARD_TIME_PROFILE
 #include <fmt/format.h>
 #endif
+#ifndef _WIN32
 #include <numa.h>
 #include <numaif.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
