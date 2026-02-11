@@ -722,11 +722,16 @@ endif()
 
 
 
-find_library(NUMA_LIBRARY NAMES numa)
-if(NUMA_LIBRARY)
-    message(STATUS "NUMA library found: ${NUMA_LIBRARY} - enabling NUMA support")
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${NUMA_LIBRARY})
+if(WIN32)
+    # Windows has built-in NUMA support via Windows API (kernel32.dll), no libnuma needed
+    message(STATUS "Windows detected - using built-in NUMA support (kernel32)")
 else()
-    message(FATAL_ERROR "NUMA library not found, please install NUMA, sudo apt install libnuma-dev")
+    find_library(NUMA_LIBRARY NAMES numa)
+    if(NUMA_LIBRARY)
+        message(STATUS "NUMA library found: ${NUMA_LIBRARY} - enabling NUMA support")
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${NUMA_LIBRARY})
+    else()
+        message(FATAL_ERROR "NUMA library not found, please install NUMA, sudo apt install libnuma-dev")
+    endif()
 endif()
 
