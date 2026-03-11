@@ -10,10 +10,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
+#include <thread>
 #include <vector>
 
 #include "../../cpu_backend/shared_mem_buffer.h"
@@ -23,6 +26,40 @@
 #include "llama.cpp/ggml-quants.h"
 #include "llama.cpp/ggml.h"
 #include "llamafile/sgemm.h"
+
+// Bind mmap pages to a specific NUMA node using mbind().
+// This ensures mmap'd weight pages are NUMA-local for the TP instance that uses them.
+// Without this, pages land on whichever NUMA node first faults them (first-touch policy),
+// which is typically the Python main thread's node — wrong for TP instances on other nodes.
+//
+// Uses MPOL_MF_MOVE to migrate already-faulted pages (e.g., pages touched by GGUFLoader
+// during parsing) to the target node. Pages not yet faulted will be placed on the
+// target node on first access.
+static inline void bind_pages_to_numa([[maybe_unused]] void* addr,
+                                      [[maybe_unused]] size_t len,
+                                      [[maybe_unused]] int node) {
+#if defined(__linux__)
+  if (len == 0 || addr == nullptr || node < 0) return;
+  static const size_t PAGE_SIZE = (size_t)sysconf(_SC_PAGESIZE);
+
+  // mbind requires page-aligned address and length
+  uintptr_t start = (uintptr_t)addr & ~(PAGE_SIZE - 1);
+  uintptr_t end = ((uintptr_t)addr + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  size_t page_len = end - start;
+
+  unsigned long nodemask = 1UL << node;
+  // max_node must be > highest bit set in nodemask
+  unsigned long max_node = sizeof(unsigned long) * 8;
+
+  long ret = mbind((void*)start, page_len, MPOL_BIND, &nodemask, max_node, MPOL_MF_MOVE);
+  if (ret != 0 && errno != EPERM) {
+    // EPERM is expected when some pages are locked; silently ignore.
+    // Other errors (ENOMEM, EIO) are logged but non-fatal.
+    printf("[bind_pages_to_numa] mbind failed for node %d: %s (addr=%p, len=%zu)\n",
+           node, strerror(errno), addr, len);
+  }
+#endif
+}
 
 inline void debug_quant(void* input, ggml_type type) {
   std::vector<float> output(ggml_blck_size(type));
@@ -34,6 +71,9 @@ inline void debug_quant(void* input, ggml_type type) {
 }
 
 class LLAMA_MOE_TP {
+ public:
+  int get_numa_node() const { return numa_node_; }
+
  private:
   GeneralMOEConfig config_;
   int tp_part_idx;
@@ -295,6 +335,22 @@ class LLAMA_MOE_TP {
           baseline_down_ptrs_[eid] = dst;
         }
       }
+
+      // Bind mmap pages to this TP's NUMA node for locality.
+      // This runs inside do_numa_job() on a NUMA-bound worker thread.
+      // Without mbind, pages would land on whichever NUMA node first faulted them
+      // (often Python's main thread on node 0), causing cross-NUMA reads during forward.
+      for (int eid = 0; eid < config.expert_num; eid++) {
+        bind_pages_to_numa(gate_expert_ptrs_[eid], gate_expert_bytes_, numa_node_);
+        bind_pages_to_numa(up_expert_ptrs_[eid], up_expert_bytes_, numa_node_);
+        if (!is_tp_split) {
+          // Zero-copy down_proj pages also need binding
+          bind_pages_to_numa(down_expert_ptrs_[eid], down_expert_bytes_, numa_node_);
+        }
+        // TP-split down_proj: stride-copied into down_storage_ (new[])
+        // which already respects the thread's NUMA policy via set_memory_to_numa().
+      }
+
     } else {
       // Legacy mode: copy from source into per-expert storage
       uint8_t* src_gate = (uint8_t*)config.gate_proj +
@@ -873,6 +929,14 @@ class LLAMA_MOE_TP {
       return;
     }
 
+    // Prefetch source pages before memcpy to reduce page-fault stalls.
+    // When baseline pointers are in mmap, pages may have been evicted under memory pressure.
+    // madvise(MADV_WILLNEED) triggers asynchronous readahead so pages are resident by the
+    // time memcpy reaches them, avoiding synchronous page faults (~100us each).
+    madvise(baseline_gate_ptrs_[expert_id], gate_expert_bytes_, MADV_WILLNEED);
+    madvise(baseline_up_ptrs_[expert_id], up_expert_bytes_, MADV_WILLNEED);
+    madvise(baseline_down_ptrs_[expert_id], down_expert_bytes_, MADV_WILLNEED);
+
     // Copy data from current live pointers (mmap or legacy)
     memcpy(tier0_gate_[expert_id], gate_expert_ptrs_[expert_id], gate_expert_bytes_);
     memcpy(tier0_up_[expert_id], up_expert_ptrs_[expert_id], up_expert_bytes_);
@@ -965,12 +1029,34 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
   }
 
   void promote_expert(int expert_id) {
-    for (int i = 0; i < this->tp_count; i++) {
-      this->tps[i]->promote_expert(expert_id);
+    // Dispatch promote to per-NUMA threads so memcpy runs NUMA-local.
+    // promote_expert() is called from Python's background promotion thread which
+    // has no NUMA binding. Without NUMA dispatch, memcpy would read from mmap pages
+    // on node X and write to numa_alloc_onnode buffers on node X, but execute on
+    // an arbitrary node Y — causing cross-NUMA traffic in both directions.
+    //
+    // Spawning short-lived threads is acceptable here: promotion runs every ~5 seconds
+    // in the background, not in the inference hot path. Thread spawn cost (~5us) is
+    // negligible compared to the multi-MB memcpy (~1ms).
+    if (this->tp_count <= 1) {
+      // Single TP: no need for thread dispatch
+      this->tps[0]->promote_expert(expert_id);
+      return;
     }
+    std::vector<std::thread> workers;
+    workers.reserve(this->tp_count);
+    for (int i = 0; i < this->tp_count; i++) {
+      workers.emplace_back([this, i, expert_id]() {
+        set_to_numa(this->tps[i]->get_numa_node());
+        this->tps[i]->promote_expert(expert_id);
+      });
+    }
+    for (auto& t : workers) t.join();
   }
 
   void demote_expert(int expert_id) {
+    // Demote is lightweight (pointer swap + numa_free), no memcpy.
+    // NUMA locality doesn't matter for demote, keep simple sequential dispatch.
     for (int i = 0; i < this->tp_count; i++) {
       this->tps[i]->demote_expert(expert_id);
     }
