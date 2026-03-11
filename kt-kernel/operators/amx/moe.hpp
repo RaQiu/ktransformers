@@ -221,7 +221,7 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
                 // Free original buffer and point to mmap
                 std::free(gate_bb_[expert_id]->b);
                 gate_bb_[expert_id]->b =
-                    (typename decltype(gate_bb_[expert_id]->b))(config_.gate_projs[tp_part_idx][logical_expert_id]);
+                    (decltype(gate_bb_[expert_id]->b))(config_.gate_projs[tp_part_idx][logical_expert_id]);
 
                 if constexpr (T::BufferB::SCALE) {
                   gate_bb_[expert_id]->d = (float*)(config_.gate_scales[tp_part_idx][logical_expert_id]);
@@ -229,7 +229,7 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
 
                 std::free(up_bb_[expert_id]->b);
                 up_bb_[expert_id]->b =
-                    (typename decltype(up_bb_[expert_id]->b))(config_.up_projs[tp_part_idx][logical_expert_id]);
+                    (decltype(up_bb_[expert_id]->b))(config_.up_projs[tp_part_idx][logical_expert_id]);
 
                 if constexpr (T::BufferB::SCALE) {
                   up_bb_[expert_id]->d = (float*)(config_.up_scales[tp_part_idx][logical_expert_id]);
@@ -239,7 +239,7 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
               {
                 std::free(down_bb_[expert_id]->b);
                 down_bb_[expert_id]->b =
-                    (typename decltype(down_bb_[expert_id]->b))(config_.down_projs[tp_part_idx][logical_expert_id]);
+                    (decltype(down_bb_[expert_id]->b))(config_.down_projs[tp_part_idx][logical_expert_id]);
 
                 if constexpr (T::BufferB::SCALE) {
                   down_bb_[expert_id]->d = (float*)(config_.down_scales[tp_part_idx][logical_expert_id]);

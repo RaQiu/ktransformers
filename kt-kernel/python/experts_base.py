@@ -471,8 +471,18 @@ class BaseMoEWrapper(ABC):
             )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
-    def sync_forward(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor, cuda_stream) -> torch.Tensor:
+    def sync_forward(self, hidden_states: torch.Tensor, topk_ids_or_stream=None, cuda_stream=None) -> torch.Tensor:
         """
+        # Backward compatibility: handle both old (hidden_states, cuda_stream) and new (hidden_states, topk_ids, cuda_stream) signatures
+        if cuda_stream is None and topk_ids_or_stream is not None:
+            if hasattr(topk_ids_or_stream, "cuda_stream"):
+                cuda_stream = topk_ids_or_stream
+                topk_ids = None
+            else:
+                cuda_stream = topk_ids_or_stream
+                topk_ids = None
+        else:
+            topk_ids = topk_ids_or_stream
         Synchronize and retrieve forward inference results.
 
         Args:
