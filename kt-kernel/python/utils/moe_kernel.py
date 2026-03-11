@@ -49,6 +49,7 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "MOE_INT8",
+        weight_strategy: str = "tiered",
     ):
         """
         Initialize general MoE Wrapper.
@@ -97,6 +98,7 @@ class GeneralMoEWrapper(BaseMoEWrapper):
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
+            weight_strategy=weight_strategy,
         )
 
         # moe-specific: Check if we should load merged safetensor weights

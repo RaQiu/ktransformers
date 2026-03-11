@@ -961,3 +961,79 @@ class GGUFLoader:
         data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
 
         return data, ggml_type
+
+    def get_mmap_tensor_and_ggml_type(self, name: str):
+        """
+        Get tensor data as a zero-copy view into the mmap'd file region.
+
+        Unlike get_undequanted_tensor_and_ggml_type(), this does NOT copy the data.
+        The returned numpy array points directly into the mmap'd file, so:
+        - No additional memory is allocated
+        - The OS manages which pages are resident via Page Cache LRU
+        - Pages can be evicted under memory pressure without writing to swap
+
+        This is essential when model size approaches physical RAM to avoid swap thrashing.
+
+        The caller must keep a reference to the GGUFLoader (and thus the mmap handle)
+        for as long as the returned array is in use.
+
+        Args:
+            name: Tensor name (in PyTorch format, will be translated to GGUF format)
+
+        Returns:
+            (data_ptr, n_bytes, ggml_type): Tuple of raw pointer (int), byte count, and GGML type
+        """
+        name = translate_name_to_gguf(name)
+
+        if name not in self.tensor_info:
+            raise KeyError(f"Tensor '{name}' not found in GGUF files")
+
+        info = self.tensor_info[name]
+        file_path = self.tensor_file_map[name]
+        mmap_data = self.file_data_map[file_path]
+
+        offset = info["offset"]
+        n_elements = info["n_elements"]
+        ggml_type = info["dtype"]
+
+        GGML_QUANT_SIZES = {
+            GGMLQuantizationType.F32: (1, 4),
+            GGMLQuantizationType.F16: (1, 2),
+            GGMLQuantizationType.BF16: (1, 2),
+            GGMLQuantizationType.Q4_0: (32, 2 + 16),
+            GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
+            GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
+            GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
+            GGMLQuantizationType.Q8_0: (32, 2 + 32),
+            GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
+            GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
+            GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
+            GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
+            GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
+            GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
+            GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
+            GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
+            GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
+            GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
+            GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
+            GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
+            GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
+            GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
+            GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
+            GGMLQuantizationType.I8: (1, 1),
+            GGMLQuantizationType.I16: (1, 2),
+            GGMLQuantizationType.I32: (1, 4),
+            GGMLQuantizationType.I64: (1, 8),
+            GGMLQuantizationType.F64: (1, 8),
+            GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
+        }
+
+        block_size, type_size = GGML_QUANT_SIZES[ggml_type]
+        n_bytes = n_elements * type_size // block_size
+
+        # Zero-copy: return a numpy view directly into the mmap region
+        data_view = np.frombuffer(mmap_data[offset : offset + n_bytes], dtype=np.uint8)
+        # data_view.ctypes.data is the raw pointer into the mmap'd file
+        data_ptr = data_view.ctypes.data
+
+        return data_ptr, n_bytes, ggml_type

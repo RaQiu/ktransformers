@@ -65,6 +65,7 @@ class KTMoEWrapper:
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
+        weight_strategy: str = "tiered",
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -117,6 +118,7 @@ class KTMoEWrapper:
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
+            weight_strategy=weight_strategy,
         )
 
     # Forward static methods to the base class

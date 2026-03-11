@@ -38,9 +38,31 @@ class LLAMA_MOE_TP {
   GeneralMOEConfig config_;
   int tp_part_idx;
 
-  uint8_t* m_local_gate_proj_;  // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
-  uint8_t* m_local_up_proj_;    // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
-  uint8_t* m_local_down_proj_;  // [expert_num * hidden_size * intermediate_size ( /32 if quantized)]
+  // Per-expert weight pointers (live pointers used in forward, swappable for tiered cache)
+  std::vector<uint8_t*> gate_expert_ptrs_;   // [expert_num]
+  std::vector<uint8_t*> up_expert_ptrs_;     // [expert_num]
+  std::vector<uint8_t*> down_expert_ptrs_;   // [expert_num]
+
+  // Baseline pointers (mmap or legacy storage) for demotion fallback
+  std::vector<uint8_t*> baseline_gate_ptrs_; // [expert_num]
+  std::vector<uint8_t*> baseline_up_ptrs_;   // [expert_num]
+  std::vector<uint8_t*> baseline_down_ptrs_; // [expert_num]
+
+  // Tier 0 NUMA-local buffers (non-null when promoted)
+  std::vector<uint8_t*> tier0_gate_;         // [expert_num]
+  std::vector<uint8_t*> tier0_up_;           // [expert_num]
+  std::vector<uint8_t*> tier0_down_;         // [expert_num]
+
+  // Backing storage ownership (delete[] in destructor)
+  uint8_t* gate_storage_ = nullptr;
+  uint8_t* up_storage_ = nullptr;
+  uint8_t* down_storage_ = nullptr;
+
+  // Per-expert byte sizes (for promote/demote allocation)
+  size_t gate_expert_bytes_ = 0;
+  size_t up_expert_bytes_ = 0;
+  size_t down_expert_bytes_ = 0;
+  int numa_node_ = 0;
 
   float* s_input_fp32_;    // [hidden_size]
   uint8_t* s_gate_input_;  // [hidden_size * ggml_type_size(ggml_internal_get_type_traits(gate_type).vec_dot_type) /
@@ -181,23 +203,38 @@ class LLAMA_MOE_TP {
     m_local_down_input_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
-    auto size = 1ll * config.expert_num * config.intermediate_size * config.hidden_size;
-    m_local_up_proj_ =
-        new uint8_t[size * ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type)];
+    // Initialize per-expert pointer vectors
+    int en = config.expert_num;
+    gate_expert_ptrs_.resize(en, nullptr);
+    up_expert_ptrs_.resize(en, nullptr);
+    down_expert_ptrs_.resize(en, nullptr);
+    baseline_gate_ptrs_.resize(en, nullptr);
+    baseline_up_ptrs_.resize(en, nullptr);
+    baseline_down_ptrs_.resize(en, nullptr);
+    tier0_gate_.resize(en, nullptr);
+    tier0_up_.resize(en, nullptr);
+    tier0_down_.resize(en, nullptr);
 
-    m_local_gate_proj_ =
-        new uint8_t[size * ggml_type_size((ggml_type)config.gate_type) / ggml_blck_size((ggml_type)config.gate_type)];
-    m_local_down_proj_ =
-        new uint8_t[size * ggml_type_size((ggml_type)config.down_type) / ggml_blck_size((ggml_type)config.down_type)];
+    // Compute per-expert byte sizes
+    auto gr = ggml_type_size((ggml_type)config.gate_type) / ggml_blck_size((ggml_type)config.gate_type);
+    auto ur = ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type);
+    auto dr = ggml_type_size((ggml_type)config.down_type) / ggml_blck_size((ggml_type)config.down_type);
+    gate_expert_bytes_ = (size_t)config.intermediate_size * config.hidden_size * gr;
+    up_expert_bytes_ = (size_t)config.intermediate_size * config.hidden_size * ur;
+    down_expert_bytes_ = (size_t)config.hidden_size * config.intermediate_size * dr;
+    numa_node_ = tp_part_idx;
+
+    if (!config.use_mmap) {
+      // Legacy mode: allocate flat storage buffers
+      gate_storage_ = new uint8_t[(size_t)en * gate_expert_bytes_];
+      up_storage_ = new uint8_t[(size_t)en * up_expert_bytes_];
+      down_storage_ = new uint8_t[(size_t)en * down_expert_bytes_];
+    }
+    // Per-expert pointers are populated in load_weights()
   }
 
   void load_weights(int complete_intermediate_size, int offset) {
-    auto local_gate_proj = m_local_gate_proj_;
-    auto local_up_proj = m_local_up_proj_;
-    auto local_down_proj = m_local_down_proj_;
     auto& config = config_;
-    // printf("gate load weights:");
-    // debug_quant(config.gate_proj, (ggml_type)config.gate_type);
     // we need to make sure the blck size is correct for size.
     if (config.intermediate_size % ggml_blck_size((ggml_type)config.down_type) != 0) {
       printf("intermediate_size: %d, down_type blck size: %d\n", config.intermediate_size,
@@ -214,39 +251,81 @@ class LLAMA_MOE_TP {
              ggml_blck_size((ggml_type)config.gate_type));
       throw std::runtime_error("intermediate_size * hidden_size must be a multiple of gate_type blck size");
     }
-    uint8_t* gate_proj = (uint8_t*)config.gate_proj + offset * config.hidden_size *
-                                                          ggml_type_size((ggml_type)config.gate_type) /
-                                                          ggml_blck_size((ggml_type)config.gate_type);
-    uint8_t* up_proj = (uint8_t*)config.up_proj + offset * config.hidden_size *
-                                                      ggml_type_size((ggml_type)config.up_type) /
-                                                      ggml_blck_size((ggml_type)config.up_type);
-    uint8_t* down_proj = (uint8_t*)config.down_proj + offset * ggml_type_size((ggml_type)config.down_type) /
-                                                          ggml_blck_size((ggml_type)config.down_type);
 
-    for (int i = 0; i < config.expert_num; ++i) {
-      memcpy(local_gate_proj, gate_proj,
-             config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
-                 ggml_blck_size((ggml_type)config.gate_type));
-      memcpy(local_up_proj, up_proj,
-             config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
-                 ggml_blck_size((ggml_type)config.up_type));
-      for (int j = 0; j < config.hidden_size; ++j) {
-        memcpy(local_down_proj, down_proj,
-               config.intermediate_size * ggml_type_size((ggml_type)config.down_type) /
-                   ggml_blck_size((ggml_type)config.down_type));
-        local_down_proj += config.intermediate_size * ggml_type_size((ggml_type)config.down_type) /
-                           ggml_blck_size((ggml_type)config.down_type);
-        down_proj += complete_intermediate_size * ggml_type_size((ggml_type)config.down_type) /
-                     ggml_blck_size((ggml_type)config.down_type);
+    auto gate_ratio = ggml_type_size((ggml_type)config.gate_type) / ggml_blck_size((ggml_type)config.gate_type);
+    auto up_ratio = ggml_type_size((ggml_type)config.up_type) / ggml_blck_size((ggml_type)config.up_type);
+    auto down_ratio = ggml_type_size((ggml_type)config.down_type) / ggml_blck_size((ggml_type)config.down_type);
+    bool is_tp_split = (config.intermediate_size != complete_intermediate_size);
+
+    if (config.use_mmap) {
+      // mmap mode: set per-expert pointers into mmap region
+      // gate/up: [expert, intermediate, hidden] - contiguous per-expert even with TP
+      for (int eid = 0; eid < config.expert_num; eid++) {
+        gate_expert_ptrs_[eid] = (uint8_t*)config.gate_proj +
+            ((size_t)eid * complete_intermediate_size + offset) * config.hidden_size * gate_ratio;
+        up_expert_ptrs_[eid] = (uint8_t*)config.up_proj +
+            ((size_t)eid * complete_intermediate_size + offset) * config.hidden_size * up_ratio;
+        baseline_gate_ptrs_[eid] = gate_expert_ptrs_[eid];
+        baseline_up_ptrs_[eid] = up_expert_ptrs_[eid];
       }
-      local_gate_proj += config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
-                         ggml_blck_size((ggml_type)config.gate_type);
-      local_up_proj += config.intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
-                       ggml_blck_size((ggml_type)config.up_type);
-      gate_proj += complete_intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.gate_type) /
-                   ggml_blck_size((ggml_type)config.gate_type);
-      up_proj += complete_intermediate_size * config.hidden_size * ggml_type_size((ggml_type)config.up_type) /
-                 ggml_blck_size((ggml_type)config.up_type);
+
+      if (!is_tp_split) {
+        // No TP split: down_proj is also contiguous per-expert, zero-copy
+        for (int eid = 0; eid < config.expert_num; eid++) {
+          down_expert_ptrs_[eid] = (uint8_t*)config.down_proj +
+              (size_t)eid * config.hidden_size * complete_intermediate_size * down_ratio;
+          baseline_down_ptrs_[eid] = down_expert_ptrs_[eid];
+        }
+      } else {
+        // TP split: down_proj [expert, hidden, complete_intermediate] needs stride-copy
+        // because the TP slice along intermediate is not contiguous per row
+        down_storage_ = new uint8_t[(size_t)config.expert_num * down_expert_bytes_];
+        uint8_t* src_down_base = (uint8_t*)config.down_proj;
+        for (int eid = 0; eid < config.expert_num; eid++) {
+          uint8_t* dst = down_storage_ + (size_t)eid * down_expert_bytes_;
+          for (int j = 0; j < config.hidden_size; j++) {
+            uint8_t* src_row = src_down_base +
+                ((size_t)eid * config.hidden_size + j) * complete_intermediate_size * down_ratio +
+                (size_t)offset * down_ratio;
+            memcpy(dst + (size_t)j * config.intermediate_size * down_ratio,
+                   src_row,
+                   (size_t)config.intermediate_size * down_ratio);
+          }
+          down_expert_ptrs_[eid] = dst;
+          baseline_down_ptrs_[eid] = dst;
+        }
+      }
+    } else {
+      // Legacy mode: copy from source into per-expert storage
+      uint8_t* src_gate = (uint8_t*)config.gate_proj +
+          (size_t)offset * config.hidden_size * gate_ratio;
+      uint8_t* src_up = (uint8_t*)config.up_proj +
+          (size_t)offset * config.hidden_size * up_ratio;
+      uint8_t* src_down = (uint8_t*)config.down_proj +
+          (size_t)offset * down_ratio;
+
+      for (int eid = 0; eid < config.expert_num; eid++) {
+        // Gate/up: contiguous per-expert in source
+        gate_expert_ptrs_[eid] = gate_storage_ + (size_t)eid * gate_expert_bytes_;
+        up_expert_ptrs_[eid] = up_storage_ + (size_t)eid * up_expert_bytes_;
+        memcpy(gate_expert_ptrs_[eid], src_gate, gate_expert_bytes_);
+        memcpy(up_expert_ptrs_[eid], src_up, up_expert_bytes_);
+        src_gate += (size_t)complete_intermediate_size * config.hidden_size * gate_ratio;
+        src_up += (size_t)complete_intermediate_size * config.hidden_size * up_ratio;
+
+        // Down: stride-copy [hidden_size rows, each intermediate_size from complete_intermediate_size]
+        down_expert_ptrs_[eid] = down_storage_ + (size_t)eid * down_expert_bytes_;
+        for (int j = 0; j < config.hidden_size; j++) {
+          memcpy(down_expert_ptrs_[eid] + (size_t)j * config.intermediate_size * down_ratio,
+                 src_down,
+                 (size_t)config.intermediate_size * down_ratio);
+          src_down += (size_t)complete_intermediate_size * down_ratio;
+        }
+
+        baseline_gate_ptrs_[eid] = gate_expert_ptrs_[eid];
+        baseline_up_ptrs_[eid] = up_expert_ptrs_[eid];
+        baseline_down_ptrs_[eid] = down_expert_ptrs_[eid];
+      }
     }
   }
 
@@ -341,7 +420,7 @@ class LLAMA_MOE_TP {
             int ith = task_id % nth;
 
             void* gate_proj_ptr =
-                (uint8_t*)m_local_gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.m_block) *
+                gate_expert_ptrs_[expert_id] + (size_t)ith * config_.m_block *
                                                    config_.hidden_size * ggml_type_size((ggml_type)config_.gate_type) /
                                                    ggml_blck_size((ggml_type)config_.gate_type);
 
@@ -358,7 +437,7 @@ class LLAMA_MOE_TP {
             }
 
             void* up_proj_ptr =
-                (uint8_t*)m_local_up_proj_ + (expert_id * config_.intermediate_size + ith * config_.m_block) *
+                up_expert_ptrs_[expert_id] + (size_t)ith * config_.m_block *
                                                  config_.hidden_size * ggml_type_size((ggml_type)config_.up_type) /
                                                  ggml_blck_size((ggml_type)config_.up_type);
 
@@ -421,7 +500,7 @@ class LLAMA_MOE_TP {
 
             auto expert_offset = expert_id * config_.hidden_size * config_.intermediate_size;
             auto m_block_offset = ith * config_.m_block * config_.intermediate_size;
-            void* down_proj_ptr = (uint8_t*)m_local_down_proj_ + (expert_offset + m_block_offset) *
+            void* down_proj_ptr = down_expert_ptrs_[expert_id] + (size_t)m_block_offset *
                                                                      ggml_type_size((ggml_type)config_.down_type) /
                                                                      ggml_blck_size((ggml_type)config_.down_type);
 
@@ -610,7 +689,7 @@ class LLAMA_MOE_TP {
           void* gate_input_ptr = m_local_gate_input_ptr_[expert_idx];
 
           void* gate_proj_ptr =
-              (uint8_t*)m_local_gate_proj_ + (expert_idx * config_.intermediate_size + ith * m_block) *
+              gate_expert_ptrs_[expert_idx] + (size_t)ith * m_block *
                                                  config_.hidden_size * ggml_type_size((ggml_type)config_.gate_type) /
                                                  ggml_blck_size((ggml_type)config_.gate_type);
 
@@ -629,7 +708,7 @@ class LLAMA_MOE_TP {
                           GGML_PREC_DEFAULT);
           void* up_input_ptr = m_local_up_input_ptr_[expert_idx];
 
-          void* up_proj_ptr = (uint8_t*)m_local_up_proj_ + (expert_idx * config_.intermediate_size + ith * m_block) *
+          void* up_proj_ptr = up_expert_ptrs_[expert_idx] + (size_t)ith * m_block *
                                                                config_.hidden_size *
                                                                ggml_type_size((ggml_type)config_.up_type) /
                                                                ggml_blck_size((ggml_type)config_.up_type);
@@ -680,10 +759,9 @@ class LLAMA_MOE_TP {
           int ith = task_id % nth;
           void* down_input_ptr = m_local_down_input_ptr_[expert_idx];
 
-          auto expert_offset = expert_idx * config_.hidden_size * config_.intermediate_size;
           auto m_block_offset = ith * m_block * config_.intermediate_size;
 
-          void* down_proj_ptr = (uint8_t*)m_local_down_proj_ + (expert_offset + m_block_offset) *
+          void* down_proj_ptr = down_expert_ptrs_[expert_idx] + (size_t)m_block_offset *
                                                                    ggml_type_size((ggml_type)config_.down_type) /
                                                                    ggml_blck_size((ggml_type)config_.down_type);
 
@@ -763,6 +841,75 @@ class LLAMA_MOE_TP {
                                   ggml_blck_size((ggml_type)config_.hidden_type),
             output + forward_len * config_.hidden_size);
   }
+
+  ~LLAMA_MOE_TP() {
+#ifndef _WIN32
+    for (size_t i = 0; i < tier0_gate_.size(); i++) {
+      if (tier0_gate_[i]) numa_free(tier0_gate_[i], gate_expert_bytes_);
+      if (tier0_up_[i]) numa_free(tier0_up_[i], up_expert_bytes_);
+      if (tier0_down_[i]) numa_free(tier0_down_[i], down_expert_bytes_);
+    }
+#endif
+    delete[] gate_storage_;
+    delete[] up_storage_;
+    delete[] down_storage_;
+  }
+
+  void promote_expert(int expert_id) {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+    if (tier0_gate_[expert_id] != nullptr) return;  // already promoted
+
+    // Allocate NUMA-local buffers
+    tier0_gate_[expert_id] = (uint8_t*)numa_alloc_onnode(gate_expert_bytes_, numa_node_);
+    tier0_up_[expert_id] = (uint8_t*)numa_alloc_onnode(up_expert_bytes_, numa_node_);
+    tier0_down_[expert_id] = (uint8_t*)numa_alloc_onnode(down_expert_bytes_, numa_node_);
+
+    if (!tier0_gate_[expert_id] || !tier0_up_[expert_id] || !tier0_down_[expert_id]) {
+      // Allocation failed, clean up
+      if (tier0_gate_[expert_id]) { numa_free(tier0_gate_[expert_id], gate_expert_bytes_); tier0_gate_[expert_id] = nullptr; }
+      if (tier0_up_[expert_id]) { numa_free(tier0_up_[expert_id], up_expert_bytes_); tier0_up_[expert_id] = nullptr; }
+      if (tier0_down_[expert_id]) { numa_free(tier0_down_[expert_id], down_expert_bytes_); tier0_down_[expert_id] = nullptr; }
+      return;
+    }
+
+    // Copy data from current live pointers (mmap or legacy)
+    memcpy(tier0_gate_[expert_id], gate_expert_ptrs_[expert_id], gate_expert_bytes_);
+    memcpy(tier0_up_[expert_id], up_expert_ptrs_[expert_id], up_expert_bytes_);
+    memcpy(tier0_down_[expert_id], down_expert_ptrs_[expert_id], down_expert_bytes_);
+
+    // Swap live pointers to NUMA-local buffers (atomic store on x86_64)
+    gate_expert_ptrs_[expert_id] = tier0_gate_[expert_id];
+    up_expert_ptrs_[expert_id] = tier0_up_[expert_id];
+    down_expert_ptrs_[expert_id] = tier0_down_[expert_id];
+#endif
+  }
+
+  void demote_expert(int expert_id) {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+    if (tier0_gate_[expert_id] == nullptr) return;  // not promoted
+
+    // Restore live pointers to baseline (mmap or legacy storage)
+    gate_expert_ptrs_[expert_id] = baseline_gate_ptrs_[expert_id];
+    up_expert_ptrs_[expert_id] = baseline_up_ptrs_[expert_id];
+    down_expert_ptrs_[expert_id] = baseline_down_ptrs_[expert_id];
+
+    // Free NUMA-local buffers
+    numa_free(tier0_gate_[expert_id], gate_expert_bytes_);
+    numa_free(tier0_up_[expert_id], up_expert_bytes_);
+    numa_free(tier0_down_[expert_id], down_expert_bytes_);
+
+    tier0_gate_[expert_id] = nullptr;
+    tier0_up_[expert_id] = nullptr;
+    tier0_down_[expert_id] = nullptr;
+#endif
+  }
+
+  bool is_expert_promoted(int expert_id) const {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    return tier0_gate_[expert_id] != nullptr;
+  }
 };
 
 template <>
@@ -815,6 +962,22 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
                      config.hidden_size, (ggml_type)config.hidden_type);
         },
         nullptr);
+  }
+
+  void promote_expert(int expert_id) {
+    for (int i = 0; i < this->tp_count; i++) {
+      this->tps[i]->promote_expert(expert_id);
+    }
+  }
+
+  void demote_expert(int expert_id) {
+    for (int i = 0; i < this->tp_count; i++) {
+      this->tps[i]->demote_expert(expert_id);
+    }
+  }
+
+  bool is_expert_promoted(int expert_id) const {
+    return this->tps[0]->is_expert_promoted(expert_id);
   }
 };
 #endif

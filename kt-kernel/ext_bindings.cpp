@@ -253,6 +253,16 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
+  // Bind promote/demote for Llamafile backend (tiered weight management)
+  if constexpr (std::is_same_v<MoeTP, LLAMA_MOE_TP>) {
+    moe_cls.def("promote_expert", &MoeClass::promote_expert, py::arg("expert_id"),
+                "Promote an expert to Tier 0 (NUMA-local malloc) for ~80ns access latency");
+    moe_cls.def("demote_expert", &MoeClass::demote_expert, py::arg("expert_id"),
+                "Demote an expert back to baseline (mmap or legacy storage)");
+    moe_cls.def("is_expert_promoted", &MoeClass::is_expert_promoted, py::arg("expert_id"),
+                "Check if an expert is currently in Tier 0");
+  }
+
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
@@ -551,6 +561,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("path", &GeneralMOEConfig::path)
       .def_readwrite("save", &GeneralMOEConfig::save)
       .def_readwrite("load", &GeneralMOEConfig::load)
+      .def_readwrite("use_mmap", &GeneralMOEConfig::use_mmap)
       .def_readwrite("m_block", &GeneralMOEConfig::m_block)
       .def_readwrite("group_min_len", &GeneralMOEConfig::group_min_len)
       .def_readwrite("group_max_len", &GeneralMOEConfig::group_max_len)

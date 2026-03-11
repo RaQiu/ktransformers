@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import os
 import ctypes
+import numpy as np
 
 from kt_kernel import kt_kernel_ext
 
@@ -148,6 +149,8 @@ class BaseMoEWrapper(ABC):
 
     _cpu_infer_instance = None
     _layer_has_pending_deferred: Dict[int, bool] = {}
+    _tiered_provider = None  # Singleton TieredWeightProvider
+    _prev_topk_ids: Optional[np.ndarray] = None  # Previous token's expert IDs for prefetch
 
     def __init__(
         self,
@@ -164,6 +167,7 @@ class BaseMoEWrapper(ABC):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
+        weight_strategy: str = "tiered",
     ):
         """
         Initialize base MoE Wrapper.
@@ -185,12 +189,15 @@ class BaseMoEWrapper(ABC):
             cpu_save: Whether to save weights to CPU memory
             max_deferred_experts_per_token: Number of experts per token to defer on this layer. Defaults to 0 (no defer).
             method: Backend method string
+            weight_strategy: Weight loading strategy. "auto" selects based on model/RAM ratio,
+                             "legacy" forces malloc+copy, "tiered" forces mmap-based loading.
         """
         self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
+        self.weight_strategy = weight_strategy
 
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
@@ -234,8 +241,41 @@ class BaseMoEWrapper(ABC):
 
         self.cpu_infer = BaseMoEWrapper._cpu_infer_instance
 
+        # Initialize tiered weight provider (singleton, only for tiered strategy).
+        # NOTE: self._provider is initially None for ALL backends.
+        # Only backends that call register_moe() (currently Llamafile) will set
+        # self._provider, so AMX/RAWINT4 backends avoid useless record_activations
+        # and prefetch calls (which would cause a GPU sync in the hot path).
+        if self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
+            from .utils.weight_provider import TieredWeightProvider
+            BaseMoEWrapper._tiered_provider = TieredWeightProvider(
+                num_experts=num_experts,
+                num_layers=1,  # dict-based storage, supports arbitrary layer_idx
+            )
+        self._provider = None  # Set by subclass via _register_moe_with_provider()
+
+        # NOTE: promotion thread is NOT started here — it's started lazily
+        # in register_moe() after the first MOE object is registered.
+        # Starting here would run the thread with an empty moe_refs dict.
+
         # Backend-specific initialization happens in subclasses
         self.moe = None
+
+    def _register_moe_with_provider(self):
+        """
+        Register self.moe with the tiered weight provider and enable tiered management.
+
+        Call this from subclass load_weights() AFTER self.moe is created.
+        Only backends whose C++ MOE objects support promote_expert/demote_expert
+        should call this (currently Llamafile only).
+
+        This sets self._provider, which enables prefetch and record_activations
+        in submit_forward/sync_forward.
+        """
+        provider = BaseMoEWrapper._tiered_provider
+        if provider is not None and self.moe is not None:
+            provider.register_moe(self.layer_idx, self.moe)
+            self._provider = provider
 
     @abstractmethod
     def load_weights_from_tensors(
@@ -331,6 +371,14 @@ class BaseMoEWrapper(ABC):
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
         topk_ids_long = topk_ids.to(torch.long)
+
+        # Tiered weight management: prefetch using PREVIOUS token's expert IDs
+        # This avoids a GPU sync (.cpu().numpy()) in the hot path (PERF-1).
+        # Previous-token IDs are a good predictor for current-token routing
+        # because token sequences exhibit temporal locality in expert selection.
+        if self._provider is not None and BaseMoEWrapper._prev_topk_ids is not None:
+            self._provider.prefetch_layer(self.layer_idx, BaseMoEWrapper._prev_topk_ids)
+
         immediate_ids: torch.Tensor
         deferred_ids: Optional[torch.Tensor]
         if self.max_deferred_experts_per_token > 0:
@@ -376,12 +424,13 @@ class BaseMoEWrapper(ABC):
             )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
-    def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
+    def sync_forward(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor, cuda_stream) -> torch.Tensor:
         """
         Synchronize and retrieve forward inference results.
 
         Args:
             hidden_states: Original input hidden states (for getting buffer)
+            topk_ids: Top-k expert IDs from this forward pass (for recording activations)
             cuda_stream: CUDA stream for synchronization
 
         Returns:
@@ -402,6 +451,16 @@ class BaseMoEWrapper(ABC):
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+
+        # Record activations for hotness tracking AFTER sync (not in hot path).
+        # The .cpu().numpy() transfer is acceptable here because we've already
+        # synchronized with the CPU worker — no pipeline bubble introduced.
+        if self._provider is not None:
+            ids_np = topk_ids.detach().cpu().numpy()
+            self._provider.record_activations(ids_np)
+            # Cache for next token's prefetch (avoid GPU sync in submit_forward)
+            BaseMoEWrapper._prev_topk_ids = ids_np
+
         return output_gpu[current_slot]
 
     def forward(
@@ -424,7 +483,7 @@ class BaseMoEWrapper(ABC):
             Output tensor on GPU
         """
         self.submit_forward(hidden_states, topk_ids, topk_weights, cuda_stream)
-        return self.sync_forward(hidden_states, cuda_stream)
+        return self.sync_forward(hidden_states, topk_ids, cuda_stream)
 
     @staticmethod
     def set_capture_batch_sizes(capture_bs: List[int]):

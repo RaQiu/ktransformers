@@ -287,6 +287,11 @@ struct GeneralMOEConfig {
   bool save = false;
   bool load = false;
 
+  // mmap mode: when true, weight pointers point directly into mmap'd regions.
+  // load_weights() should skip memcpy and use the pointers as-is.
+  // This avoids double-buffering when model size approaches physical RAM.
+  bool use_mmap = false;
+
   // for llamafile
   int m_block = 4;
   int group_min_len = 0;

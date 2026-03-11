@@ -47,6 +47,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
+        weight_strategy: str = "tiered",
     ):
         """
         Initialize AMX MoE Wrapper.
@@ -97,6 +98,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
+            weight_strategy=weight_strategy,
         )
 
         # AMX-specific: Check if we should load merged safetensor weights
@@ -278,6 +280,12 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
 
+        # Note: AMX backend loads from SafeTensors which copies data into PyTorch
+        # tensors (not mmap-backed). Setting use_mmap=True here would cause the
+        # C++ code to std::free aligned_alloc buffers and re-point to the
+        # SafeTensor-copied data, which works but provides no mmap benefit.
+        # Only the Llamafile/GGUF backend genuinely benefits from use_mmap.
+
         if self.cpu_save:
             moe_config.save = True
             moe_config.load = False
@@ -339,6 +347,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "RAWINT4",
+        weight_strategy: str = "tiered",
     ):
         if method == "RAWINT4" and not _HAS_RAWINT4_SUPPORT:
             raise RuntimeError(
@@ -379,6 +388,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
+            weight_strategy=weight_strategy,
         )
 
         if NativeMoEWrapper._native_loader_instance is None:

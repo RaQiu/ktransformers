@@ -207,40 +207,82 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     auto pool = config_.pool->get_subpool(tp_part_idx);
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     if (config_.gate_projs.size()) {
-      pool->do_work_stealing_job(
-          config_.expert_num, nullptr,
-          [this, physical_to_logical_map](int expert_id) {
-            // printf("Load layer %d [%d/%d]\n", config_.layer_idx, expert_id, config_.expert_num);
-            uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
-            {
-              size_t scale_size = config_.intermediate_size * sizeof(float);
-              size_t size = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size) - scale_size;
+      if (config_.use_mmap) {
+        // mmap zero-copy mode: point BufferB directly into mmap'd region.
+        // Free the original aligned_alloc'd buffers and replace with mmap pointers.
+        pool->do_work_stealing_job(
+            config_.expert_num, nullptr,
+            [this, physical_to_logical_map](int expert_id) {
+              uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
+              {
+                size_t scale_size = config_.intermediate_size * sizeof(float);
+                size_t size = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size) - scale_size;
 
-              memcpy(gate_bb_[expert_id]->b, config_.gate_projs[tp_part_idx][logical_expert_id], size);
+                // Free original buffer and point to mmap
+                std::free(gate_bb_[expert_id]->b);
+                gate_bb_[expert_id]->b =
+                    (typename decltype(gate_bb_[expert_id]->b))(config_.gate_projs[tp_part_idx][logical_expert_id]);
 
-              if constexpr (T::BufferB::SCALE) {
-                memcpy(gate_bb_[expert_id]->d, config_.gate_scales[tp_part_idx][logical_expert_id], scale_size);
+                if constexpr (T::BufferB::SCALE) {
+                  gate_bb_[expert_id]->d = (float*)(config_.gate_scales[tp_part_idx][logical_expert_id]);
+                }
+
+                std::free(up_bb_[expert_id]->b);
+                up_bb_[expert_id]->b =
+                    (typename decltype(up_bb_[expert_id]->b))(config_.up_projs[tp_part_idx][logical_expert_id]);
+
+                if constexpr (T::BufferB::SCALE) {
+                  up_bb_[expert_id]->d = (float*)(config_.up_scales[tp_part_idx][logical_expert_id]);
+                }
               }
 
-              memcpy(up_bb_[expert_id]->b, config_.up_projs[tp_part_idx][logical_expert_id], size);
+              {
+                std::free(down_bb_[expert_id]->b);
+                down_bb_[expert_id]->b =
+                    (typename decltype(down_bb_[expert_id]->b))(config_.down_projs[tp_part_idx][logical_expert_id]);
 
-              if constexpr (T::BufferB::SCALE) {
-                memcpy(up_bb_[expert_id]->d, config_.up_scales[tp_part_idx][logical_expert_id], scale_size);
+                if constexpr (T::BufferB::SCALE) {
+                  down_bb_[expert_id]->d = (float*)(config_.down_scales[tp_part_idx][logical_expert_id]);
+                }
               }
-            }
+            },
+            nullptr);
+      } else {
+        // Legacy copy mode
+        pool->do_work_stealing_job(
+            config_.expert_num, nullptr,
+            [this, physical_to_logical_map](int expert_id) {
+              uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
+              {
+                size_t scale_size = config_.intermediate_size * sizeof(float);
+                size_t size = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size) - scale_size;
 
-            {
-              size_t scale_size = config_.hidden_size * sizeof(float);
-              size_t size = T::BufferB::required_size(config_.hidden_size, config_.intermediate_size) - scale_size;
+                memcpy(gate_bb_[expert_id]->b, config_.gate_projs[tp_part_idx][logical_expert_id], size);
 
-              memcpy(down_bb_[expert_id]->b, config_.down_projs[tp_part_idx][logical_expert_id], size);
+                if constexpr (T::BufferB::SCALE) {
+                  memcpy(gate_bb_[expert_id]->d, config_.gate_scales[tp_part_idx][logical_expert_id], scale_size);
+                }
 
-              if constexpr (T::BufferB::SCALE) {
-                memcpy(down_bb_[expert_id]->d, config_.down_scales[tp_part_idx][logical_expert_id], scale_size);
+                memcpy(up_bb_[expert_id]->b, config_.up_projs[tp_part_idx][logical_expert_id], size);
+
+                if constexpr (T::BufferB::SCALE) {
+                  memcpy(up_bb_[expert_id]->d, config_.up_scales[tp_part_idx][logical_expert_id], scale_size);
+                }
               }
-            }
-          },
-          nullptr);
+
+              {
+                size_t scale_size = config_.hidden_size * sizeof(float);
+                size_t size = T::BufferB::required_size(config_.hidden_size, config_.intermediate_size) - scale_size;
+
+                memcpy(down_bb_[expert_id]->b, config_.down_projs[tp_part_idx][logical_expert_id], size);
+
+                if constexpr (T::BufferB::SCALE) {
+                  memcpy(down_bb_[expert_id]->d, config_.down_scales[tp_part_idx][logical_expert_id], scale_size);
+                }
+              }
+            },
+            nullptr);
+      }
 
     } else {
       int nth = T::recommended_nth(config_.intermediate_size);
