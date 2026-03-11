@@ -48,6 +48,9 @@ class AMXMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         weight_strategy: str = "tiered",
+        tier0_memory_gb: Optional[float] = None,
+        max_tier0_experts: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
     ):
         """
         Initialize AMX MoE Wrapper.
@@ -99,6 +102,9 @@ class AMXMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
             weight_strategy=weight_strategy,
+            tier0_memory_gb=tier0_memory_gb,
+            max_tier0_experts=max_tier0_experts,
+            num_moe_layers=num_moe_layers,
         )
 
         # AMX-specific: Check if we should load merged safetensor weights
@@ -348,6 +354,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "RAWINT4",
         weight_strategy: str = "tiered",
+        tier0_memory_gb: Optional[float] = None,
+        max_tier0_experts: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
     ):
         if method == "RAWINT4" and not _HAS_RAWINT4_SUPPORT:
             raise RuntimeError(
@@ -389,6 +398,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
             weight_strategy=weight_strategy,
+            tier0_memory_gb=tier0_memory_gb,
+            max_tier0_experts=max_tier0_experts,
+            num_moe_layers=num_moe_layers,
         )
 
         if NativeMoEWrapper._native_loader_instance is None:

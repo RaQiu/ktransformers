@@ -149,6 +149,11 @@ def test_config(
         ]
     )
 
+    if config.get("tier0_memory_gb") is not None:
+        cmd.extend(["--kt-tier0-memory-gb", str(config["tier0_memory_gb"])])
+    if config.get("max_tier0_experts") is not None:
+        cmd.extend(["--kt-max-tier0-experts", str(config["max_tier0_experts"])])
+
     # Add other SGLang options
     if config.get("attention_backend"):
         cmd.extend(["--attention-backend", config["attention_backend"]])

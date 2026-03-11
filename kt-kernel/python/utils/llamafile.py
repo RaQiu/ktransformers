@@ -42,6 +42,9 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "LLAMAFILE",
         weight_strategy: str = "tiered",
+        tier0_memory_gb: Optional[float] = None,
+        max_tier0_experts: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
     ):
         """
         Initialize Llamafile MoE Wrapper.
@@ -135,6 +138,9 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
             weight_strategy=weight_strategy,
+            tier0_memory_gb=tier0_memory_gb,
+            max_tier0_experts=max_tier0_experts,
+            num_moe_layers=num_moe_layers,
         )
 
         self.weights_to_keep = None

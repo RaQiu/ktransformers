@@ -174,6 +174,40 @@ class MmapWeightRegion:
         _madvise_willneed(self.ptr, self.n_bytes)
 
 
+def compute_max_tier0_experts(
+    tier0_memory_bytes: int,
+    num_layers: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    bytes_per_element: float = 0.5,  # Q4_K ≈ 0.5 bytes/element
+) -> int:
+    """
+    Compute how many experts can fit in the Tier 0 NUMA-local memory budget.
+
+    Tier 0 promotes the same expert IDs across ALL layers, so total memory is:
+        max_tier0_experts * num_layers * per_expert_per_layer_bytes
+
+    Args:
+        tier0_memory_bytes: Total memory budget for Tier 0 in bytes
+        num_layers: Number of MoE layers in the model
+        num_experts: Total experts per layer (for clamping)
+        hidden_size: Model hidden size (e.g., 7168)
+        intermediate_size: Expert intermediate size (e.g., 2048)
+        bytes_per_element: Quantization ratio (Q4_K≈0.5, Q8≈1.0, BF16≈2.0)
+
+    Returns:
+        Maximum number of experts that can be promoted to Tier 0
+    """
+    # Each expert has 3 projections: gate(H×I), up(H×I), down(I×H)
+    per_expert_per_layer = int(3 * hidden_size * intermediate_size * bytes_per_element)
+    if per_expert_per_layer <= 0 or num_layers <= 0:
+        return min(30, num_experts)
+    per_expert_total = per_expert_per_layer * num_layers
+    max_experts = int(tier0_memory_bytes / per_expert_total)
+    return max(1, min(max_experts, num_experts))
+
+
 class TieredWeightProvider:
     """
     Three-tier weight manager for MoE experts.
