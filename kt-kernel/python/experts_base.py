@@ -264,12 +264,21 @@ class BaseMoEWrapper(ABC):
         # and prefetch calls (which would cause a GPU sync in the hot path).
         if self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
             from .utils.weight_provider import TieredWeightProvider, compute_max_tier0_experts
+            import psutil
 
             # Fallback to environment variables if parameters not provided
             if tier0_memory_gb is None and "KT_TIER0_MEMORY_GB" in os.environ:
                 tier0_memory_gb = float(os.environ["KT_TIER0_MEMORY_GB"])
             if max_tier0_experts is None and "KT_MAX_TIER0_EXPERTS" in os.environ:
                 max_tier0_experts = int(os.environ["KT_MAX_TIER0_EXPERTS"])
+
+            # Auto-detect available memory if not specified
+            if tier0_memory_gb is None and max_tier0_experts is None:
+                available_gb = psutil.virtual_memory().available / (1024**3)
+                # Use all available memory minus 4GB safety margin for system
+                tier0_memory_gb = max(available_gb - 4.0, 1.0)
+                print(f"[TieredWeightProvider] Auto-detected {available_gb:.1f}GB available memory, "
+                      f"allocating {tier0_memory_gb:.1f}GB for tier0 (all available - 4GB safety margin)")
 
             effective_max_tier0 = max_tier0_experts or 30
             if tier0_memory_gb is not None:
@@ -281,7 +290,7 @@ class BaseMoEWrapper(ABC):
                     hidden_size=hidden_size,
                     intermediate_size=moe_intermediate_size,
                 )
-                print(f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb} → "
+                print(f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb:.1f} → "
                       f"max_tier0_experts={effective_max_tier0} "
                       f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * 0.5 / 1024**3:.1f}GB)")
 
