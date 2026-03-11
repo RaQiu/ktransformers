@@ -521,6 +521,8 @@ def _run_impl(
         env.update({k: str(v) for k, v in inference_env.items()})
 
     # Add tier0 parameters as environment variables (fallback for SGLang)
+    if weight_strategy:
+        env["KT_WEIGHT_STRATEGY"] = weight_strategy
     if tier0_memory_gb is not None:
         env["KT_TIER0_MEMORY_GB"] = str(tier0_memory_gb)
     if max_tier0_experts is not None:
@@ -670,14 +672,8 @@ def _build_sglang_command(
                 "--kt-gpu-prefill-token-threshold",
                 str(kt_gpu_prefill_threshold),
                 "--kt-enable-dynamic-expert-update",  # Enable dynamic expert updates
-                "--kt-weight-strategy",
-                weight_strategy,
             ]
         )
-        if tier0_memory_gb is not None:
-            cmd.extend(["--kt-tier0-memory-gb", str(tier0_memory_gb)])
-        if max_tier0_experts is not None:
-            cmd.extend(["--kt-max-tier0-experts", str(max_tier0_experts)])
 
     # Add SGLang options
     cmd.extend(

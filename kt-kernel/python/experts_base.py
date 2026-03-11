@@ -209,7 +209,11 @@ class BaseMoEWrapper(ABC):
         self.num_experts_per_tok = num_experts_per_tok
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
-        self.weight_strategy = weight_strategy
+
+        # Fallback to environment variable if not provided
+        if weight_strategy is None and "KT_WEIGHT_STRATEGY" in os.environ:
+            weight_strategy = os.environ["KT_WEIGHT_STRATEGY"]
+        self.weight_strategy = weight_strategy or "tiered"
 
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
