@@ -168,6 +168,9 @@ class BaseMoEWrapper(ABC):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         weight_strategy: str = "tiered",
+        tier0_memory_gb: Optional[float] = None,
+        max_tier0_experts: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
     ):
         """
         Initialize base MoE Wrapper.
@@ -191,6 +194,15 @@ class BaseMoEWrapper(ABC):
             method: Backend method string
             weight_strategy: Weight loading strategy. "auto" selects based on model/RAM ratio,
                              "legacy" forces malloc+copy, "tiered" forces mmap-based loading.
+            tier0_memory_gb: Physical memory budget for Tier 0 NUMA-local buffers (in GB).
+                             If set, overrides max_tier0_experts by computing how many experts
+                             fit in this budget across all layers.
+            max_tier0_experts: Maximum number of expert IDs promoted to Tier 0.
+                               If tier0_memory_gb is set, this is computed automatically.
+                               Defaults to 30.
+            num_moe_layers: Total number of MoE layers in the model. Required when
+                            tier0_memory_gb is set (for budget calculation). If None,
+                            estimated from registered layers.
         """
         self.layer_idx = layer_idx
         self.num_experts = num_experts
@@ -247,10 +259,32 @@ class BaseMoEWrapper(ABC):
         # self._provider, so AMX/RAWINT4 backends avoid useless record_activations
         # and prefetch calls (which would cause a GPU sync in the hot path).
         if self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
-            from .utils.weight_provider import TieredWeightProvider
+            from .utils.weight_provider import TieredWeightProvider, compute_max_tier0_experts
+
+            # Fallback to environment variables if parameters not provided
+            if tier0_memory_gb is None and "KT_TIER0_MEMORY_GB" in os.environ:
+                tier0_memory_gb = float(os.environ["KT_TIER0_MEMORY_GB"])
+            if max_tier0_experts is None and "KT_MAX_TIER0_EXPERTS" in os.environ:
+                max_tier0_experts = int(os.environ["KT_MAX_TIER0_EXPERTS"])
+
+            effective_max_tier0 = max_tier0_experts or 30
+            if tier0_memory_gb is not None:
+                effective_num_layers = num_moe_layers or 60  # fallback estimate
+                effective_max_tier0 = compute_max_tier0_experts(
+                    tier0_memory_bytes=int(tier0_memory_gb * 1024**3),
+                    num_layers=effective_num_layers,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size=moe_intermediate_size,
+                )
+                print(f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb} → "
+                      f"max_tier0_experts={effective_max_tier0} "
+                      f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * 0.5 / 1024**3:.1f}GB)")
+
             BaseMoEWrapper._tiered_provider = TieredWeightProvider(
                 num_experts=num_experts,
                 num_layers=1,  # dict-based storage, supports arbitrary layer_idx
+                max_tier0_experts=effective_max_tier0,
             )
         self._provider = None  # Set by subclass via _register_moe_with_provider()
 

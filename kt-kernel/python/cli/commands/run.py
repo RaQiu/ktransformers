@@ -81,6 +81,20 @@ from kt_kernel.cli.utils.user_model_registry import UserModelRegistry
     default=None,
     help="Weight loading strategy: tiered (mmap, default), legacy (malloc+copy)",
 )
+@click.option(
+    "--tier0-memory-gb",
+    "tier0_memory_gb",
+    type=float,
+    default=None,
+    help="Tier 0 NUMA memory budget in GB (auto-calculates max promoted experts)",
+)
+@click.option(
+    "--max-tier0-experts",
+    "max_tier0_experts",
+    type=int,
+    default=None,
+    help="Max expert IDs promoted to Tier 0 NUMA buffers (default: 30)",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -108,6 +122,8 @@ def run(
     advanced: bool,
     dry_run: bool,
     weight_strategy: Optional[str],
+    tier0_memory_gb: Optional[float],
+    max_tier0_experts: Optional[int],
 ) -> None:
     """Start model inference server.
 
@@ -165,6 +181,9 @@ def run(
         advanced=advanced,
         dry_run=dry_run,
         extra_cli_args=extra_cli_args,
+        weight_strategy=weight_strategy,
+        tier0_memory_gb=tier0_memory_gb,
+        max_tier0_experts=max_tier0_experts,
     )
 
 
@@ -192,6 +211,9 @@ def _run_impl(
     advanced: bool,
     dry_run: bool,
     extra_cli_args: list[str],
+    weight_strategy: Optional[str] = None,
+    tier0_memory_gb: Optional[float] = None,
+    max_tier0_experts: Optional[int] = None,
 ) -> None:
     """Actual implementation of run command."""
     # Check if SGLang is installed before proceeding
@@ -498,6 +520,12 @@ def _run_impl(
     if isinstance(inference_env, dict):
         env.update({k: str(v) for k, v in inference_env.items()})
 
+    # Add tier0 parameters as environment variables (fallback for SGLang)
+    if tier0_memory_gb is not None:
+        env["KT_TIER0_MEMORY_GB"] = str(tier0_memory_gb)
+    if max_tier0_experts is not None:
+        env["KT_MAX_TIER0_EXPERTS"] = str(max_tier0_experts)
+
     # Step 5: Show configuration summary
     console.print()
     print_step("Configuration")
@@ -646,6 +674,10 @@ def _build_sglang_command(
                 weight_strategy,
             ]
         )
+        if tier0_memory_gb is not None:
+            cmd.extend(["--kt-tier0-memory-gb", str(tier0_memory_gb)])
+        if max_tier0_experts is not None:
+            cmd.extend(["--kt-max-tier0-experts", str(max_tier0_experts)])
 
     # Add SGLang options
     cmd.extend(
