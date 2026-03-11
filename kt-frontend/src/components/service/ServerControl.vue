@@ -50,6 +50,12 @@
         <el-form-item label="Max Total Tokens">
           <el-input-number v-model="config.maxTokens" :min="1024" :step="1024" />
         </el-form-item>
+        <el-form-item label="Memory-Mapped Weights">
+          <el-switch v-model="config.useMmap" active-text="mmap" inactive-text="legacy" />
+          <div style="font-size: 12px; color: #909399; margin-top: 4px;">
+            Recommended ON when model size ≥ 70% of RAM. Avoids swap thrashing.
+          </div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showConfig = false">Cancel</el-button>
@@ -88,7 +94,8 @@ const config = ref({
   cpuThreads: 16,
   numaNodes: 2,
   tensorParallel: 1,
-  maxTokens: 32768
+  maxTokens: 32768,
+  useMmap: true
 })
 
 onMounted(async () => {

@@ -144,6 +144,8 @@ def test_config(
             config.get("kt_method", "AMXINT4"),
             "--kt-gpu-prefill-token-threshold",
             str(config.get("kt_gpu_prefill_threshold", 4096)),
+            "--kt-weight-strategy",
+            config.get("weight_strategy", "tiered"),
         ]
     )
 

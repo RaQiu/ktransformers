@@ -74,6 +74,13 @@ from kt_kernel.cli.utils.user_model_registry import UserModelRegistry
 @click.option("--quantize", "-q", is_flag=True, default=False, help="Quantize model")
 @click.option("--advanced", is_flag=True, default=False, help="Show advanced options")
 @click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Show command without executing")
+@click.option(
+    "--weight-strategy",
+    "weight_strategy",
+    type=click.Choice(["auto", "tiered", "legacy"]),
+    default=None,
+    help="Weight loading strategy: tiered (mmap, default), legacy (malloc+copy)",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -100,6 +107,7 @@ def run(
     quantize: bool,
     advanced: bool,
     dry_run: bool,
+    weight_strategy: Optional[str],
 ) -> None:
     """Start model inference server.
 
@@ -427,6 +435,7 @@ def _run_impl(
     # KT-kernel options
     final_kt_method = resolve(kt_method, "inference.kt_method", "AMXINT4")
     final_kt_gpu_prefill_threshold = resolve(kt_gpu_prefill_threshold, "inference.kt_gpu_prefill_token_threshold", 4096)
+    final_weight_strategy = resolve(weight_strategy, "inference.weight_strategy", "tiered")
 
     # SGLang options
     final_attention_backend = resolve(attention_backend, "inference.attention_backend", "flashinfer")
@@ -474,6 +483,7 @@ def _run_impl(
         disable_shared_experts_fusion=final_disable_shared_experts_fusion,
         tool_call_parser=final_tool_call_parser,
         reasoning_parser=final_reasoning_parser,
+        weight_strategy=final_weight_strategy,
         settings=settings,
         extra_model_params=extra_params,
         extra_cli_args=extra_cli_args,
@@ -505,6 +515,7 @@ def _run_impl(
     console.print(f"  NUMA Nodes (kt-threadpool-count): [cyan]{final_numa_nodes}[/cyan]")
     console.print(f"  Tensor Parallel: [cyan]{final_tensor_parallel_size}[/cyan]")
     console.print(f"  Method: [cyan]{final_kt_method}[/cyan]")
+    console.print(f"  Weight Strategy: [cyan]{final_weight_strategy}[/cyan]")
     console.print(f"  Attention: [cyan]{final_attention_backend}[/cyan]")
 
     # Weights info
@@ -579,6 +590,7 @@ def _build_sglang_command(
     disable_shared_experts_fusion: bool,
     tool_call_parser: Optional[str],
     reasoning_parser: Optional[str],
+    weight_strategy: str,
     settings,
     extra_model_params: Optional[dict] = None,  # New parameter for additional params
     extra_cli_args: Optional[list[str]] = None,  # Extra args from CLI to pass to sglang
@@ -630,6 +642,8 @@ def _build_sglang_command(
                 "--kt-gpu-prefill-token-threshold",
                 str(kt_gpu_prefill_threshold),
                 "--kt-enable-dynamic-expert-update",  # Enable dynamic expert updates
+                "--kt-weight-strategy",
+                weight_strategy,
             ]
         )
 
@@ -692,6 +706,7 @@ def _build_sglang_command(
             "watchdog-timeout",
             "served-model-name",
             "disable-shared-experts-fusion",
+            "kt-weight-strategy",
         }
 
         for key, value in extra_model_params.items():

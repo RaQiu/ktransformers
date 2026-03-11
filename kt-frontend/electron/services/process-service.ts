@@ -18,6 +18,9 @@ export class ProcessService {
     if (config.port) args.push('--port', config.port.toString())
     if (config.gpuExperts) args.push('--gpu-experts', config.gpuExperts.toString())
     if (config.cpuThreads) args.push('--cpu-threads', config.cpuThreads.toString())
+    if (config.useMmap !== undefined) {
+      args.push('--weight-strategy', config.useMmap ? 'tiered' : 'legacy')
+    }
 
     this.process = spawn('kt', args, { shell: true })
 
