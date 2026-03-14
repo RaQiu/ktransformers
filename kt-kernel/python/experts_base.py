@@ -13,8 +13,8 @@ import torch
 from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import os
-import ctypes
 import numpy as np
+from pathlib import Path
 
 from kt_kernel import kt_kernel_ext
 
@@ -148,9 +148,25 @@ class BaseMoEWrapper(ABC):
     """
 
     _cpu_infer_instance = None
+    _cpu_infer_signature: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
+    _active_wrapper_count: int = 0
     _layer_has_pending_deferred: Dict[int, bool] = {}
     _tiered_provider = None  # Singleton TieredWeightProvider
-    _prev_topk_ids: Optional[np.ndarray] = None  # Previous token's expert IDs for prefetch
+    _prev_topk_ids_by_layer: Dict[int, np.ndarray] = {}
+    _provider_backends = frozenset({"LLAMAFILE", "BF16"})
+
+    @staticmethod
+    def _detect_available_numa_node_ids() -> List[int]:
+        """Return actual Linux NUMA node ids instead of assuming 0..N-1."""
+        node_root = Path("/sys/devices/system/node")
+        node_ids: List[int] = []
+        if node_root.exists():
+            for entry in node_root.iterdir():
+                if entry.name.startswith("node") and entry.name[4:].isdigit():
+                    node_ids.append(int(entry.name[4:]))
+        if not node_ids:
+            return [0]
+        return sorted(set(node_ids))
 
     def __init__(
         self,
@@ -167,7 +183,7 @@ class BaseMoEWrapper(ABC):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
-        weight_strategy: str = "tiered",
+        weight_strategy: str = "auto",
         tier0_memory_gb: Optional[float] = None,
         max_tier0_experts: Optional[int] = None,
         num_moe_layers: Optional[int] = None,
@@ -192,8 +208,10 @@ class BaseMoEWrapper(ABC):
             cpu_save: Whether to save weights to CPU memory
             max_deferred_experts_per_token: Number of experts per token to defer on this layer. Defaults to 0 (no defer).
             method: Backend method string
-            weight_strategy: Weight loading strategy. "auto" selects based on model/RAM ratio,
-                             "legacy" forces malloc+copy, "tiered" forces mmap-based loading.
+            weight_strategy: Weight residency strategy. "auto" chooses between
+                             full-resident legacy mode and mmap+tier0 adaptive mode,
+                             "legacy" forces malloc+copy, "tiered" forces mmap baseline
+                             with hot experts promoted into Tier0 NUMA buffers.
             tier0_memory_gb: Physical memory budget for Tier 0 NUMA-local buffers (in GB).
                              If set, overrides max_tier0_experts by computing how many experts
                              fit in this budget across all layers.
@@ -209,11 +227,59 @@ class BaseMoEWrapper(ABC):
         self.num_experts_per_tok = num_experts_per_tok
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
+        self.cpuinfer_threads = cpuinfer_threads
+        self.threadpool_count = threadpool_count
 
-        # Fallback to environment variable if not provided
+        # Fallback to environment variable if not provided, then resolve "auto"
         if weight_strategy is None and "KT_WEIGHT_STRATEGY" in os.environ:
             weight_strategy = os.environ["KT_WEIGHT_STRATEGY"]
-        self.weight_strategy = weight_strategy or "tiered"
+
+        requested_weight_strategy = weight_strategy or "auto"
+        from .utils.weight_provider import backend_supports_tiered_strategy, resolve_backend_weight_strategy
+
+        backend_has_tiered = backend_supports_tiered_strategy(method)
+        if requested_weight_strategy in {"auto", "tiered"}:
+            from .utils.weight_provider import get_available_ram_bytes
+
+            effective_num_layers = num_moe_layers or 60
+            available_ram_bytes = get_available_ram_bytes()
+            resolved_strategy, estimated_model_bytes, total_ram_bytes = resolve_backend_weight_strategy(
+                method,
+                requested_weight_strategy,
+                num_layers=effective_num_layers,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=moe_intermediate_size,
+                available_ram_bytes=available_ram_bytes,
+            )
+            self.weight_strategy = resolved_strategy
+            if requested_weight_strategy == "auto":
+                if backend_has_tiered:
+                    tiered_mode = (
+                        "mmap + adaptive Tier0"
+                        if method in BaseMoEWrapper._provider_backends
+                        else "mmap baseline"
+                    )
+                    print(
+                        "[TieredWeightProvider] weight_strategy=auto -> "
+                        f"{self.weight_strategy} "
+                        f"(backend={method}, mode={tiered_mode}, "
+                        f"estimated_moe_weights={estimated_model_bytes / 1024**3:.1f}GB, "
+                        f"available_ram={available_ram_bytes / 1024**3:.1f}GB, "
+                        f"total_ram={total_ram_bytes / 1024**3:.1f}GB)"
+                    )
+                else:
+                    print(
+                        "[TieredWeightProvider] weight_strategy=auto -> legacy "
+                        f"(backend={method} uses resident weights; mmap-backed tiered loading is unavailable)"
+                    )
+            elif not backend_has_tiered and self.weight_strategy != requested_weight_strategy:
+                print(
+                    "[TieredWeightProvider] weight_strategy=tiered requested but downgraded to legacy "
+                    f"(backend={method} does not support mmap-backed expert weights)"
+                )
+        else:
+            self.weight_strategy = requested_weight_strategy
 
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
@@ -239,32 +305,66 @@ class BaseMoEWrapper(ABC):
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         self.method = method
+        self.max_tier0_experts = int(max_tier0_experts) if max_tier0_experts is not None else 0
+        self.tier0_memory_gb = tier0_memory_gb
 
-        # Initialize CPU inference engine (singleton)
+        if threadpool_count <= 0:
+            raise ValueError(f"threadpool_count must be positive, got {threadpool_count}")
+        if cpuinfer_threads < threadpool_count:
+            raise ValueError(
+                f"cpuinfer_threads ({cpuinfer_threads}) must be >= threadpool_count ({threadpool_count})"
+            )
+
+        available_numa_ids = BaseMoEWrapper._detect_available_numa_node_ids()
+        if threadpool_count > len(available_numa_ids):
+            raise ValueError(
+                f"threadpool_count ({threadpool_count}) exceeds detected NUMA nodes "
+                f"{available_numa_ids}"
+            )
+
+        subpool_numa_map = available_numa_ids[:threadpool_count]
+        subpool_thread_count = [
+            cpuinfer_threads // threadpool_count + (1 if i < cpuinfer_threads % threadpool_count else 0)
+            for i in range(threadpool_count)
+        ]
+        runtime_signature = (tuple(subpool_numa_map), tuple(subpool_thread_count))
+
+        # Initialize CPU inference engine (singleton per worker topology).
         if BaseMoEWrapper._cpu_infer_instance is None:
             worker_config = kt_kernel_ext.WorkerPoolConfig()
-
-            subpool_numa_map = list(range(threadpool_count))
-            subpool_thread_count = [
-                cpuinfer_threads // threadpool_count + (1 if i < cpuinfer_threads % threadpool_count else 0)
-                for i in range(threadpool_count)
-            ]
-
             worker_config.subpool_count = threadpool_count
             worker_config.subpool_numa_map = subpool_numa_map
             worker_config.subpool_thread_count = subpool_thread_count
             BaseMoEWrapper._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+            BaseMoEWrapper._cpu_infer_signature = runtime_signature
+        elif BaseMoEWrapper._cpu_infer_signature != runtime_signature:
+            if BaseMoEWrapper._active_wrapper_count > 0:
+                raise RuntimeError(
+                    "CPUInfer is already initialized with a different NUMA/thread layout. "
+                    "Destroy existing MoE wrappers before creating a new runtime topology."
+                )
+            BaseMoEWrapper.reset_runtime_state(force=True)
+            worker_config = kt_kernel_ext.WorkerPoolConfig()
+            worker_config.subpool_count = threadpool_count
+            worker_config.subpool_numa_map = subpool_numa_map
+            worker_config.subpool_thread_count = subpool_thread_count
+            BaseMoEWrapper._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+            BaseMoEWrapper._cpu_infer_signature = runtime_signature
 
         self.cpu_infer = BaseMoEWrapper._cpu_infer_instance
 
-        # Initialize tiered weight provider (singleton, only for tiered strategy).
+        # Initialize tiered weight provider only for backends that truly support
+        # mmap baseline + Tier0 promotion.
         # NOTE: self._provider is initially None for ALL backends.
-        # Only backends that call register_moe() (currently Llamafile) will set
-        # self._provider, so AMX/RAWINT4 backends avoid useless record_activations
-        # and prefetch calls (which would cause a GPU sync in the hot path).
-        if self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
-            from .utils.weight_provider import TieredWeightProvider, compute_max_tier0_experts
-            import psutil
+        provider_backend = method in BaseMoEWrapper._provider_backends
+        if provider_backend and self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
+            from .utils.weight_provider import (
+                TieredWeightProvider,
+                compute_max_tier0_experts,
+                get_available_ram_bytes,
+                method_bytes_per_element,
+                resolve_auto_tier0_budget_bytes,
+            )
 
             # Fallback to environment variables if parameters not provided
             if tier0_memory_gb is None and "KT_TIER0_MEMORY_GB" in os.environ:
@@ -274,11 +374,24 @@ class BaseMoEWrapper(ABC):
 
             # Auto-detect available memory if not specified
             if tier0_memory_gb is None and max_tier0_experts is None:
-                available_gb = psutil.virtual_memory().available / (1024**3)
-                # Use all available memory minus 4GB safety margin for system
-                tier0_memory_gb = max(available_gb - 4.0, 1.0)
-                print(f"[TieredWeightProvider] Auto-detected {available_gb:.1f}GB available memory, "
-                      f"allocating {tier0_memory_gb:.1f}GB for tier0 (all available - 4GB safety margin)")
+                available_gb = get_available_ram_bytes() / (1024**3)
+                effective_num_layers = num_moe_layers or 60
+                model_bytes = 0
+                from .utils.weight_provider import estimate_model_weight_bytes
+
+                model_bytes = estimate_model_weight_bytes(
+                    num_layers=effective_num_layers,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size=moe_intermediate_size,
+                    bytes_per_element=method_bytes_per_element(method),
+                )
+                tier0_bytes = resolve_auto_tier0_budget_bytes(model_bytes=model_bytes)
+                tier0_memory_gb = tier0_bytes / (1024**3)
+                print(
+                    f"[TieredWeightProvider] Auto-adapted tier0 budget: "
+                    f"available_ram={available_gb:.1f}GB, tier0={tier0_memory_gb:.1f}GB"
+                )
 
             effective_max_tier0 = max_tier0_experts or 30
             if tier0_memory_gb is not None:
@@ -289,16 +402,36 @@ class BaseMoEWrapper(ABC):
                     num_experts=num_experts,
                     hidden_size=hidden_size,
                     intermediate_size=moe_intermediate_size,
+                    bytes_per_element=method_bytes_per_element(method),
                 )
                 print(f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb:.1f} → "
                       f"max_tier0_experts={effective_max_tier0} "
-                      f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * 0.5 / 1024**3:.1f}GB)")
+                      f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * method_bytes_per_element(method) / 1024**3:.1f}GB)")
+
+            self.max_tier0_experts = effective_max_tier0
 
             BaseMoEWrapper._tiered_provider = TieredWeightProvider(
                 num_experts=num_experts,
                 num_layers=1,  # dict-based storage, supports arbitrary layer_idx
                 max_tier0_experts=effective_max_tier0,
             )
+        elif provider_backend and self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is not None:
+            if BaseMoEWrapper._tiered_provider.num_experts != num_experts:
+                if BaseMoEWrapper._active_wrapper_count > 0:
+                    raise RuntimeError(
+                        "TieredWeightProvider is already initialized for a different expert count. "
+                        "Destroy existing MoE wrappers before loading another MoE topology."
+                    )
+                BaseMoEWrapper._tiered_provider.stop_promotion_thread()
+                BaseMoEWrapper._tiered_provider = None
+                from .utils.weight_provider import TieredWeightProvider
+
+                BaseMoEWrapper._tiered_provider = TieredWeightProvider(
+                    num_experts=num_experts,
+                    num_layers=1,
+                    max_tier0_experts=max_tier0_experts or 30,
+                )
+            self.max_tier0_experts = BaseMoEWrapper._tiered_provider.max_tier0_experts
         self._provider = None  # Set by subclass via _register_moe_with_provider()
 
         # NOTE: promotion thread is NOT started here — it's started lazily
@@ -307,6 +440,8 @@ class BaseMoEWrapper(ABC):
 
         # Backend-specific initialization happens in subclasses
         self.moe = None
+        self._closed = False
+        BaseMoEWrapper._active_wrapper_count += 1
 
     def _register_moe_with_provider(self):
         """
@@ -314,14 +449,18 @@ class BaseMoEWrapper(ABC):
 
         Call this from subclass load_weights() AFTER self.moe is created.
         Only backends whose C++ MOE objects support promote_expert/demote_expert
-        should call this (currently Llamafile only).
+        should call this (currently Llamafile and BF16 tiered).
 
         This sets self._provider, which enables prefetch and record_activations
         in submit_forward/sync_forward.
         """
         provider = BaseMoEWrapper._tiered_provider
         if provider is not None and self.moe is not None:
-            provider.register_moe(self.layer_idx, self.moe)
+            provider.register_moe(
+                self.layer_idx,
+                self.moe,
+                gpu_experts_mask=self.gpu_experts_mask.detach().cpu().numpy(),
+            )
             self._provider = provider
 
     @abstractmethod
@@ -400,7 +539,6 @@ class BaseMoEWrapper(ABC):
             cuda_stream: CUDA stream for synchronization
         """
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        batch_size = flat_hidden_states.shape[0]
 
         (
             input_tensor_cpu,
@@ -423,8 +561,9 @@ class BaseMoEWrapper(ABC):
         # This avoids a GPU sync (.cpu().numpy()) in the hot path (PERF-1).
         # Previous-token IDs are a good predictor for current-token routing
         # because token sequences exhibit temporal locality in expert selection.
-        if self._provider is not None and BaseMoEWrapper._prev_topk_ids is not None:
-            self._provider.prefetch_layer(self.layer_idx, BaseMoEWrapper._prev_topk_ids)
+        prev_topk_ids = BaseMoEWrapper._prev_topk_ids_by_layer.get(self.layer_idx)
+        if self._provider is not None and prev_topk_ids is not None:
+            self._provider.prefetch_layer(self.layer_idx, prev_topk_ids)
 
         immediate_ids: torch.Tensor
         deferred_ids: Optional[torch.Tensor]
@@ -473,16 +612,6 @@ class BaseMoEWrapper(ABC):
 
     def sync_forward(self, hidden_states: torch.Tensor, topk_ids_or_stream=None, cuda_stream=None) -> torch.Tensor:
         """
-        # Backward compatibility: handle both old (hidden_states, cuda_stream) and new (hidden_states, topk_ids, cuda_stream) signatures
-        if cuda_stream is None and topk_ids_or_stream is not None:
-            if hasattr(topk_ids_or_stream, "cuda_stream"):
-                cuda_stream = topk_ids_or_stream
-                topk_ids = None
-            else:
-                cuda_stream = topk_ids_or_stream
-                topk_ids = None
-        else:
-            topk_ids = topk_ids_or_stream
         Synchronize and retrieve forward inference results.
 
         Args:
@@ -493,6 +622,15 @@ class BaseMoEWrapper(ABC):
         Returns:
             output_gpu: Output tensor on GPU
         """
+        # Backward compatibility:
+        #   sync_forward(hidden_states, cuda_stream)
+        #   sync_forward(hidden_states, topk_ids, cuda_stream)
+        if cuda_stream is None and topk_ids_or_stream is not None and hasattr(topk_ids_or_stream, "cuda_stream"):
+            cuda_stream = topk_ids_or_stream
+            topk_ids = None
+        else:
+            topk_ids = topk_ids_or_stream
+
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
             _input_tensor_cpu,
@@ -512,11 +650,11 @@ class BaseMoEWrapper(ABC):
         # Record activations for hotness tracking AFTER sync (not in hot path).
         # The .cpu().numpy() transfer is acceptable here because we've already
         # synchronized with the CPU worker — no pipeline bubble introduced.
-        if self._provider is not None:
+        if self._provider is not None and topk_ids is not None:
             ids_np = topk_ids.detach().cpu().numpy()
-            self._provider.record_activations(ids_np)
-            # Cache for next token's prefetch (avoid GPU sync in submit_forward)
-            BaseMoEWrapper._prev_topk_ids = ids_np
+            self._provider.record_activations(self.layer_idx, ids_np)
+            # Cache same-layer expert IDs for next-token prefetch without a hot-path GPU sync.
+            BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = ids_np
 
         return output_gpu[current_slot]
 
@@ -579,3 +717,59 @@ class BaseMoEWrapper(ABC):
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
+
+    @staticmethod
+    def reset_runtime_state(force: bool = False):
+        """
+        Reset global runtime singletons once no active wrappers remain.
+
+        force=True should only be used when the caller knows no live wrappers will
+        touch the old CPUInfer / provider objects afterwards.
+        """
+        if not force and BaseMoEWrapper._active_wrapper_count > 0:
+            raise RuntimeError("Cannot reset runtime state while MoE wrappers are still active")
+        provider = BaseMoEWrapper._tiered_provider
+        if provider is not None:
+            provider.stop_promotion_thread()
+        BaseMoEWrapper._tiered_provider = None
+        BaseMoEWrapper._cpu_infer_instance = None
+        BaseMoEWrapper._cpu_infer_signature = None
+        BaseMoEWrapper._layer_has_pending_deferred.clear()
+        BaseMoEWrapper._prev_topk_ids_by_layer.clear()
+        BaseMoEWrapper.clear_buffer_cache()
+
+    def close(self):
+        """Release layer-specific registrations and tear down globals when the last wrapper dies."""
+        if getattr(self, "_closed", False):
+            return
+
+        try:
+            if getattr(self, "cpu_infer", None) is not None:
+                self.cpu_infer.sync()
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_provider", None) is not None:
+                self._provider.unregister_moe(self.layer_idx)
+        except Exception:
+            pass
+
+        BaseMoEWrapper._layer_has_pending_deferred.pop(self.layer_idx, None)
+        BaseMoEWrapper._prev_topk_ids_by_layer.pop(self.layer_idx, None)
+
+        self._provider = None
+        self.moe = None
+        self._closed = True
+
+        if BaseMoEWrapper._active_wrapper_count > 0:
+            BaseMoEWrapper._active_wrapper_count -= 1
+
+        if BaseMoEWrapper._active_wrapper_count == 0:
+            BaseMoEWrapper.reset_runtime_state(force=True)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

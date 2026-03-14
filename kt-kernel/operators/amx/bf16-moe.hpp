@@ -13,6 +13,14 @@
 
 // #define DEBUG_BF16_MOE
 
+#ifndef _WIN32
+#include <numa.h>
+#include <sys/mman.h>
+#endif
+
+#include <atomic>
+#include <thread>
+
 #include "la/amx_kernels.hpp"  // For vec_mul/mat_mul
 #include "la/amx_raw_buffers.hpp"
 #include "la/amx_raw_kernels.hpp"
@@ -43,6 +51,40 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   using Base::up_bc_;
 
  public:
+  static constexpr bool kUsesLazyMmapPacking = true;
+
+#ifndef _WIN32
+ private:
+  enum ExpertState : uint8_t {
+    EXPERT_BASELINE = 0,
+    EXPERT_PACKING = 1,
+    EXPERT_CACHED = 2,
+    EXPERT_PINNED = 3,
+    EXPERT_DEMOTING = 4,
+  };
+
+  std::vector<const ggml_bf16_t*> baseline_gate_src_;
+  std::vector<const ggml_bf16_t*> baseline_up_src_;
+  std::vector<const ggml_bf16_t*> baseline_down_src_;
+
+  std::vector<void*> packed_gate_owner_;
+  std::vector<void*> packed_up_owner_;
+  std::vector<void*> packed_down_owner_;
+
+  std::unique_ptr<std::atomic<uint8_t>[]> expert_states_;
+  std::unique_ptr<std::atomic<uint32_t>[]> active_readers_;
+
+  std::atomic<int> resident_expert_count_{0};
+  std::atomic<int> eviction_cursor_{0};
+  int numa_node_ = 0;
+  int cache_capacity_ = 0;
+  size_t gate_weight_bytes_ = 0;
+  size_t up_weight_bytes_ = 0;
+  size_t down_weight_bytes_ = 0;
+  int full_intermediate_size_ = 0;
+#endif
+
+ public:
   using typename Base::input_t;
   using typename Base::output_t;
 
@@ -55,9 +97,31 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   void derived_init() {
     // BF16 has no quantization, no need to check quant_config
     printf("Created AMX_BF16_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+#ifndef _WIN32
+    if (config_.use_mmap) {
+      initialize_lazy_mmap_state();
+    }
+#endif
   }
 
-  ~AMX_BF16_MOE_TP() = default;
+  ~AMX_BF16_MOE_TP() {
+#ifndef _WIN32
+    if (config_.use_mmap) {
+      for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+        free_packed_expert(expert_id);
+      }
+    } else {
+      for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+        std::free(gate_bb_[expert_id]->b);
+        std::free(up_bb_[expert_id]->b);
+        std::free(down_bb_[expert_id]->b);
+        gate_bb_[expert_id]->b = nullptr;
+        up_bb_[expert_id]->b = nullptr;
+        down_bb_[expert_id]->b = nullptr;
+      }
+    }
+#endif
+  }
 
   // ============================================================================
   // CRTP buffer creation - without group_size
@@ -113,6 +177,243 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     }
   }
 
+#ifndef _WIN32
+  void initialize_lazy_mmap_state() {
+    const int en = config_.expert_num;
+    baseline_gate_src_.assign(en, nullptr);
+    baseline_up_src_.assign(en, nullptr);
+    baseline_down_src_.assign(en, nullptr);
+    packed_gate_owner_.assign(en, nullptr);
+    packed_up_owner_.assign(en, nullptr);
+    packed_down_owner_.assign(en, nullptr);
+    expert_states_ = std::make_unique<std::atomic<uint8_t>[]>(en);
+    active_readers_ = std::make_unique<std::atomic<uint32_t>[]>(en);
+    resident_expert_count_.store(0, std::memory_order_relaxed);
+    eviction_cursor_.store(0, std::memory_order_relaxed);
+    gate_weight_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
+    up_weight_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
+    down_weight_bytes_ = T::BufferB::required_size(config_.hidden_size, config_.intermediate_size);
+    cache_capacity_ = std::max(1, std::min(config_.expert_num, std::max(config_.max_tier0_experts, config_.num_experts_per_tok)));
+    full_intermediate_size_ =
+        config_.intermediate_size * std::max(1, config_.pool != nullptr ? config_.pool->config.subpool_count : 1);
+
+    if (config_.pool != nullptr && tp_part_idx < (int)config_.pool->config.subpool_numa_map.size()) {
+      numa_node_ = config_.pool->config.subpool_numa_map[tp_part_idx];
+    }
+
+    for (int expert_id = 0; expert_id < en; ++expert_id) {
+      expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_relaxed);
+      active_readers_[expert_id].store(0, std::memory_order_relaxed);
+      std::free(gate_bb_[expert_id]->b);
+      std::free(up_bb_[expert_id]->b);
+      std::free(down_bb_[expert_id]->b);
+      gate_bb_[expert_id]->b = nullptr;
+      up_bb_[expert_id]->b = nullptr;
+      down_bb_[expert_id]->b = nullptr;
+    }
+  }
+
+  void set_mmap_source_ptrs(int expert_id,
+                            const ggml_bf16_t* gate_src,
+                            const ggml_bf16_t* up_src,
+                            const ggml_bf16_t* down_src) {
+    baseline_gate_src_[expert_id] = gate_src;
+    baseline_up_src_[expert_id] = up_src;
+    baseline_down_src_[expert_id] = down_src;
+    expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+  }
+
+  void acquire_expert_read(int expert_id) {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+    active_readers_[expert_id].fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  void release_expert_read(int expert_id) {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+    active_readers_[expert_id].fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  class ExpertReadScope {
+   public:
+    ExpertReadScope(AMX_BF16_MOE_TP* owner, std::vector<int> expert_ids) : owner_(owner), experts_(std::move(expert_ids)) {
+      for (int expert_id : experts_) {
+        owner_->acquire_expert_read(expert_id);
+      }
+    }
+
+    ~ExpertReadScope() {
+      for (int expert_id : experts_) {
+        owner_->release_expert_read(expert_id);
+      }
+    }
+
+   private:
+    AMX_BF16_MOE_TP* owner_;
+    std::vector<int> experts_;
+  };
+
+  void free_packed_expert(int expert_id) {
+    void* gate_owner = packed_gate_owner_[expert_id];
+    void* up_owner = packed_up_owner_[expert_id];
+    void* down_owner = packed_down_owner_[expert_id];
+    packed_gate_owner_[expert_id] = nullptr;
+    packed_up_owner_[expert_id] = nullptr;
+    packed_down_owner_[expert_id] = nullptr;
+    gate_bb_[expert_id]->b = nullptr;
+    up_bb_[expert_id]->b = nullptr;
+    down_bb_[expert_id]->b = nullptr;
+
+    if (gate_owner) {
+      numa_free(gate_owner, gate_weight_bytes_);
+    }
+    if (up_owner) {
+      numa_free(up_owner, up_weight_bytes_);
+    }
+    if (down_owner) {
+      numa_free(down_owner, down_weight_bytes_);
+    }
+  }
+
+  bool evict_one_cached_expert(int exclude_expert_id) {
+    if (config_.expert_num <= 1) return false;
+
+    for (int attempt = 0; attempt < config_.expert_num; ++attempt) {
+      const int victim = (eviction_cursor_.fetch_add(1, std::memory_order_acq_rel) + attempt) % config_.expert_num;
+      if (victim == exclude_expert_id) {
+        continue;
+      }
+
+      uint8_t expected = EXPERT_CACHED;
+      if (!expert_states_[victim].compare_exchange_strong(
+              expected, EXPERT_DEMOTING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        continue;
+      }
+
+      if (active_readers_[victim].load(std::memory_order_acquire) != 0) {
+        expert_states_[victim].store(EXPERT_CACHED, std::memory_order_release);
+        continue;
+      }
+
+      free_packed_expert(victim);
+      resident_expert_count_.fetch_sub(1, std::memory_order_acq_rel);
+      expert_states_[victim].store(EXPERT_BASELINE, std::memory_order_release);
+      return true;
+    }
+
+    return false;
+  }
+
+  bool allocate_and_pack_expert(int expert_id, bool pin_after_pack) {
+    while (resident_expert_count_.load(std::memory_order_acquire) >= cache_capacity_) {
+      if (!evict_one_cached_expert(expert_id)) {
+        break;
+      }
+    }
+
+    void* gate_owner = numa_alloc_onnode(gate_weight_bytes_, numa_node_);
+    void* up_owner = numa_alloc_onnode(up_weight_bytes_, numa_node_);
+    void* down_owner = numa_alloc_onnode(down_weight_bytes_, numa_node_);
+    if (gate_owner == nullptr || up_owner == nullptr || down_owner == nullptr) {
+      if (gate_owner) numa_free(gate_owner, gate_weight_bytes_);
+      if (up_owner) numa_free(up_owner, up_weight_bytes_);
+      if (down_owner) numa_free(down_owner, down_weight_bytes_);
+      return false;
+    }
+
+    if (baseline_gate_src_[expert_id] == nullptr || baseline_up_src_[expert_id] == nullptr ||
+        baseline_down_src_[expert_id] == nullptr) {
+      numa_free(gate_owner, gate_weight_bytes_);
+      numa_free(up_owner, up_weight_bytes_);
+      numa_free(down_owner, down_weight_bytes_);
+      return false;
+    }
+
+    madvise((void*)baseline_gate_src_[expert_id], gate_weight_bytes_, MADV_WILLNEED);
+    madvise((void*)baseline_up_src_[expert_id], up_weight_bytes_, MADV_WILLNEED);
+    madvise((void*)baseline_down_src_[expert_id],
+            sizeof(ggml_bf16_t) * (size_t)config_.hidden_size * (size_t)full_intermediate_size_, MADV_WILLNEED);
+
+    gate_bb_[expert_id]->set_data(gate_owner);
+    up_bb_[expert_id]->set_data(up_owner);
+    down_bb_[expert_id]->set_data(down_owner);
+
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    int nth = T::recommended_nth(config_.intermediate_size);
+    pool->do_work_stealing_job(
+        nth * 2, nullptr,
+        [this, expert_id, nth](int task_id) {
+          const bool is_up = task_id >= nth;
+          const int ith = task_id % nth;
+          if (is_up) {
+            up_bb_[expert_id]->from_mat(const_cast<ggml_bf16_t*>(baseline_up_src_[expert_id]), ith, nth);
+          } else {
+            gate_bb_[expert_id]->from_mat(const_cast<ggml_bf16_t*>(baseline_gate_src_[expert_id]), ith, nth);
+          }
+        },
+        nullptr);
+
+    nth = T::recommended_nth(config_.hidden_size);
+    std::vector<ggml_bf16_t> down_contiguous((size_t)config_.hidden_size * (size_t)config_.intermediate_size);
+    const size_t down_col_offset = (size_t)tp_part_idx * (size_t)config_.intermediate_size;
+    for (int row = 0; row < config_.hidden_size; ++row) {
+      const ggml_bf16_t* src_row = baseline_down_src_[expert_id] + (size_t)row * (size_t)full_intermediate_size_ + down_col_offset;
+      ggml_bf16_t* dst_row = down_contiguous.data() + (size_t)row * (size_t)config_.intermediate_size;
+      std::memcpy(dst_row, src_row, sizeof(ggml_bf16_t) * (size_t)config_.intermediate_size);
+    }
+    pool->do_work_stealing_job(
+        nth, nullptr,
+        [this, expert_id, nth, &down_contiguous](int ith) {
+          down_bb_[expert_id]->from_mat(down_contiguous.data(), ith, nth);
+        },
+        nullptr);
+
+    packed_gate_owner_[expert_id] = gate_owner;
+    packed_up_owner_[expert_id] = up_owner;
+    packed_down_owner_[expert_id] = down_owner;
+    resident_expert_count_.fetch_add(1, std::memory_order_acq_rel);
+    expert_states_[expert_id].store(pin_after_pack ? EXPERT_PINNED : EXPERT_CACHED, std::memory_order_release);
+    return true;
+  }
+
+  void ensure_expert_ready(int expert_id, bool pin = false) {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+
+    for (;;) {
+      uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+      if (state == EXPERT_PINNED) {
+        return;
+      }
+      if (state == EXPERT_CACHED) {
+        if (!pin) {
+          return;
+        }
+        uint8_t expected = EXPERT_CACHED;
+        if (expert_states_[expert_id].compare_exchange_strong(
+                expected, EXPERT_PINNED, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          return;
+        }
+        continue;
+      }
+      if (state == EXPERT_BASELINE) {
+        uint8_t expected = EXPERT_BASELINE;
+        if (!expert_states_[expert_id].compare_exchange_strong(
+                expected, EXPERT_PACKING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          continue;
+        }
+        if (!allocate_and_pack_expert(expert_id, pin)) {
+          expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+          throw std::runtime_error("BF16 lazy-pack promotion failed");
+        }
+        continue;
+      }
+      if (state == EXPERT_PACKING || state == EXPERT_DEMOTING) {
+        std::this_thread::yield();
+        continue;
+      }
+    }
+  }
+#endif
+
 #ifdef DEBUG_BF16_MOE
   // Function to dump Buffer B data for debugging
   inline void dump_buffer_b(int expert_idx, const std::string& matrix_type, typename T::BufferB* buffer) {
@@ -157,6 +458,10 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
    * Loads weights from config_.gate_proj, up_proj, down_proj (no scales).
    */
   void load_weights() {
+    if (config_.use_mmap) {
+      return;
+    }
+
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
@@ -204,6 +509,87 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
 #ifdef DEBUG_BF16_MOE
     dump_buffer_b(0, "gate", gate_bb_[0].get());
     dump_buffer_b(0, "down", down_bb_[0].get());
+#endif
+  }
+
+  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+#ifndef _WIN32
+    std::unique_ptr<ExpertReadScope> expert_read_scope;
+    if (config_.use_mmap) {
+      std::vector<int> active_experts;
+      active_experts.reserve(qlen * k);
+      std::vector<uint8_t> seen(config_.expert_num, 0);
+
+      for (int i = 0; i < qlen * k; ++i) {
+        const int expert_id = (int)expert_ids[i];
+        if (config_.should_skip_expert(expert_id) || seen[expert_id]) {
+          continue;
+        }
+        seen[expert_id] = 1;
+        active_experts.push_back(expert_id);
+      }
+
+      expert_read_scope = std::make_unique<ExpertReadScope>(this, active_experts);
+      for (int expert_id : active_experts) {
+        ensure_expert_ready(expert_id, false);
+      }
+    }
+#endif
+    Base::forward(qlen, k, expert_ids, weights, input, output);
+  }
+
+  void promote_expert(int expert_id) {
+#ifndef _WIN32
+    ensure_expert_ready(expert_id, true);
+#else
+    (void)expert_id;
+#endif
+  }
+
+  void demote_expert(int expert_id) {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+
+    for (;;) {
+      uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+      if (state == EXPERT_BASELINE) {
+        return;
+      }
+      if (state == EXPERT_PACKING) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (state != EXPERT_CACHED && state != EXPERT_PINNED) {
+        return;
+      }
+
+      uint8_t expected = state;
+      if (!expert_states_[expert_id].compare_exchange_strong(
+              expected, EXPERT_DEMOTING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        continue;
+      }
+
+      while (active_readers_[expert_id].load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+      }
+
+      free_packed_expert(expert_id);
+      resident_expert_count_.fetch_sub(1, std::memory_order_acq_rel);
+      expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      return;
+    }
+#else
+    (void)expert_id;
+#endif
+  }
+
+  bool is_expert_promoted(int expert_id) const {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    return expert_states_[expert_id].load(std::memory_order_acquire) == EXPERT_PINNED;
+#else
+    (void)expert_id;
+    return false;
 #endif
   }
 
@@ -449,66 +835,101 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
     const bool use_per_expert_ptrs = !config.gate_projs.empty();
     const size_t full_weight_elems = (size_t)config.intermediate_size * config.hidden_size;
 
-    pool->dispense_backend()->do_numa_job([&, this](int i) {
-      auto& tpc = tps[i]->config_;
-      const size_t tp_weight_elems = (size_t)tpc.intermediate_size * tpc.hidden_size;
+    if (config.use_mmap) {
+      pool->dispense_backend()->do_numa_job([&, this](int i) {
+        auto& tpc = tps[i]->config_;
+        const size_t tp_weight_elems = (size_t)tpc.intermediate_size * tpc.hidden_size;
+        const size_t gate_up_weight_src_offset = (size_t)i * tp_weight_elems;
+        const size_t down_weight_src_col_offset = (size_t)i * (size_t)tpc.intermediate_size;
+        auto* tp = tps[i].get();
 
-      // Allocate BF16 weights (2 bytes/element)
-      tpc.gate_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
-      tpc.up_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
-      tpc.down_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
+        pool->get_subpool(i)->do_work_stealing_job(
+            tpc.expert_num, nullptr,
+            [&, tp](int expert_id) {
+              const size_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
 
-      const size_t tp_idx = (size_t)i;
-      const size_t gate_up_weight_src_offset = i * tp_weight_elems;
-      const size_t down_weight_src_col_offset = i * (size_t)tpc.intermediate_size;
+              const ggml_bf16_t* gate_src;
+              const ggml_bf16_t* up_src;
+              const ggml_bf16_t* down_src;
 
-      pool->get_subpool(i)->do_work_stealing_job(
-          tpc.expert_num, nullptr,
-          [&, &tpc](int expert_id_) {
-            const size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+              if (use_per_expert_ptrs) {
+                gate_src = (const ggml_bf16_t*)config.gate_projs[0][logical_expert_id] + gate_up_weight_src_offset;
+                up_src = (const ggml_bf16_t*)config.up_projs[0][logical_expert_id] + gate_up_weight_src_offset;
+                down_src = (const ggml_bf16_t*)config.down_projs[0][logical_expert_id];
+              } else {
+                gate_src = (const ggml_bf16_t*)config.gate_proj + logical_expert_id * full_weight_elems +
+                           gate_up_weight_src_offset;
+                up_src =
+                    (const ggml_bf16_t*)config.up_proj + logical_expert_id * full_weight_elems + gate_up_weight_src_offset;
+                down_src = (const ggml_bf16_t*)config.down_proj + logical_expert_id * full_weight_elems;
+              }
 
-            ggml_bf16_t* gate_dst = (ggml_bf16_t*)tpc.gate_proj + expert_id * tp_weight_elems;
-            ggml_bf16_t* up_dst = (ggml_bf16_t*)tpc.up_proj + expert_id * tp_weight_elems;
-            ggml_bf16_t* down_dst = (ggml_bf16_t*)tpc.down_proj + expert_id * tp_weight_elems;
+              (void)down_weight_src_col_offset;
+              tp->set_mmap_source_ptrs(expert_id, gate_src, up_src, down_src);
+            },
+            nullptr);
+      });
+    } else {
+      pool->dispense_backend()->do_numa_job([&, this](int i) {
+        auto& tpc = tps[i]->config_;
+        const size_t tp_weight_elems = (size_t)tpc.intermediate_size * tpc.hidden_size;
 
-            const ggml_bf16_t* gate_src;
-            const ggml_bf16_t* up_src;
-            const ggml_bf16_t* down_src;
+        // Allocate BF16 weights (2 bytes/element)
+        tpc.gate_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
+        tpc.up_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
+        tpc.down_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
 
-            if (use_per_expert_ptrs) {
-              gate_src = (const ggml_bf16_t*)config.gate_projs[0][expert_id] + gate_up_weight_src_offset;
-              up_src = (const ggml_bf16_t*)config.up_projs[0][expert_id] + gate_up_weight_src_offset;
-              down_src = (const ggml_bf16_t*)config.down_projs[0][expert_id];
-            } else {
-              gate_src =
-                  (const ggml_bf16_t*)config.gate_proj + expert_id * full_weight_elems + gate_up_weight_src_offset;
-              up_src = (const ggml_bf16_t*)config.up_proj + expert_id * full_weight_elems + gate_up_weight_src_offset;
-              down_src = (const ggml_bf16_t*)config.down_proj + expert_id * full_weight_elems;
-            }
+        const size_t gate_up_weight_src_offset = (size_t)i * tp_weight_elems;
+        const size_t down_weight_src_col_offset = (size_t)i * (size_t)tpc.intermediate_size;
 
-            // Copy gate and up weights
-            std::memcpy(gate_dst, gate_src, tp_weight_elems * sizeof(ggml_bf16_t));
-            std::memcpy(up_dst, up_src, tp_weight_elems * sizeof(ggml_bf16_t));
+        pool->get_subpool(i)->do_work_stealing_job(
+            tpc.expert_num, nullptr,
+            [&, &tpc](int expert_id) {
+              const size_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
 
-            // Copy down weights (row-wise split)
-            for (int row = 0; row < config.hidden_size; row++) {
-              const size_t src_row_offset = (size_t)row * (size_t)config.intermediate_size + down_weight_src_col_offset;
-              const size_t dst_row_offset = (size_t)row * (size_t)tpc.intermediate_size;
-              std::memcpy(down_dst + dst_row_offset, down_src + src_row_offset,
-                          (size_t)tpc.intermediate_size * sizeof(ggml_bf16_t));
-            }
-          },
-          nullptr);
-    });
+              ggml_bf16_t* gate_dst = (ggml_bf16_t*)tpc.gate_proj + expert_id * tp_weight_elems;
+              ggml_bf16_t* up_dst = (ggml_bf16_t*)tpc.up_proj + expert_id * tp_weight_elems;
+              ggml_bf16_t* down_dst = (ggml_bf16_t*)tpc.down_proj + expert_id * tp_weight_elems;
 
-    DO_TPS_LOAD_WEIGHTS(pool);
+              const ggml_bf16_t* gate_src;
+              const ggml_bf16_t* up_src;
+              const ggml_bf16_t* down_src;
 
-    pool->dispense_backend()->do_numa_job([&, this](int i) {
-      auto& tpc = tps[i]->config_;
-      delete[] (ggml_bf16_t*)tpc.gate_proj;
-      delete[] (ggml_bf16_t*)tpc.up_proj;
-      delete[] (ggml_bf16_t*)tpc.down_proj;
-    });
+              if (use_per_expert_ptrs) {
+                gate_src = (const ggml_bf16_t*)config.gate_projs[0][logical_expert_id] + gate_up_weight_src_offset;
+                up_src = (const ggml_bf16_t*)config.up_projs[0][logical_expert_id] + gate_up_weight_src_offset;
+                down_src = (const ggml_bf16_t*)config.down_projs[0][logical_expert_id];
+              } else {
+                gate_src = (const ggml_bf16_t*)config.gate_proj + logical_expert_id * full_weight_elems +
+                           gate_up_weight_src_offset;
+                up_src =
+                    (const ggml_bf16_t*)config.up_proj + logical_expert_id * full_weight_elems + gate_up_weight_src_offset;
+                down_src = (const ggml_bf16_t*)config.down_proj + logical_expert_id * full_weight_elems;
+              }
+
+              std::memcpy(gate_dst, gate_src, tp_weight_elems * sizeof(ggml_bf16_t));
+              std::memcpy(up_dst, up_src, tp_weight_elems * sizeof(ggml_bf16_t));
+
+              for (int row = 0; row < config.hidden_size; row++) {
+                const size_t src_row_offset =
+                    (size_t)row * (size_t)config.intermediate_size + down_weight_src_col_offset;
+                const size_t dst_row_offset = (size_t)row * (size_t)tpc.intermediate_size;
+                std::memcpy(down_dst + dst_row_offset, down_src + src_row_offset,
+                            (size_t)tpc.intermediate_size * sizeof(ggml_bf16_t));
+              }
+            },
+            nullptr);
+      });
+
+      DO_TPS_LOAD_WEIGHTS(pool);
+
+      pool->dispense_backend()->do_numa_job([&, this](int i) {
+        auto& tpc = tps[i]->config_;
+        delete[] (ggml_bf16_t*)tpc.gate_proj;
+        delete[] (ggml_bf16_t*)tpc.up_proj;
+        delete[] (ggml_bf16_t*)tpc.down_proj;
+      });
+    }
 
     this->weights_loaded = true;
   }
@@ -536,6 +957,25 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
                                             w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
     });
+  }
+
+  void promote_expert(int expert_id) {
+    if (this->tp_count <= 1) {
+      this->tps[0]->promote_expert(expert_id);
+      return;
+    }
+    this->config.pool->dispense_backend()->do_numa_job(
+        [this, expert_id](int tp_id) { this->tps[tp_id]->promote_expert(expert_id); });
+  }
+
+  void demote_expert(int expert_id) {
+    for (int i = 0; i < this->tp_count; ++i) {
+      this->tps[i]->demote_expert(expert_id);
+    }
+  }
+
+  bool is_expert_promoted(int expert_id) const {
+    return !this->tps.empty() && this->tps[0]->is_expert_promoted(expert_id);
   }
 };
 

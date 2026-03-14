@@ -8,7 +8,10 @@ This module provides loaders for:
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import struct
 import numpy as np
 import torch
 from enum import IntEnum
@@ -109,7 +112,9 @@ class SafeTensorLoader:
     tensor_file_map: dict
     tensor_type_map: dict
     file_handle_map: dict
+    file_memmap_map: dict
     tensor_device_map: dict
+    tensor_info_map: dict
 
     def __init__(self, file_path: str):
         self.__load_tensor_file_map(file_path)
@@ -122,9 +127,11 @@ class SafeTensorLoader:
         else:
             folder_path = file_path
         self.file_handle_map = {}
+        self.file_memmap_map = {}
         self.tensor_file_map = {}
         self.tensor_type_map = {}
         self.tensor_device_map = {}
+        self.tensor_info_map = {}
 
         found_safetensor = False
         for root, _, files in os.walk(folder_path):
@@ -132,26 +139,111 @@ class SafeTensorLoader:
             for file in files:
                 if file.endswith(".safetensors"):
                     found_safetensor = True
-                    file_path = os.path.join(root, file)
-                    if file not in self.file_handle_map:
+                    tensor_path = os.path.join(root, file)
+                    if tensor_path not in self.file_handle_map:
                         try:
-                            handle = safe_open(file_path, framework="pt")
-                            self.file_handle_map[file] = handle
+                            handle = safe_open(tensor_path, framework="pt")
+                            self.file_handle_map[tensor_path] = handle
+                            self._index_safetensor_file(tensor_path)
                         except Exception as e:
-                            print(f"Error opening Safetensor file {file_path}: {e}")
+                            print(f"Error opening Safetensor file {tensor_path}: {e}")
                             continue
 
-                    f = self.file_handle_map.get(file)
+                    f = self.file_handle_map.get(tensor_path)
                     if f is None:
                         continue
                     try:
                         for key in f.keys():
-                            self.tensor_file_map[key] = file
+                            self.tensor_file_map[key] = tensor_path
                     except Exception as e:
-                        print(f"Error reading Safetensor file {file_path}: {e}")
+                        print(f"Error reading Safetensor file {tensor_path}: {e}")
 
         if not found_safetensor:
             raise FileNotFoundError(f"No Safetensor files found in {folder_path}")
+
+    def _index_safetensor_file(self, file_path: str):
+        with open(file_path, "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_size))
+
+        data_base_offset = 8 + header_size
+        for key, info in header.items():
+            if key == "__metadata__":
+                continue
+            self.tensor_info_map[key] = {
+                "file_path": file_path,
+                "dtype": info["dtype"],
+                "shape": tuple(info["shape"]),
+                "offset": data_base_offset + int(info["data_offsets"][0]),
+            }
+
+    def _get_file_memmap(self, file_path: str) -> np.memmap:
+        mm = self.file_memmap_map.get(file_path)
+        if mm is None:
+            mm = np.memmap(file_path, mode="r", dtype=np.uint8)
+            self.file_memmap_map[file_path] = mm
+        return mm
+
+    def _get_dense_moe_layout(self, base_key: str) -> tuple[list[int], list[int]]:
+        up_base_key = re.escape(f"{base_key}.ffn_up_exps")
+        pattern = re.compile(rf"^{up_base_key}\.(\d+)\.numa\.(\d+)\.weight$")
+        expert_ids = set()
+        numa_ids = set()
+        for key in self.tensor_file_map:
+            match = pattern.match(key)
+            if match is None:
+                continue
+            expert_ids.add(int(match.group(1)))
+            numa_ids.add(int(match.group(2)))
+
+        if not expert_ids:
+            raise ValueError(f"No experts found for key {base_key}")
+
+        sorted_expert_ids = sorted(expert_ids)
+        sorted_numa_ids = sorted(numa_ids)
+        if sorted_expert_ids != list(range(len(sorted_expert_ids))):
+            raise ValueError(f"Expert ids for {base_key} must be dense and start at 0, got {sorted_expert_ids}")
+        if sorted_numa_ids != list(range(len(sorted_numa_ids))):
+            raise ValueError(f"NUMA ids for {base_key} must be dense and start at 0, got {sorted_numa_ids}")
+        return sorted_numa_ids, sorted_expert_ids
+
+    @staticmethod
+    def _dtype_for_mmap(dtype_name: str) -> np.dtype:
+        dtype_map = {
+            "BOOL": np.dtype(np.bool_),
+            "U8": np.dtype(np.uint8),
+            "I8": np.dtype(np.int8),
+            "U16": np.dtype(np.uint16),
+            "I16": np.dtype(np.int16),
+            "U32": np.dtype(np.uint32),
+            "I32": np.dtype(np.int32),
+            "U64": np.dtype(np.uint64),
+            "I64": np.dtype(np.int64),
+            "F16": np.dtype(np.float16),
+            "BF16": np.dtype(np.uint16),
+            "F32": np.dtype(np.float32),
+            "F64": np.dtype(np.float64),
+            "F8_E4M3FN": np.dtype(np.uint8),
+            "F8_E5M2": np.dtype(np.uint8),
+        }
+        try:
+            return dtype_map[dtype_name]
+        except KeyError as exc:
+            raise NotImplementedError(f"Unsupported safetensors dtype for mmap: {dtype_name}") from exc
+
+    def get_mmap_tensor(self, key: str) -> np.ndarray:
+        if key not in self.tensor_info_map:
+            raise KeyError(f"Key {key} not found in Safetensor files")
+        info = self.tensor_info_map[key]
+        backing = self._get_file_memmap(info["file_path"])
+        array = np.ndarray(
+            shape=info["shape"],
+            dtype=self._dtype_for_mmap(info["dtype"]),
+            buffer=backing,
+            offset=info["offset"],
+        )
+        array.flags.writeable = False
+        return array
 
     def load_tensor(self, key: str, device: str = "cpu"):
         if key not in self.tensor_file_map:
@@ -167,6 +259,7 @@ class SafeTensorLoader:
         for handle in self.file_handle_map.values():
             handle.close()
         self.file_handle_map.clear()
+        self.file_memmap_map.clear()
 
     def load_experts(self, base_key: str, device: str = "cpu"):
         """
@@ -187,23 +280,16 @@ class SafeTensorLoader:
         up_base_key = f"{base_key}.ffn_up_exps"
         gate_base_key = f"{base_key}.ffn_gate_exps"
         down_base_key = f"{base_key}.ffn_down_exps"
-        max_numa_id = -1
-        max_experts_count = -1
-        while self.has_tensor(f"{up_base_key}.{max_experts_count+1}.numa.{0}.weight"):
-            max_experts_count += 1
-        if max_experts_count == 0:
-            raise ValueError(f"No experts found for key {base_key}")
-        while self.has_tensor(f"{up_base_key}.{0}.numa.{max_numa_id+1}.weight"):
-            max_numa_id += 1
+        numa_ids, expert_ids = self._get_dense_moe_layout(base_key)
         # Initialize empty lists to store tensors for each projection type
-        up_weights = [[] for _ in range(max_numa_id + 1)]
-        gate_weights = [[] for _ in range(max_numa_id + 1)]
-        down_weights = [[] for _ in range(max_numa_id + 1)]
-        up_scales = [[] for _ in range(max_numa_id + 1)]
-        gate_scales = [[] for _ in range(max_numa_id + 1)]
-        down_scales = [[] for _ in range(max_numa_id + 1)]
-        for numa_id in range(max_numa_id + 1):
-            for expert_id in range(max_experts_count + 1):
+        up_weights = [[] for _ in numa_ids]
+        gate_weights = [[] for _ in numa_ids]
+        down_weights = [[] for _ in numa_ids]
+        up_scales = [[] for _ in numa_ids]
+        gate_scales = [[] for _ in numa_ids]
+        down_scales = [[] for _ in numa_ids]
+        for numa_id in numa_ids:
+            for expert_id in expert_ids:
                 up_key = f"{up_base_key}.{expert_id}.numa.{numa_id}.weight"
                 gate_key = f"{gate_base_key}.{expert_id}.numa.{numa_id}.weight"
                 down_key = f"{down_base_key}.{expert_id}.numa.{numa_id}.weight"
@@ -224,6 +310,43 @@ class SafeTensorLoader:
                 up_scales[numa_id].append(up_scale_tensor)
                 gate_scales[numa_id].append(gate_scale_tensor)
                 down_scales[numa_id].append(down_scale_tensor)
+        return {
+            "up": up_weights,
+            "gate": gate_weights,
+            "down": down_weights,
+            "up_scale": up_scales,
+            "gate_scale": gate_scales,
+            "down_scale": down_scales,
+        }
+
+    def load_experts_mmap(self, base_key: str):
+        """
+        Load expert weights as file-backed numpy views.
+
+        This keeps quantized data in the safetensors mmap baseline and lets C++
+        point directly into the mapped file when `use_mmap=True`.
+        """
+        up_base_key = f"{base_key}.ffn_up_exps"
+        gate_base_key = f"{base_key}.ffn_gate_exps"
+        down_base_key = f"{base_key}.ffn_down_exps"
+        numa_ids, expert_ids = self._get_dense_moe_layout(base_key)
+
+        up_weights = [[] for _ in numa_ids]
+        gate_weights = [[] for _ in numa_ids]
+        down_weights = [[] for _ in numa_ids]
+        up_scales = [[] for _ in numa_ids]
+        gate_scales = [[] for _ in numa_ids]
+        down_scales = [[] for _ in numa_ids]
+
+        for numa_id in numa_ids:
+            for expert_id in expert_ids:
+                up_weights[numa_id].append(self.get_mmap_tensor(f"{up_base_key}.{expert_id}.numa.{numa_id}.weight"))
+                gate_weights[numa_id].append(self.get_mmap_tensor(f"{gate_base_key}.{expert_id}.numa.{numa_id}.weight"))
+                down_weights[numa_id].append(self.get_mmap_tensor(f"{down_base_key}.{expert_id}.numa.{numa_id}.weight"))
+                up_scales[numa_id].append(self.get_mmap_tensor(f"{up_base_key}.{expert_id}.numa.{numa_id}.scale"))
+                gate_scales[numa_id].append(self.get_mmap_tensor(f"{gate_base_key}.{expert_id}.numa.{numa_id}.scale"))
+                down_scales[numa_id].append(self.get_mmap_tensor(f"{down_base_key}.{expert_id}.numa.{numa_id}.scale"))
+
         return {
             "up": up_weights,
             "gate": gate_weights,
@@ -619,6 +742,60 @@ class BF16SafeTensorLoader(SafeTensorLoader):
             "down": down_list,
         }
 
+    def load_experts_mmap(self, base_key: str):
+        """Load BF16 expert weights as zero-copy mmap views."""
+        if self._detected_format == "packed":
+            return self._load_experts_packed_mmap(base_key)
+
+        experts_prefix_candidates = self._get_experts_prefix_candidates(base_key)
+        gate_name, up_name, down_name = self._get_proj_names()
+
+        expert_count = 0
+        experts_prefix = None
+        for prefix in experts_prefix_candidates:
+            expert_count = 0
+            while self.has_tensor(f"{prefix}.{expert_count}.{gate_name}.weight"):
+                expert_count += 1
+            if expert_count > 0:
+                experts_prefix = prefix
+                break
+
+        if expert_count == 0 or experts_prefix is None:
+            raise ValueError(f"No experts found for keys: {experts_prefix_candidates}")
+
+        gate_weights = [None] * expert_count
+        up_weights = [None] * expert_count
+        down_weights = [None] * expert_count
+
+        for exp_id in range(expert_count):
+            gate_weights[exp_id] = self.get_mmap_tensor(f"{experts_prefix}.{exp_id}.{gate_name}.weight")
+            up_weights[exp_id] = self.get_mmap_tensor(f"{experts_prefix}.{exp_id}.{up_name}.weight")
+            down_weights[exp_id] = self.get_mmap_tensor(f"{experts_prefix}.{exp_id}.{down_name}.weight")
+
+        return {
+            "gate": gate_weights,
+            "up": up_weights,
+            "down": down_weights,
+        }
+
+    def _load_experts_packed_mmap(self, base_key: str):
+        """Load packed BF16 expert weights as zero-copy mmap views."""
+        experts_prefix = self._resolve_packed_experts_prefix(base_key)
+
+        gate_up = self.get_mmap_tensor(f"{experts_prefix}.gate_up_proj")
+        down = self.get_mmap_tensor(f"{experts_prefix}.down_proj")
+
+        mid = gate_up.shape[1] // 2
+        gate_list = [gate_up[i, :mid, :] for i in range(gate_up.shape[0])]
+        up_list = [gate_up[i, mid:, :] for i in range(gate_up.shape[0])]
+        down_list = [down[i] for i in range(down.shape[0])]
+
+        return {
+            "gate": gate_list,
+            "up": up_list,
+            "down": down_list,
+        }
+
 
 class CompressedSafeTensorLoader(SafeTensorLoader):
     """Loader for compressed SafeTensor layouts (RAWINT4 weights)."""
@@ -706,7 +883,7 @@ class GGUFLoader:
         else:
             raise ValueError(f"Path must be a .gguf file or a directory: {gguf_path}")
 
-        print(f"[GGUFLoader] Summary:")
+        print("[GGUFLoader] Summary:")
         print(f"  Files loaded: {len(self.file_data_map)}")
         print(f"  Total tensors: {len(self.tensor_info)}")
         print(f"  Metadata keys: {len(self.metadata)}")
@@ -727,7 +904,7 @@ class GGUFLoader:
             elif isinstance(value, np.ndarray) and value.dtype == np.uint8:
                 try:
                     value = bytes(value).decode("utf-8")
-                except:
+                except Exception:
                     pass
             self.metadata[key] = value
 
@@ -761,7 +938,7 @@ class GGUFLoader:
                     elif isinstance(value, np.ndarray) and value.dtype == np.uint8:
                         try:
                             value = bytes(value).decode("utf-8")
-                        except:
+                        except Exception:
                             pass
                     self.metadata[key] = value
 
@@ -874,7 +1051,7 @@ class GGUFLoader:
         Args:
             filter_keywords: Optional list of keywords to filter metadata keys
         """
-        print(f"\n[GGUFLoader] GGUF Metadata:")
+        print("\n[GGUFLoader] GGUF Metadata:")
         print(f"  Total metadata entries: {len(self.metadata)}")
 
         if filter_keywords:

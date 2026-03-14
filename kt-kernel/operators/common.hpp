@@ -291,6 +291,7 @@ struct GeneralMOEConfig {
   // load_weights() should skip memcpy and use the pointers as-is.
   // This avoids double-buffering when model size approaches physical RAM.
   bool use_mmap = false;
+  int max_tier0_experts = 0;
 
   // for llamafile
   int m_block = 4;

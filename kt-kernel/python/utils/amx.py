@@ -1,7 +1,7 @@
 import os
 import torch
-import ctypes
 from typing import Optional
+import numpy as np
 
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
@@ -31,6 +31,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
     """
 
     _safetensor_loader_instance = None  # Singleton SafeTensorLoader
+    _safetensor_loader_path = None
 
     def __init__(
         self,
@@ -47,7 +48,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
-        weight_strategy: str = "tiered",
+        weight_strategy: str = "auto",
         tier0_memory_gb: Optional[float] = None,
         max_tier0_experts: Optional[int] = None,
         num_moe_layers: Optional[int] = None,
@@ -116,8 +117,13 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
         # Initialize SafeTensor loader (singleton)
         if self.load_merged_weight:
-            if AMXMoEWrapper._safetensor_loader_instance is None:
+            resolved_weight_path = os.path.abspath(weight_path)
+            if (
+                AMXMoEWrapper._safetensor_loader_instance is None
+                or AMXMoEWrapper._safetensor_loader_path != resolved_weight_path
+            ):
                 AMXMoEWrapper._safetensor_loader_instance = SafeTensorLoader(weight_path)
+                AMXMoEWrapper._safetensor_loader_path = resolved_weight_path
             self.safetensor_loader = AMXMoEWrapper._safetensor_loader_instance
 
         # AMX-specific weight storage
@@ -127,6 +133,9 @@ class AMXMoEWrapper(BaseMoEWrapper):
         self.gate_scales = None
         self.up_scales = None
         self.down_scales = None
+        self._mmap_keepalive = None
+        self._uses_mmap_weights = False
+        self._uses_mmap_weights = False
 
     def load_weights_from_tensors(
         self,
@@ -204,9 +213,26 @@ class AMXMoEWrapper(BaseMoEWrapper):
         up_scale_ptrs = []
         down_scale_ptrs = []
 
+        use_mmap = self.weight_strategy == "tiered"
+        if use_mmap and not self.load_merged_weight:
+            print(
+                f"[AMXMoEWrapper] layer={self.layer_idx} requested tiered mmap loading, "
+                "but merged safetensors were not found; falling back to legacy resident loading"
+            )
+            use_mmap = False
+            self.weight_strategy = "legacy"
+
+        if use_mmap and self.cpu_save:
+            print(
+                f"[AMXMoEWrapper] layer={self.layer_idx} requested tiered mmap loading during cpu_save, "
+                "which requires resident buffers; falling back to legacy loading"
+            )
+            use_mmap = False
+            self.weight_strategy = "legacy"
+
         if self.load_merged_weight:
             base_key = f"blk.{self.layer_idx}"
-            w = self.safetensor_loader.load_experts(base_key)
+            w = self.safetensor_loader.load_experts_mmap(base_key) if use_mmap else self.safetensor_loader.load_experts(base_key)
 
             self.gate_weights = w["gate"]
             self.up_weights = w["up"]
@@ -217,50 +243,32 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
             # Get pointers to weight arrays
             gate_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(et.ctypes.data) for et in numa_array]
                 for numa_array in self.gate_weights
             ]
 
             up_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(et.ctypes.data) for et in numa_array]
                 for numa_array in self.up_weights
             ]
 
             down_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(et.ctypes.data) for et in numa_array]
                 for numa_array in self.down_weights
             ]
 
             gate_scale_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(et.ctypes.data) for et in numa_array]
                 for numa_array in self.gate_scales
             ]
 
             up_scale_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(et.ctypes.data) for et in numa_array]
                 for numa_array in self.up_scales
             ]
 
             down_scale_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(et.ctypes.data) for et in numa_array]
                 for numa_array in self.down_scales
             ]
 
@@ -285,12 +293,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
-
-        # Note: AMX backend loads from SafeTensors which copies data into PyTorch
-        # tensors (not mmap-backed). Setting use_mmap=True here would cause the
-        # C++ code to std::free aligned_alloc buffers and re-point to the
-        # SafeTensor-copied data, which works but provides no mmap benefit.
-        # Only the Llamafile/GGUF backend genuinely benefits from use_mmap.
+        moe_config.use_mmap = use_mmap
 
         if self.cpu_save:
             moe_config.save = True
@@ -322,9 +325,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
         # Load weights
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
+        self._uses_mmap_weights = use_mmap
 
         # Clean up temporary weight storage if using merged weights
-        if self.load_merged_weight:
+        if self.load_merged_weight and not use_mmap:
             del self.gate_weights
             del self.up_weights
             del self.down_weights
@@ -337,6 +341,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for RAWINT4/FP8/FP8_PERCHANNEL/BF16 experts stored in compressed SafeTensor format."""
 
     _native_loader_instance = None
+    _native_loader_signature = None
 
     def __init__(
         self,
@@ -353,7 +358,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "RAWINT4",
-        weight_strategy: str = "tiered",
+        weight_strategy: str = "auto",
         tier0_memory_gb: Optional[float] = None,
         max_tier0_experts: Optional[int] = None,
         num_moe_layers: Optional[int] = None,
@@ -403,7 +408,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
             num_moe_layers=num_moe_layers,
         )
 
-        if NativeMoEWrapper._native_loader_instance is None:
+        resolved_weight_path = os.path.abspath(weight_path)
+        loader_signature = (method, resolved_weight_path)
+        if (
+            NativeMoEWrapper._native_loader_instance is None
+            or NativeMoEWrapper._native_loader_signature != loader_signature
+        ):
             if method == "RAWINT4":
                 NativeMoEWrapper._native_loader_instance = CompressedSafeTensorLoader(weight_path)
             elif method == "FP8":
@@ -415,6 +425,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 NativeMoEWrapper._native_loader_instance = BF16SafeTensorLoader(weight_path)
             else:
                 raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
+            NativeMoEWrapper._native_loader_signature = loader_signature
         self.loader = NativeMoEWrapper._native_loader_instance
 
         self.gate_weights = None
@@ -438,7 +449,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         t0 = time.time()
         base_key = f"model.layers.{self.layer_idx}"
-        weights = self.loader.load_experts(base_key)
+        use_mmap = self.weight_strategy == "tiered" and self.method == "BF16"
+        if use_mmap and self.cpu_save:
+            print(
+                f"[NativeMoEWrapper] layer={self.layer_idx} requested tiered mmap loading during cpu_save, "
+                "which requires resident buffers; falling back to legacy loading"
+            )
+            use_mmap = False
+            self.weight_strategy = "legacy"
+
+        weights = self.loader.load_experts_mmap(base_key) if use_mmap else self.loader.load_experts(base_key)
         t1 = time.time()
 
         # Keep individual tensors instead of stacking - avoid expensive memory copy
@@ -480,9 +500,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         # Build pointer lists: [numa_id][expert_id] -> pointer
         # Since RAWINT4/FP8/BF16 has no numa sharding, numa dimension is 1
-        gate_ptrs = [[t.data_ptr() for t in self.gate_weights]]
-        up_ptrs = [[t.data_ptr() for t in self.up_weights]]
-        down_ptrs = [[t.data_ptr() for t in self.down_weights]]
+        def _ptr(weight):
+            if isinstance(weight, np.ndarray):
+                return int(weight.ctypes.data)
+            return weight.data_ptr()
+
+        gate_ptrs = [[_ptr(t) for t in self.gate_weights]]
+        up_ptrs = [[_ptr(t) for t in self.up_weights]]
+        down_ptrs = [[_ptr(t) for t in self.down_weights]]
 
         # BF16 has no scales, pass empty lists (will use 0/nullptr for consistency)
         if self.method == "BF16":
@@ -513,6 +538,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
+        moe_config.use_mmap = use_mmap
+        moe_config.max_tier0_experts = self.max_tier0_experts
 
         # Infer group_size from scale shape (column-major layout)
         # For gate/up projection: in_features = hidden_size
@@ -539,17 +566,30 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.moe = AMXBF16_MOE(moe_config)
         t4 = time.time()
 
+        if use_mmap and self.method == "BF16":
+            self._uses_mmap_weights = True
+            self._register_moe_with_provider()
+            self._register_bf16_mmap_regions()
+
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
         t5 = time.time()
 
-        del self.gate_weights
-        del self.up_weights
-        del self.down_weights
-        if self.gate_scales is not None:
-            del self.gate_scales
-            del self.up_scales
-            del self.down_scales
+        if use_mmap:
+            self._mmap_keepalive = (
+                self.gate_weights,
+                self.up_weights,
+                self.down_weights,
+            )
+            self._uses_mmap_weights = True
+        else:
+            del self.gate_weights
+            del self.up_weights
+            del self.down_weights
+            if self.gate_scales is not None:
+                del self.gate_scales
+                del self.up_scales
+                del self.down_scales
         t6 = time.time()
 
         print(
@@ -562,6 +602,27 @@ class NativeMoEWrapper(BaseMoEWrapper):
             f"cleanup: {(t6-t5)*1000:.1f}ms, "
             f"total: {(t6-t0)*1000:.1f}ms"
         )
+
+    def _register_bf16_mmap_regions(self):
+        """Register BF16 mmap source regions for provider prefetch."""
+        if self._provider is None:
+            return
+
+        from .weight_provider import MmapWeightRegion
+
+        self._provider.clear_layer_regions(self.layer_idx)
+
+        for proj_name, weights in (
+            ("gate", self.gate_weights),
+            ("up", self.up_weights),
+            ("down", self.down_weights),
+        ):
+            for expert_id, weight in enumerate(weights):
+                region = MmapWeightRegion.__new__(MmapWeightRegion)
+                region.ptr = int(weight.ctypes.data)
+                region.n_bytes = int(weight.nbytes)
+                region._view = weight
+                self._provider.register_mmap_region(self.layer_idx, proj_name, expert_id, region)
 
     def submit_write_weight_scale_to_buffer(
         self,
@@ -604,3 +665,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
         """
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
+
+    def close(self):
+        super().close()
+        self._mmap_keepalive = None
+        if BaseMoEWrapper._active_wrapper_count == 0:
+            NativeMoEWrapper._native_loader_instance = None
+            NativeMoEWrapper._native_loader_signature = None

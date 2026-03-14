@@ -48,6 +48,7 @@ static const bool _is_plain_ = false;
 #include <pybind11/stl.h>  // std::vector/std::pair/std::string conversions
 
 #include <cstdint>
+#include <concepts>
 #include <memory>
 #include <type_traits>
 
@@ -253,8 +254,11 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
-  // Bind promote/demote for Llamafile backend (tiered weight management)
-  if constexpr (std::is_same_v<MoeTP, LLAMA_MOE_TP>) {
+  if constexpr (requires(MoeClass moe, int expert_id) {
+                  moe.promote_expert(expert_id);
+                  moe.demote_expert(expert_id);
+                  { moe.is_expert_promoted(expert_id) } -> std::convertible_to<bool>;
+                }) {
     moe_cls.def("promote_expert", &MoeClass::promote_expert, py::arg("expert_id"),
                 "Promote an expert to Tier 0 (NUMA-local malloc) for ~80ns access latency");
     moe_cls.def("demote_expert", &MoeClass::demote_expert, py::arg("expert_id"),
@@ -562,6 +566,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("save", &GeneralMOEConfig::save)
       .def_readwrite("load", &GeneralMOEConfig::load)
       .def_readwrite("use_mmap", &GeneralMOEConfig::use_mmap)
+      .def_readwrite("max_tier0_experts", &GeneralMOEConfig::max_tier0_experts)
       .def_readwrite("m_block", &GeneralMOEConfig::m_block)
       .def_readwrite("group_min_len", &GeneralMOEConfig::group_min_len)
       .def_readwrite("group_max_len", &GeneralMOEConfig::group_max_len)

@@ -110,6 +110,12 @@ class AMX_MOE_BASE {
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
+    bool use_lazy_mmap_packing = false;
+    if constexpr (requires { Derived::kUsesLazyMmapPacking; }) {
+      use_lazy_mmap_packing = config_.use_mmap && Derived::kUsesLazyMmapPacking;
+    }
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
@@ -117,15 +123,22 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      size_t gate_bb_bytes = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+      size_t up_bb_bytes = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+      size_t down_bb_bytes = buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
+      if (use_lazy_mmap_packing) {
+        gate_bb_bytes = 64;
+        up_bb_bytes = 64;
+        down_bb_bytes = 64;
+      }
+
+      void* gate_bb_ptr = std::aligned_alloc(64, align64(gate_bb_bytes));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = std::aligned_alloc(64, align64(up_bb_bytes));
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      void* down_bb_ptr = std::aligned_alloc(64, align64(down_bb_bytes));
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp
@@ -219,7 +232,6 @@ class AMX_MOE_BASE {
     void* down_ba_pool_ptr = down_ba_pool_;
     void* down_bc_pool_ptr = down_bc_pool_;
     constexpr size_t M_STEP = T::M_STEP;
-    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
     size_t used_pool_m = 0;
     size_t used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0, used_pool_bytes_ba_down = 0,
            used_pool_bytes_bc_down = 0;
