@@ -193,6 +193,14 @@ class AMX_MOE_BASE {
     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
   }
 
+  // Optional mmap/tiered hooks. Backends that support expert promotion can
+  // override these in their derived type; other native backends keep no-op
+  // defaults so the shared TP wrapper still compiles.
+  void set_mmap_source_ptrs(int, const ggml_bf16_t*, const ggml_bf16_t*, const ggml_bf16_t*) {}
+  void promote_expert(int) {}
+  void demote_expert(int) {}
+  bool is_expert_promoted(int) const { return false; }
+
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
@@ -232,6 +240,7 @@ class AMX_MOE_BASE {
     void* down_ba_pool_ptr = down_ba_pool_;
     void* down_bc_pool_ptr = down_bc_pool_;
     constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
     size_t used_pool_m = 0;
     size_t used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0, used_pool_bytes_ba_down = 0,
            used_pool_bytes_bc_down = 0;

@@ -48,8 +48,10 @@ if(USE_CONDA_TOOLCHAIN)
     set(CMAKE_C_COMPILER   ${CONDA_CC}  CACHE FILEPATH "C compiler" FORCE)
     set(CMAKE_CXX_COMPILER ${CONDA_CXX} CACHE FILEPATH "C++ compiler" FORCE)
 else()
-    # Prefer system compilers explicitly to avoid accidentally picking conda wrappers from PATH
-    if(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
+    # Prefer system compilers explicitly only when the caller hasn't already
+    # selected a compiler via CC/CXX or -DCMAKE_<LANG>_COMPILER.
+    if(NOT DEFINED ENV{CC} AND NOT DEFINED ENV{CXX} AND
+       EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
         set(CMAKE_C_COMPILER   "/usr/bin/gcc" CACHE FILEPATH "C compiler" FORCE)
         set(CMAKE_CXX_COMPILER "/usr/bin/g++" CACHE FILEPATH "C++ compiler" FORCE)
     endif()
@@ -736,4 +738,3 @@ else()
         message(FATAL_ERROR "NUMA library not found, please install NUMA, sudo apt install libnuma-dev")
     endif()
 endif()
-

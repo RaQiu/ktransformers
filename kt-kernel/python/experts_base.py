@@ -10,6 +10,7 @@ This module contains base classes and utilities shared across all backend implem
 from __future__ import annotations
 
 import torch
+import json
 from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import os
@@ -154,6 +155,80 @@ class BaseMoEWrapper(ABC):
     _tiered_provider = None  # Singleton TieredWeightProvider
     _prev_topk_ids_by_layer: Dict[int, np.ndarray] = {}
     _provider_backends = frozenset({"LLAMAFILE", "BF16"})
+    _debug_moe_layers: Optional[set] = None
+    _debug_logged_layers: set = set()
+
+    @classmethod
+    def _should_debug_layer(cls, layer_idx: int) -> bool:
+        raw = os.environ.get("KT_DEBUG_MOE_LAYERS")
+        if not raw:
+            return False
+        if cls._debug_moe_layers is None:
+            values = set()
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    values.add(int(part))
+                except ValueError:
+                    pass
+            cls._debug_moe_layers = values
+        return layer_idx in cls._debug_moe_layers and layer_idx not in cls._debug_logged_layers
+
+    @staticmethod
+    def _debug_stats_tensor(t: torch.Tensor) -> dict:
+        x = t.detach().float()
+        finite = torch.isfinite(x)
+        return {
+            "shape": list(x.shape),
+            "min": float(x.min().item()) if x.numel() else 0.0,
+            "max": float(x.max().item()) if x.numel() else 0.0,
+            "mean": float(x.mean().item()) if x.numel() else 0.0,
+            "std": float(x.std().item()) if x.numel() > 1 else 0.0,
+            "l2": float(torch.linalg.vector_norm(x).item()) if x.numel() else 0.0,
+            "finite_ratio": float(finite.float().mean().item()) if x.numel() else 1.0,
+        }
+
+    def _debug_log_moe_once(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor],
+        output_tensor: torch.Tensor,
+    ) -> None:
+        if not BaseMoEWrapper._should_debug_layer(self.layer_idx):
+            return
+        BaseMoEWrapper._debug_logged_layers.add(self.layer_idx)
+        line = {
+            "layer": self.layer_idx,
+            "weight_strategy": self.weight_strategy,
+            "hidden": self._debug_stats_tensor(hidden_states),
+            "output": self._debug_stats_tensor(output_tensor),
+        }
+        if topk_ids is not None and torch.is_tensor(topk_ids):
+            ids = topk_ids.detach().cpu().reshape(-1)
+            line["topk_ids_head"] = ids[:32].tolist()
+            line["topk_ids_unique"] = int(ids.unique().numel()) if ids.numel() else 0
+        if topk_weights is not None and torch.is_tensor(topk_weights):
+            line["topk_weights"] = self._debug_stats_tensor(topk_weights)
+            line["topk_weights_head"] = topk_weights.detach().cpu().reshape(-1)[:32].tolist()
+        debug_path = os.environ.get("KT_DEBUG_MOE_LOG", "/tmp/kt_moe_debug.log")
+        with open(debug_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        dump_dir = os.environ.get("KT_DEBUG_MOE_DUMP_DIR")
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            dump_path = os.path.join(dump_dir, f"layer_{self.layer_idx}.pt")
+            payload = {
+                "layer": self.layer_idx,
+                "weight_strategy": self.weight_strategy,
+                "hidden_states": hidden_states.detach().cpu(),
+                "topk_ids": topk_ids.detach().cpu() if torch.is_tensor(topk_ids) else None,
+                "topk_weights": topk_weights.detach().cpu() if torch.is_tensor(topk_weights) else None,
+                "output_tensor": output_tensor.detach().cpu(),
+            }
+            torch.save(payload, dump_path)
 
     @staticmethod
     def _detect_available_numa_node_ids() -> List[int]:
@@ -230,9 +305,11 @@ class BaseMoEWrapper(ABC):
         self.cpuinfer_threads = cpuinfer_threads
         self.threadpool_count = threadpool_count
 
-        # Fallback to environment variable if not provided, then resolve "auto"
-        if weight_strategy is None and "KT_WEIGHT_STRATEGY" in os.environ:
-            weight_strategy = os.environ["KT_WEIGHT_STRATEGY"]
+        # Allow environment override so runtime experiments can force
+        # legacy/tiered without needing a dedicated launch_server flag.
+        env_weight_strategy = os.environ.get("KT_WEIGHT_STRATEGY")
+        if env_weight_strategy:
+            weight_strategy = env_weight_strategy
 
         requested_weight_strategy = weight_strategy or "auto"
         from .utils.weight_provider import backend_supports_tiered_strategy, resolve_backend_weight_strategy
@@ -280,6 +357,12 @@ class BaseMoEWrapper(ABC):
                 )
         else:
             self.weight_strategy = requested_weight_strategy
+
+        print(
+            "[KTWeightStrategy] "
+            f"env={env_weight_strategy!r} requested={requested_weight_strategy!r} "
+            f"resolved={self.weight_strategy!r} method={method!r} layer={layer_idx}"
+        )
 
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
@@ -580,34 +663,36 @@ class BaseMoEWrapper(ABC):
         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
 
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
-        self.cpu_infer.submit_with_cuda_stream(
-            cuda_stream,
-            self.moe.forward_task(
-                bsz_slot_tensor.data_ptr(),
-                immediate_experts_ids_cpu[current_slot].size(-1),
-                immediate_experts_ids_cpu[current_slot].data_ptr(),
-                weights_cpu[current_slot].data_ptr(),
-                input_tensor_cpu[current_slot].data_ptr(),
-                output_cpu[current_slot].data_ptr(),
-                incremental,
-            ),
+        immediate_task = self.moe.forward_task(
+            bsz_slot_tensor.data_ptr(),
+            immediate_experts_ids_cpu[current_slot].size(-1),
+            immediate_experts_ids_cpu[current_slot].data_ptr(),
+            weights_cpu[current_slot].data_ptr(),
+            input_tensor_cpu[current_slot].data_ptr(),
+            output_cpu[current_slot].data_ptr(),
+            incremental,
         )
+        if cuda_stream is None:
+            self.cpu_infer.submit(immediate_task)
+        else:
+            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         if deferred_ids is not None:
             deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
-            self.cpu_infer.submit_with_cuda_stream(
-                cuda_stream,
-                self.moe.forward_task(
-                    bsz_slot_tensor.data_ptr(),
-                    deferred_experts_ids_cpu[current_slot].size(-1),
-                    deferred_experts_ids_cpu[current_slot].data_ptr(),
-                    weights_cpu[current_slot].data_ptr(),
-                    input_tensor_cpu[current_slot].data_ptr(),
-                    output_cpu[next_slot].data_ptr(),
-                    False,
-                ),
+            deferred_task = self.moe.forward_task(
+                bsz_slot_tensor.data_ptr(),
+                deferred_experts_ids_cpu[current_slot].size(-1),
+                deferred_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                output_cpu[next_slot].data_ptr(),
+                False,
             )
+            if cuda_stream is None:
+                self.cpu_infer.submit(deferred_task)
+            else:
+                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def sync_forward(self, hidden_states: torch.Tensor, topk_ids_or_stream=None, cuda_stream=None) -> torch.Tensor:
@@ -625,11 +710,12 @@ class BaseMoEWrapper(ABC):
         # Backward compatibility:
         #   sync_forward(hidden_states, cuda_stream)
         #   sync_forward(hidden_states, topk_ids, cuda_stream)
-        if cuda_stream is None and topk_ids_or_stream is not None and hasattr(topk_ids_or_stream, "cuda_stream"):
-            cuda_stream = topk_ids_or_stream
-            topk_ids = None
-        else:
-            topk_ids = topk_ids_or_stream
+        topk_ids = topk_ids_or_stream
+        if cuda_stream is None and topk_ids_or_stream is not None:
+            is_stream_arg = hasattr(topk_ids_or_stream, "cuda_stream") or isinstance(topk_ids_or_stream, int)
+            if is_stream_arg:
+                cuda_stream = getattr(topk_ids_or_stream, "cuda_stream", topk_ids_or_stream)
+                topk_ids = None
 
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
@@ -644,8 +730,17 @@ class BaseMoEWrapper(ABC):
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
-        self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        if cuda_stream is None:
+            self.cpu_infer.sync(allow_pending)
+        else:
+            self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+        self._debug_log_moe_once(
+            flat_hidden_states,
+            _immediate_experts_ids_cpu[current_slot],
+            _weights_cpu[current_slot],
+            output_cpu[current_slot],
+        )
 
         # Record activations for hotness tracking AFTER sync (not in hot path).
         # The .cpu().numpy() transfer is acceptable here because we've already

@@ -31,7 +31,7 @@ class TP_MOE_Common : public MoE_Interface {
   std::vector<std::unique_ptr<T>> tps;
 
   std::vector<typename T::output_t*> local_output_numa;
-  T::output_t* local_output = nullptr;
+  typename T::output_t* local_output = nullptr;
 
   bool weights_loaded = false;
 

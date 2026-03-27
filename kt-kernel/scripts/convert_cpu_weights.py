@@ -563,11 +563,13 @@ class OnlineQuantConverter(ConverterBase):
         input_type: str = None,
         quant_method: str = "int4",
         merge_to_safetensor: bool = True,
+        fp8_expert_batch: int = 16,
     ):
         super().__init__(
             input_path, output_path, model_config, cpuinfer_threads, threadpool_count, input_type, merge_to_safetensor
         )
         self.quant_method = quant_method
+        self.fp8_expert_batch = max(1, int(fp8_expert_batch))
 
         # For FP8, get block size from model_config
         if input_type == "fp8":
@@ -605,6 +607,31 @@ class OnlineQuantConverter(ConverterBase):
         dequantized = dequantized.view(H, W).contiguous()
 
         return dequantized
+
+    def _dequantize_fp8_blockwise_batched(self, fp8_weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+        """Dequantize FP8 weights with block-wise scaling for a batch of experts.
+
+        Args:
+            fp8_weight: FP8 tensor of shape [B, H, W]
+            scale_inv: Scale inverse tensor of shape [B, H_blocks, W_blocks]
+
+        Returns:
+            Dequantized tensor of shape [B, H, W]
+        """
+        if fp8_weight.dim() != 3 or scale_inv.dim() != 3:
+            raise ValueError(
+                f"Expected batched FP8 tensors with rank 3, got {tuple(fp8_weight.shape)} and {tuple(scale_inv.shape)}"
+            )
+
+        batch, H, W = fp8_weight.shape
+        batch_s, H_blocks, W_blocks = scale_inv.shape
+        if batch != batch_s:
+            raise ValueError(f"Batch mismatch: fp8 batch={batch}, scale batch={batch_s}")
+
+        flat_weight = fp8_weight.reshape(batch * H, W).contiguous()
+        flat_scale = scale_inv.reshape(batch * H_blocks, W_blocks).contiguous()
+        dequantized = weight_dequant(flat_weight, flat_scale)
+        return dequantized.reshape(batch, H, W).contiguous()
 
     def _load_binary_tensor(self, file_path: str) -> torch.Tensor:
         """Load .kt format binary tensor file
@@ -796,31 +823,8 @@ class OnlineQuantConverter(ConverterBase):
 
                 # Load weights based on input type
                 if self.input_type == "fp8":
-                    # Load FP8 weights and their scale_inv tensors
-                    gate_scale_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight_scale_inv"
-                    up_scale_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight_scale_inv"
-                    down_scale_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight_scale_inv"
-
-                    if gate_scale_key not in self.tensor_file_map:
-                        raise KeyError(f"Missing gate weight_scale_inv for layer {layer_idx}, expert {expert_id}")
-                    if up_scale_key not in self.tensor_file_map:
-                        raise KeyError(f"Missing up weight_scale_inv for layer {layer_idx}, expert {expert_id}")
-                    if down_scale_key not in self.tensor_file_map:
-                        raise KeyError(f"Missing down weight_scale_inv for layer {layer_idx}, expert {expert_id}")
-
-                    # Load FP8 weights and scales
-                    gate_fp8 = self._load_tensor(gate_key).to("cuda")
-                    up_fp8 = self._load_tensor(up_key).to("cuda")
-                    down_fp8 = self._load_tensor(down_key).to("cuda")
-
-                    gate_scale_inv = self._load_tensor(gate_scale_key).to("cuda")
-                    up_scale_inv = self._load_tensor(up_scale_key).to("cuda")
-                    down_scale_inv = self._load_tensor(down_scale_key).to("cuda")
-
-                    # Dequantize FP8 to BF16 using block-wise scaling
-                    gate_weight = weight_dequant(gate_fp8, gate_scale_inv).to("cpu").to(torch.bfloat16).contiguous()
-                    up_weight = weight_dequant(up_fp8, up_scale_inv).to("cpu").to(torch.bfloat16).contiguous()
-                    down_weight = weight_dequant(down_fp8, down_scale_inv).to("cpu").to(torch.bfloat16).contiguous()
+                    # FP8 path is handled in expert batches below to make better use of GPU memory.
+                    pass
 
                 elif self.input_type == "fp16":
                     # Load FP16 and convert to BF16
@@ -837,9 +841,81 @@ class OnlineQuantConverter(ConverterBase):
                 else:
                     raise ValueError(f"Unsupported input_type for INT4 conversion: {self.input_type}")
 
-                gate_weights.append(gate_weight)
-                up_weights.append(up_weight)
-                down_weights.append(down_weight)
+                if self.input_type != "fp8":
+                    gate_weights.append(gate_weight)
+                    up_weights.append(up_weight)
+                    down_weights.append(down_weight)
+
+            if self.input_type == "fp8":
+                for batch_start in range(0, len(expert_ids), self.fp8_expert_batch):
+                    batch_expert_ids = expert_ids[batch_start : batch_start + self.fp8_expert_batch]
+
+                    gate_fp8_batch = []
+                    up_fp8_batch = []
+                    down_fp8_batch = []
+                    gate_scale_inv_batch = []
+                    up_scale_inv_batch = []
+                    down_scale_inv_batch = []
+
+                    for expert_id in batch_expert_ids:
+                        gate_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight"
+                        up_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight"
+                        down_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
+                        gate_scale_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight_scale_inv"
+                        up_scale_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight_scale_inv"
+                        down_scale_key = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight_scale_inv"
+
+                        if gate_scale_key not in self.tensor_file_map:
+                            raise KeyError(f"Missing gate weight_scale_inv for layer {layer_idx}, expert {expert_id}")
+                        if up_scale_key not in self.tensor_file_map:
+                            raise KeyError(f"Missing up weight_scale_inv for layer {layer_idx}, expert {expert_id}")
+                        if down_scale_key not in self.tensor_file_map:
+                            raise KeyError(f"Missing down weight_scale_inv for layer {layer_idx}, expert {expert_id}")
+
+                        gate_fp8_batch.append(self._load_tensor(gate_key))
+                        up_fp8_batch.append(self._load_tensor(up_key))
+                        down_fp8_batch.append(self._load_tensor(down_key))
+                        gate_scale_inv_batch.append(self._load_tensor(gate_scale_key))
+                        up_scale_inv_batch.append(self._load_tensor(up_scale_key))
+                        down_scale_inv_batch.append(self._load_tensor(down_scale_key))
+
+                    gate_fp8 = torch.stack(gate_fp8_batch, dim=0).to("cuda", non_blocking=True)
+                    up_fp8 = torch.stack(up_fp8_batch, dim=0).to("cuda", non_blocking=True)
+                    down_fp8 = torch.stack(down_fp8_batch, dim=0).to("cuda", non_blocking=True)
+                    gate_scale_inv = torch.stack(gate_scale_inv_batch, dim=0).to("cuda", non_blocking=True)
+                    up_scale_inv = torch.stack(up_scale_inv_batch, dim=0).to("cuda", non_blocking=True)
+                    down_scale_inv = torch.stack(down_scale_inv_batch, dim=0).to("cuda", non_blocking=True)
+
+                    gate_weight_batch = (
+                        self._dequantize_fp8_blockwise_batched(gate_fp8, gate_scale_inv)
+                        .to(torch.bfloat16)
+                        .cpu()
+                        .contiguous()
+                    )
+                    up_weight_batch = (
+                        self._dequantize_fp8_blockwise_batched(up_fp8, up_scale_inv)
+                        .to(torch.bfloat16)
+                        .cpu()
+                        .contiguous()
+                    )
+                    down_weight_batch = (
+                        self._dequantize_fp8_blockwise_batched(down_fp8, down_scale_inv)
+                        .to(torch.bfloat16)
+                        .cpu()
+                        .contiguous()
+                    )
+
+                    gate_weights.extend(gate_weight_batch.unbind(0))
+                    up_weights.extend(up_weight_batch.unbind(0))
+                    down_weights.extend(down_weight_batch.unbind(0))
+
+                    del gate_fp8, up_fp8, down_fp8
+                    del gate_scale_inv, up_scale_inv, down_scale_inv
+                    del gate_weight_batch, up_weight_batch, down_weight_batch
+                    del gate_fp8_batch, up_fp8_batch, down_fp8_batch
+                    del gate_scale_inv_batch, up_scale_inv_batch, down_scale_inv_batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Stack weights into single tensors: [num_experts, ...]
             gate_proj = torch.stack(gate_weights, dim=0).contiguous()
@@ -961,6 +1037,12 @@ def main():
         default=0,
         help="Resume conversion starting at this layer index (default: 0)",
     )
+    parser.add_argument(
+        "--fp8-expert-batch",
+        type=int,
+        default=16,
+        help="Number of experts to dequantize on GPU at once for fp8 input (default: 16)",
+    )
 
     args = parser.parse_args()
 
@@ -1007,6 +1089,7 @@ def main():
                 args.input_type,
                 quant_method,
                 merge_to_safetensor,
+                args.fp8_expert_batch,
             )
         else:
             raise ValueError(
