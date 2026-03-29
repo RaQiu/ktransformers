@@ -127,6 +127,8 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         self.gate_scales = None
         self.up_scales = None
         self.down_scales = None
+        self._mmap_keepalive = None
+        self._uses_mmap_weights = False
 
     def load_weights_from_tensors(
         self,
@@ -204,9 +206,30 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         up_scale_ptrs = []
         down_scale_ptrs = []
 
+        use_mmap = self.weight_strategy == "tiered"
+        if use_mmap and not self.load_merged_weight:
+            print(
+                f"[GeneralMoEWrapper] layer={self.layer_idx} requested tiered mmap loading, "
+                "but merged safetensors were not found; falling back to legacy resident loading"
+            )
+            use_mmap = False
+            self.weight_strategy = "legacy"
+
+        if use_mmap and self.cpu_save:
+            print(
+                f"[GeneralMoEWrapper] layer={self.layer_idx} requested tiered mmap loading during cpu_save, "
+                "which requires resident buffers; falling back to legacy loading"
+            )
+            use_mmap = False
+            self.weight_strategy = "legacy"
+
         if self.load_merged_weight:
             base_key = f"blk.{self.layer_idx}"
-            w = self.safetensor_loader.load_experts(base_key)
+            w = (
+                self.safetensor_loader.load_experts_mmap(base_key)
+                if use_mmap
+                else self.safetensor_loader.load_experts(base_key)
+            )
 
             self.gate_weights = w["gate"]
             self.up_weights = w["up"]
@@ -285,6 +308,8 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
+        moe_config.use_mmap = use_mmap
+        moe_config.max_tier0_experts = self.max_tier0_experts
 
         if self.cpu_save:
             moe_config.save = True
@@ -313,15 +338,59 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         else:
             raise NotImplementedError(f"Unsupported MoE method: {self.method}")
 
+        if use_mmap:
+            self._register_moe_with_provider()
+            self._register_moe_kernel_mmap_regions()
+
         # Load weights
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
+        self._uses_mmap_weights = use_mmap
 
         # Clean up temporary weight storage if using merged weights
-        if self.load_merged_weight:
+        if self.load_merged_weight and not use_mmap:
             del self.gate_weights
             del self.up_weights
             del self.down_weights
             del self.gate_scales
             del self.up_scales
             del self.down_scales
+        elif use_mmap:
+            self._mmap_keepalive = (
+                self.gate_weights,
+                self.up_weights,
+                self.down_weights,
+                self.gate_scales,
+                self.up_scales,
+                self.down_scales,
+            )
+
+    def _register_moe_kernel_mmap_regions(self):
+        """Register moe-kernel mmap source regions for provider prefetch."""
+        if self._provider is None:
+            return
+
+        from .weight_provider import MmapWeightRegion
+
+        self._provider.clear_layer_regions(self.layer_idx)
+
+        for proj_name, weights, scales in (
+            ("gate", self.gate_weights, self.gate_scales),
+            ("up", self.up_weights, self.up_scales),
+            ("down", self.down_weights, self.down_scales),
+        ):
+            for numa_array in weights:
+                for expert_id, weight in enumerate(numa_array):
+                    weight_region = MmapWeightRegion.__new__(MmapWeightRegion)
+                    weight_region.ptr = int(weight.ctypes.data)
+                    weight_region.n_bytes = int(weight.nbytes)
+                    weight_region._view = weight
+                    self._provider.register_mmap_region(self.layer_idx, f"{proj_name}_weight", expert_id, weight_region)
+
+            for numa_array in scales:
+                for expert_id, scale in enumerate(numa_array):
+                    scale_region = MmapWeightRegion.__new__(MmapWeightRegion)
+                    scale_region.ptr = int(scale.ctypes.data)
+                    scale_region.n_bytes = int(scale.nbytes)
+                    scale_region._view = scale
+                    self._provider.register_mmap_region(self.layer_idx, f"{proj_name}_scale", expert_id, scale_region)

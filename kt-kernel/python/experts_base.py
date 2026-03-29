@@ -154,7 +154,8 @@ class BaseMoEWrapper(ABC):
     _layer_has_pending_deferred: Dict[int, bool] = {}
     _tiered_provider = None  # Singleton TieredWeightProvider
     _prev_topk_ids_by_layer: Dict[int, np.ndarray] = {}
-    _provider_backends = frozenset({"LLAMAFILE", "BF16"})
+    # Backends whose C++ MOE objects expose promote/demote hooks for Tier0 management.
+    _provider_backends = frozenset({"LLAMAFILE", "BF16", "AMXINT4", "AMXINT8", "MOE_INT4", "MOE_INT8"})
     _debug_moe_layers: Optional[set] = None
     _debug_logged_layers: set = set()
 
@@ -333,9 +334,7 @@ class BaseMoEWrapper(ABC):
             if requested_weight_strategy == "auto":
                 if backend_has_tiered:
                     tiered_mode = (
-                        "mmap + adaptive Tier0"
-                        if method in BaseMoEWrapper._provider_backends
-                        else "mmap baseline"
+                        "mmap + adaptive Tier0" if method in BaseMoEWrapper._provider_backends else "mmap baseline"
                     )
                     print(
                         "[TieredWeightProvider] weight_strategy=auto -> "
@@ -394,15 +393,12 @@ class BaseMoEWrapper(ABC):
         if threadpool_count <= 0:
             raise ValueError(f"threadpool_count must be positive, got {threadpool_count}")
         if cpuinfer_threads < threadpool_count:
-            raise ValueError(
-                f"cpuinfer_threads ({cpuinfer_threads}) must be >= threadpool_count ({threadpool_count})"
-            )
+            raise ValueError(f"cpuinfer_threads ({cpuinfer_threads}) must be >= threadpool_count ({threadpool_count})")
 
         available_numa_ids = BaseMoEWrapper._detect_available_numa_node_ids()
         if threadpool_count > len(available_numa_ids):
             raise ValueError(
-                f"threadpool_count ({threadpool_count}) exceeds detected NUMA nodes "
-                f"{available_numa_ids}"
+                f"threadpool_count ({threadpool_count}) exceeds detected NUMA nodes " f"{available_numa_ids}"
             )
 
         subpool_numa_map = available_numa_ids[:threadpool_count]
@@ -442,6 +438,7 @@ class BaseMoEWrapper(ABC):
         provider_backend = method in BaseMoEWrapper._provider_backends
         if provider_backend and self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
             from .utils.weight_provider import (
+                constrain_tier0_memory_bytes,
                 TieredWeightProvider,
                 compute_max_tier0_experts,
                 get_available_ram_bytes,
@@ -478,18 +475,32 @@ class BaseMoEWrapper(ABC):
 
             effective_max_tier0 = max_tier0_experts or 30
             if tier0_memory_gb is not None:
+                requested_tier0_bytes = int(tier0_memory_gb * 1024**3)
+                constrained_tier0_bytes = constrain_tier0_memory_bytes(
+                    requested_tier0_bytes,
+                    available_ram_bytes=get_available_ram_bytes(),
+                )
+                if constrained_tier0_bytes < requested_tier0_bytes:
+                    print(
+                        "[TieredWeightProvider] tier0_memory_gb request was clamped by effective memory scope: "
+                        f"requested={tier0_memory_gb:.1f}GB, "
+                        f"effective={constrained_tier0_bytes / 1024**3:.1f}GB"
+                    )
+                tier0_memory_gb = constrained_tier0_bytes / (1024**3)
                 effective_num_layers = num_moe_layers or 60  # fallback estimate
                 effective_max_tier0 = compute_max_tier0_experts(
-                    tier0_memory_bytes=int(tier0_memory_gb * 1024**3),
+                    tier0_memory_bytes=constrained_tier0_bytes,
                     num_layers=effective_num_layers,
                     num_experts=num_experts,
                     hidden_size=hidden_size,
                     intermediate_size=moe_intermediate_size,
                     bytes_per_element=method_bytes_per_element(method),
                 )
-                print(f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb:.1f} → "
-                      f"max_tier0_experts={effective_max_tier0} "
-                      f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * method_bytes_per_element(method) / 1024**3:.1f}GB)")
+                print(
+                    f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb:.1f} → "
+                    f"max_tier0_experts={effective_max_tier0} "
+                    f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * method_bytes_per_element(method) / 1024**3:.1f}GB)"
+                )
 
             self.max_tier0_experts = effective_max_tier0
 
@@ -532,7 +543,7 @@ class BaseMoEWrapper(ABC):
 
         Call this from subclass load_weights() AFTER self.moe is created.
         Only backends whose C++ MOE objects support promote_expert/demote_expert
-        should call this (currently Llamafile and BF16 tiered).
+        should call this (currently Llamafile, BF16, AMXINT4, AMXINT8, MOE_INT4, and MOE_INT8 tiered).
 
         This sets self._provider, which enables prefetch and record_activations
         in submit_forward/sync_forward.

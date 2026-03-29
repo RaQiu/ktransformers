@@ -193,7 +193,9 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     gate_weight_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
     up_weight_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
     down_weight_bytes_ = T::BufferB::required_size(config_.hidden_size, config_.intermediate_size);
-    cache_capacity_ = std::max(1, std::min(config_.expert_num, std::max(config_.max_tier0_experts, config_.num_experts_per_tok)));
+    cache_capacity_ = config_.max_tier0_experts <= 0
+                          ? 0
+                          : std::min(config_.expert_num, std::max(config_.max_tier0_experts, config_.num_experts_per_tok));
     full_intermediate_size_ =
         config_.intermediate_size * std::max(1, config_.pool != nullptr ? config_.pool->config.subpool_count : 1);
 
@@ -304,9 +306,11 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   }
 
   bool allocate_and_pack_expert(int expert_id, bool pin_after_pack) {
-    while (resident_expert_count_.load(std::memory_order_acquire) >= cache_capacity_) {
-      if (!evict_one_cached_expert(expert_id)) {
-        break;
+    if (cache_capacity_ > 0) {
+      while (resident_expert_count_.load(std::memory_order_acquire) >= cache_capacity_) {
+        if (!evict_one_cached_expert(expert_id)) {
+          break;
+        }
       }
     }
 
@@ -515,8 +519,8 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
 #ifndef _WIN32
     std::unique_ptr<ExpertReadScope> expert_read_scope;
+    std::vector<int> active_experts;
     if (config_.use_mmap) {
-      std::vector<int> active_experts;
       active_experts.reserve(qlen * k);
       std::vector<uint8_t> seen(config_.expert_num, 0);
 
@@ -536,6 +540,17 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     }
 #endif
     Base::forward(qlen, k, expert_ids, weights, input, output);
+#ifndef _WIN32
+    if (config_.use_mmap && config_.max_tier0_experts <= 0 && !active_experts.empty()) {
+      // With zero Tier0 budget, keep mmap-backed experts only for the current
+      // forward pass and drop them immediately afterwards instead of retaining
+      // a cross-token resident cache.
+      expert_read_scope.reset();
+      for (int expert_id : active_experts) {
+        demote_expert(expert_id);
+      }
+    }
+#endif
   }
 
   void promote_expert(int expert_id) {

@@ -2,6 +2,8 @@
 
 import importlib.util
 import os
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -18,6 +20,10 @@ resolve_backend_weight_strategy = weight_provider.resolve_backend_weight_strateg
 resolve_weight_strategy = weight_provider.resolve_weight_strategy
 compute_max_tier0_experts = weight_provider.compute_max_tier0_experts
 resolve_auto_tier0_budget_bytes = weight_provider.resolve_auto_tier0_budget_bytes
+get_cgroup_memory_limit_current_bytes = weight_provider.get_cgroup_memory_limit_current_bytes
+get_available_ram_bytes = weight_provider.get_available_ram_bytes
+get_total_ram_bytes = weight_provider.get_total_ram_bytes
+constrain_tier0_memory_bytes = weight_provider.constrain_tier0_memory_bytes
 
 
 class DummyMoe:
@@ -162,6 +168,45 @@ def test_auto_tier0_budget_shrinks_as_memory_pressure_rises():
     assert low_pressure > high_pressure > 0
 
 
+def test_cgroup_v2_memory_limit_is_detected_from_process_scope():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        scoped = root / "system.slice" / "run-test.scope"
+        scoped.mkdir(parents=True)
+        (scoped / "memory.max").write_text(str(64 * 1024**3))
+        (scoped / "memory.current").write_text(str(12 * 1024**3))
+
+        limit, current = get_cgroup_memory_limit_current_bytes(
+            proc_self_cgroup_text="0::/system.slice/run-test.scope\n",
+            mountinfo_text="29 23 0:28 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw\n",
+            mount_root_override=root,
+        )
+
+    assert limit == 64 * 1024**3
+    assert current == 12 * 1024**3
+
+
+def test_ram_queries_prefer_cgroup_over_host_memory():
+    original = weight_provider.get_cgroup_memory_limit_current_bytes
+    try:
+        weight_provider.get_cgroup_memory_limit_current_bytes = lambda **_: (
+            64 * 1024**3,
+            12 * 1024**3,
+        )
+        assert get_total_ram_bytes() == 64 * 1024**3
+        assert get_available_ram_bytes() == 52 * 1024**3
+    finally:
+        weight_provider.get_cgroup_memory_limit_current_bytes = original
+
+
+def test_explicit_tier0_budget_is_clamped_to_effective_scope():
+    constrained = constrain_tier0_memory_bytes(
+        60 * 1024**3,
+        available_ram_bytes=32 * 1024**3,
+    )
+    assert constrained == 28 * 1024**3
+
+
 def test_provider_skips_gpu_experts_for_prefetch_and_promotion():
     """GPU-routed experts must not consume Tier0 promotion or mmap prefetch budget."""
     provider = TieredWeightProvider(num_experts=4, num_layers=2, max_tier0_experts=2)
@@ -211,15 +256,18 @@ def test_provider_prefetches_all_registered_regions_for_an_expert():
     assert region_b.prefetch_calls == 1
 
 
-def test_zero_tier0_budget_stays_in_pure_mmap_mode():
-    """A zero Tier0 budget must disable promotion entirely."""
-    assert compute_max_tier0_experts(
-        tier0_memory_bytes=0,
-        num_layers=60,
-        num_experts=256,
-        hidden_size=7168,
-        intermediate_size=2048,
-    ) == 0
+def test_zero_tier0_budget_disables_background_promotion():
+    """A zero Tier0 budget must disable provider-managed promotion entirely."""
+    assert (
+        compute_max_tier0_experts(
+            tier0_memory_bytes=0,
+            num_layers=60,
+            num_experts=256,
+            hidden_size=7168,
+            intermediate_size=2048,
+        )
+        == 0
+    )
 
     provider = TieredWeightProvider(num_experts=4, num_layers=1, max_tier0_experts=0)
     start_calls = []

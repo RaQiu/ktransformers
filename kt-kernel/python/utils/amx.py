@@ -232,7 +232,11 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
         if self.load_merged_weight:
             base_key = f"blk.{self.layer_idx}"
-            w = self.safetensor_loader.load_experts_mmap(base_key) if use_mmap else self.safetensor_loader.load_experts(base_key)
+            w = (
+                self.safetensor_loader.load_experts_mmap(base_key)
+                if use_mmap
+                else self.safetensor_loader.load_experts(base_key)
+            )
 
             self.gate_weights = w["gate"]
             self.up_weights = w["up"]
@@ -242,35 +246,17 @@ class AMXMoEWrapper(BaseMoEWrapper):
             self.down_scales = w["down_scale"]
 
             # Get pointers to weight arrays
-            gate_ptrs = [
-                [int(et.ctypes.data) for et in numa_array]
-                for numa_array in self.gate_weights
-            ]
+            gate_ptrs = [[int(et.ctypes.data) for et in numa_array] for numa_array in self.gate_weights]
 
-            up_ptrs = [
-                [int(et.ctypes.data) for et in numa_array]
-                for numa_array in self.up_weights
-            ]
+            up_ptrs = [[int(et.ctypes.data) for et in numa_array] for numa_array in self.up_weights]
 
-            down_ptrs = [
-                [int(et.ctypes.data) for et in numa_array]
-                for numa_array in self.down_weights
-            ]
+            down_ptrs = [[int(et.ctypes.data) for et in numa_array] for numa_array in self.down_weights]
 
-            gate_scale_ptrs = [
-                [int(et.ctypes.data) for et in numa_array]
-                for numa_array in self.gate_scales
-            ]
+            gate_scale_ptrs = [[int(et.ctypes.data) for et in numa_array] for numa_array in self.gate_scales]
 
-            up_scale_ptrs = [
-                [int(et.ctypes.data) for et in numa_array]
-                for numa_array in self.up_scales
-            ]
+            up_scale_ptrs = [[int(et.ctypes.data) for et in numa_array] for numa_array in self.up_scales]
 
-            down_scale_ptrs = [
-                [int(et.ctypes.data) for et in numa_array]
-                for numa_array in self.down_scales
-            ]
+            down_scale_ptrs = [[int(et.ctypes.data) for et in numa_array] for numa_array in self.down_scales]
 
         # Configure MoE
         moe_config = MOEConfig(
@@ -294,6 +280,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
         moe_config.use_mmap = use_mmap
+        moe_config.max_tier0_experts = self.max_tier0_experts
 
         if self.cpu_save:
             moe_config.save = True
@@ -322,6 +309,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
         else:
             raise NotImplementedError(f"Unsupported AMX method: {self.method}")
 
+        if use_mmap:
+            self._register_moe_with_provider()
+            self._register_amx_mmap_regions()
+
         # Load weights
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
@@ -335,6 +326,35 @@ class AMXMoEWrapper(BaseMoEWrapper):
             del self.gate_scales
             del self.up_scales
             del self.down_scales
+
+    def _register_amx_mmap_regions(self):
+        """Register AMX mmap source regions for provider prefetch."""
+        if self._provider is None:
+            return
+
+        from .weight_provider import MmapWeightRegion
+
+        self._provider.clear_layer_regions(self.layer_idx)
+
+        for proj_name, weights, scales in (
+            ("gate", self.gate_weights, self.gate_scales),
+            ("up", self.up_weights, self.up_scales),
+            ("down", self.down_weights, self.down_scales),
+        ):
+            for expert_id, weight in enumerate(weights):
+                weight_region = MmapWeightRegion.__new__(MmapWeightRegion)
+                weight_region.ptr = int(weight.ctypes.data)
+                weight_region.n_bytes = int(weight.nbytes)
+                weight_region._view = weight
+                self._provider.register_mmap_region(self.layer_idx, f"{proj_name}_weight", expert_id, weight_region)
+
+                if scales is not None:
+                    scale = scales[expert_id]
+                    scale_region = MmapWeightRegion.__new__(MmapWeightRegion)
+                    scale_region.ptr = int(scale.ctypes.data)
+                    scale_region.n_bytes = int(scale.nbytes)
+                    scale_region._view = scale
+                    self._provider.register_mmap_region(self.layer_idx, f"{proj_name}_scale", expert_id, scale_region)
 
 
 class NativeMoEWrapper(BaseMoEWrapper):

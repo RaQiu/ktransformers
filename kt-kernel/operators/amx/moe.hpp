@@ -14,6 +14,14 @@
 // #define FORWARD_TIME_PROFILE
 // #define FORWARD_TIME_REPORT
 
+#ifndef _WIN32
+#include <numa.h>
+#include <sys/mman.h>
+#endif
+
+#include <atomic>
+#include <thread>
+
 #include "moe_base.hpp"
 
 template <class T>
@@ -31,6 +39,50 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
+
+#ifndef _WIN32
+  enum ExpertState : uint8_t {
+    EXPERT_BASELINE = 0,
+    EXPERT_PACKING = 1,
+    EXPERT_CACHED = 2,
+    EXPERT_PINNED = 3,
+    EXPERT_DEMOTING = 4,
+  };
+
+  std::vector<void*> baseline_gate_weight_src_;
+  std::vector<void*> baseline_up_weight_src_;
+  std::vector<void*> baseline_down_weight_src_;
+  std::vector<float*> baseline_gate_scale_src_;
+  std::vector<float*> baseline_up_scale_src_;
+  std::vector<float*> baseline_down_scale_src_;
+  std::vector<float*> baseline_gate_mins_src_;
+  std::vector<float*> baseline_up_mins_src_;
+  std::vector<float*> baseline_down_mins_src_;
+
+  std::vector<void*> packed_gate_owner_;
+  std::vector<void*> packed_up_owner_;
+  std::vector<void*> packed_down_owner_;
+
+  std::unique_ptr<std::atomic<uint8_t>[]> expert_states_;
+  std::unique_ptr<std::atomic<uint32_t>[]> active_readers_;
+
+  std::atomic<int> resident_expert_count_{0};
+  std::atomic<int> eviction_cursor_{0};
+  int numa_node_ = 0;
+  int cache_capacity_ = 0;
+  size_t gate_total_bytes_ = 0;
+  size_t up_total_bytes_ = 0;
+  size_t down_total_bytes_ = 0;
+  size_t gate_weight_bytes_ = 0;
+  size_t up_weight_bytes_ = 0;
+  size_t down_weight_bytes_ = 0;
+  size_t gate_scale_bytes_ = 0;
+  size_t up_scale_bytes_ = 0;
+  size_t down_scale_bytes_ = 0;
+  size_t gate_mins_bytes_ = 0;
+  size_t up_mins_bytes_ = 0;
+  size_t down_mins_bytes_ = 0;
+#endif
 
 #ifdef CHECK
   char verify_bb[100000000];
@@ -136,6 +188,11 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
 
   void derived_init() {
     printf("Creating AMX_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+#ifndef _WIN32
+    if (config_.use_mmap) {
+      initialize_lazy_mmap_state();
+    }
+#endif
     auto& load = config_.load;
     auto& save = config_.save;
 
@@ -154,7 +211,320 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     }
   }
 
-  ~AMX_MOE_TP() = default;
+  ~AMX_MOE_TP() {
+#ifndef _WIN32
+    if (config_.use_mmap) {
+      for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+        free_packed_expert(expert_id);
+      }
+    }
+#endif
+  }
+
+#ifndef _WIN32
+  void initialize_lazy_mmap_state() {
+    const int en = config_.expert_num;
+    baseline_gate_weight_src_.assign(en, nullptr);
+    baseline_up_weight_src_.assign(en, nullptr);
+    baseline_down_weight_src_.assign(en, nullptr);
+    baseline_gate_scale_src_.assign(en, nullptr);
+    baseline_up_scale_src_.assign(en, nullptr);
+    baseline_down_scale_src_.assign(en, nullptr);
+    baseline_gate_mins_src_.assign(en, nullptr);
+    baseline_up_mins_src_.assign(en, nullptr);
+    baseline_down_mins_src_.assign(en, nullptr);
+    packed_gate_owner_.assign(en, nullptr);
+    packed_up_owner_.assign(en, nullptr);
+    packed_down_owner_.assign(en, nullptr);
+    expert_states_ = std::make_unique<std::atomic<uint8_t>[]>(en);
+    active_readers_ = std::make_unique<std::atomic<uint32_t>[]>(en);
+    resident_expert_count_.store(0, std::memory_order_relaxed);
+    eviction_cursor_.store(0, std::memory_order_relaxed);
+
+    gate_total_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
+    up_total_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
+    down_total_bytes_ = T::BufferB::required_size(config_.hidden_size, config_.intermediate_size);
+    gate_weight_bytes_ = reinterpret_cast<const char*>(gate_bb_[0]->d) - reinterpret_cast<const char*>(gate_bb_[0]->b);
+    up_weight_bytes_ = reinterpret_cast<const char*>(up_bb_[0]->d) - reinterpret_cast<const char*>(up_bb_[0]->b);
+    down_weight_bytes_ = reinterpret_cast<const char*>(down_bb_[0]->d) - reinterpret_cast<const char*>(down_bb_[0]->b);
+    if constexpr (requires { gate_bb_[0]->mins; }) {
+      gate_scale_bytes_ = reinterpret_cast<const char*>(gate_bb_[0]->mins) - reinterpret_cast<const char*>(gate_bb_[0]->d);
+      up_scale_bytes_ = reinterpret_cast<const char*>(up_bb_[0]->mins) - reinterpret_cast<const char*>(up_bb_[0]->d);
+      down_scale_bytes_ = reinterpret_cast<const char*>(down_bb_[0]->mins) - reinterpret_cast<const char*>(down_bb_[0]->d);
+      gate_mins_bytes_ = gate_total_bytes_ - gate_weight_bytes_ - gate_scale_bytes_;
+      up_mins_bytes_ = up_total_bytes_ - up_weight_bytes_ - up_scale_bytes_;
+      down_mins_bytes_ = down_total_bytes_ - down_weight_bytes_ - down_scale_bytes_;
+    } else {
+      gate_scale_bytes_ = gate_total_bytes_ - gate_weight_bytes_;
+      up_scale_bytes_ = up_total_bytes_ - up_weight_bytes_;
+      down_scale_bytes_ = down_total_bytes_ - down_weight_bytes_;
+    }
+    cache_capacity_ = config_.max_tier0_experts <= 0
+                          ? 0
+                          : std::min(config_.expert_num, std::max(config_.max_tier0_experts, config_.num_experts_per_tok));
+
+    if (config_.pool != nullptr && tp_part_idx < (int)config_.pool->config.subpool_numa_map.size()) {
+      numa_node_ = config_.pool->config.subpool_numa_map[tp_part_idx];
+    }
+
+    for (int expert_id = 0; expert_id < en; ++expert_id) {
+      expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_relaxed);
+      active_readers_[expert_id].store(0, std::memory_order_relaxed);
+      std::free(gate_bb_[expert_id]->b);
+      std::free(up_bb_[expert_id]->b);
+      std::free(down_bb_[expert_id]->b);
+      gate_bb_[expert_id]->b = nullptr;
+      up_bb_[expert_id]->b = nullptr;
+      down_bb_[expert_id]->b = nullptr;
+      gate_bb_[expert_id]->d = nullptr;
+      up_bb_[expert_id]->d = nullptr;
+      down_bb_[expert_id]->d = nullptr;
+      if constexpr (requires { gate_bb_[expert_id]->mins; }) {
+        gate_bb_[expert_id]->mins = nullptr;
+        up_bb_[expert_id]->mins = nullptr;
+        down_bb_[expert_id]->mins = nullptr;
+      }
+    }
+  }
+
+  void apply_baseline_ptrs(int expert_id) {
+    gate_bb_[expert_id]->b = reinterpret_cast<decltype(gate_bb_[expert_id]->b)>(baseline_gate_weight_src_[expert_id]);
+    up_bb_[expert_id]->b = reinterpret_cast<decltype(up_bb_[expert_id]->b)>(baseline_up_weight_src_[expert_id]);
+    down_bb_[expert_id]->b = reinterpret_cast<decltype(down_bb_[expert_id]->b)>(baseline_down_weight_src_[expert_id]);
+    gate_bb_[expert_id]->d = baseline_gate_scale_src_[expert_id];
+    up_bb_[expert_id]->d = baseline_up_scale_src_[expert_id];
+    down_bb_[expert_id]->d = baseline_down_scale_src_[expert_id];
+    if constexpr (requires { gate_bb_[expert_id]->mins; }) {
+      gate_bb_[expert_id]->mins = baseline_gate_mins_src_[expert_id];
+      up_bb_[expert_id]->mins = baseline_up_mins_src_[expert_id];
+      down_bb_[expert_id]->mins = baseline_down_mins_src_[expert_id];
+    }
+  }
+
+  void apply_owned_ptrs(int expert_id, void* gate_owner, void* up_owner, void* down_owner) {
+    gate_bb_[expert_id]->b = reinterpret_cast<decltype(gate_bb_[expert_id]->b)>(gate_owner);
+    up_bb_[expert_id]->b = reinterpret_cast<decltype(up_bb_[expert_id]->b)>(up_owner);
+    down_bb_[expert_id]->b = reinterpret_cast<decltype(down_bb_[expert_id]->b)>(down_owner);
+    gate_bb_[expert_id]->d = reinterpret_cast<float*>(reinterpret_cast<char*>(gate_owner) + gate_weight_bytes_);
+    up_bb_[expert_id]->d = reinterpret_cast<float*>(reinterpret_cast<char*>(up_owner) + up_weight_bytes_);
+    down_bb_[expert_id]->d = reinterpret_cast<float*>(reinterpret_cast<char*>(down_owner) + down_weight_bytes_);
+    if constexpr (requires { gate_bb_[expert_id]->mins; }) {
+      gate_bb_[expert_id]->mins = reinterpret_cast<float*>(reinterpret_cast<char*>(gate_owner) + gate_weight_bytes_ + gate_scale_bytes_);
+      up_bb_[expert_id]->mins = reinterpret_cast<float*>(reinterpret_cast<char*>(up_owner) + up_weight_bytes_ + up_scale_bytes_);
+      down_bb_[expert_id]->mins = reinterpret_cast<float*>(reinterpret_cast<char*>(down_owner) + down_weight_bytes_ + down_scale_bytes_);
+    }
+  }
+
+  void set_mmap_source_ptrs_quantized(int expert_id, void* gate_weight_src, void* up_weight_src, void* down_weight_src,
+                                      float* gate_scale_src, float* up_scale_src, float* down_scale_src,
+                                      float* gate_mins_src = nullptr, float* up_mins_src = nullptr,
+                                      float* down_mins_src = nullptr) {
+    baseline_gate_weight_src_[expert_id] = gate_weight_src;
+    baseline_up_weight_src_[expert_id] = up_weight_src;
+    baseline_down_weight_src_[expert_id] = down_weight_src;
+    baseline_gate_scale_src_[expert_id] = gate_scale_src;
+    baseline_up_scale_src_[expert_id] = up_scale_src;
+    baseline_down_scale_src_[expert_id] = down_scale_src;
+    baseline_gate_mins_src_[expert_id] = gate_mins_src;
+    baseline_up_mins_src_[expert_id] = up_mins_src;
+    baseline_down_mins_src_[expert_id] = down_mins_src;
+    apply_baseline_ptrs(expert_id);
+    expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+  }
+
+  void acquire_expert_read(int expert_id) {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+    active_readers_[expert_id].fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  void release_expert_read(int expert_id) {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+    active_readers_[expert_id].fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  class ExpertReadScope {
+   public:
+    ExpertReadScope(AMX_MOE_TP* owner, std::vector<int> expert_ids) : owner_(owner), experts_(std::move(expert_ids)) {
+      for (int expert_id : experts_) {
+        owner_->acquire_expert_read(expert_id);
+      }
+    }
+
+    ~ExpertReadScope() {
+      for (int expert_id : experts_) {
+        owner_->release_expert_read(expert_id);
+      }
+    }
+
+   private:
+    AMX_MOE_TP* owner_;
+    std::vector<int> experts_;
+  };
+
+  void free_packed_expert(int expert_id) {
+    void* gate_owner = packed_gate_owner_[expert_id];
+    void* up_owner = packed_up_owner_[expert_id];
+    void* down_owner = packed_down_owner_[expert_id];
+    packed_gate_owner_[expert_id] = nullptr;
+    packed_up_owner_[expert_id] = nullptr;
+    packed_down_owner_[expert_id] = nullptr;
+
+    if (gate_owner) {
+      numa_free(gate_owner, gate_total_bytes_);
+    }
+    if (up_owner) {
+      numa_free(up_owner, up_total_bytes_);
+    }
+    if (down_owner) {
+      numa_free(down_owner, down_total_bytes_);
+    }
+  }
+
+  bool evict_one_cached_expert(int exclude_expert_id) {
+    if (config_.expert_num <= 1) return false;
+
+    for (int attempt = 0; attempt < config_.expert_num; ++attempt) {
+      const int victim = (eviction_cursor_.fetch_add(1, std::memory_order_acq_rel) + attempt) % config_.expert_num;
+      if (victim == exclude_expert_id) {
+        continue;
+      }
+
+      uint8_t expected = EXPERT_CACHED;
+      if (!expert_states_[victim].compare_exchange_strong(
+              expected, EXPERT_DEMOTING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        continue;
+      }
+
+      if (active_readers_[victim].load(std::memory_order_acquire) != 0) {
+        expert_states_[victim].store(EXPERT_CACHED, std::memory_order_release);
+        continue;
+      }
+
+      free_packed_expert(victim);
+      apply_baseline_ptrs(victim);
+      resident_expert_count_.fetch_sub(1, std::memory_order_acq_rel);
+      expert_states_[victim].store(EXPERT_BASELINE, std::memory_order_release);
+      return true;
+    }
+
+    return false;
+  }
+
+  bool allocate_and_copy_expert(int expert_id, bool pin_after_copy) {
+    if (cache_capacity_ > 0) {
+      while (resident_expert_count_.load(std::memory_order_acquire) >= cache_capacity_) {
+        if (!evict_one_cached_expert(expert_id)) {
+          break;
+        }
+      }
+    }
+
+    void* gate_owner = numa_alloc_onnode(gate_total_bytes_, numa_node_);
+    void* up_owner = numa_alloc_onnode(up_total_bytes_, numa_node_);
+    void* down_owner = numa_alloc_onnode(down_total_bytes_, numa_node_);
+    if (gate_owner == nullptr || up_owner == nullptr || down_owner == nullptr) {
+      if (gate_owner) numa_free(gate_owner, gate_total_bytes_);
+      if (up_owner) numa_free(up_owner, up_total_bytes_);
+      if (down_owner) numa_free(down_owner, down_total_bytes_);
+      return false;
+    }
+
+    if (baseline_gate_weight_src_[expert_id] == nullptr || baseline_up_weight_src_[expert_id] == nullptr ||
+        baseline_down_weight_src_[expert_id] == nullptr || baseline_gate_scale_src_[expert_id] == nullptr ||
+        baseline_up_scale_src_[expert_id] == nullptr || baseline_down_scale_src_[expert_id] == nullptr) {
+      numa_free(gate_owner, gate_total_bytes_);
+      numa_free(up_owner, up_total_bytes_);
+      numa_free(down_owner, down_total_bytes_);
+      return false;
+    }
+
+    madvise(baseline_gate_weight_src_[expert_id], gate_weight_bytes_, MADV_WILLNEED);
+    madvise(baseline_up_weight_src_[expert_id], up_weight_bytes_, MADV_WILLNEED);
+    madvise(baseline_down_weight_src_[expert_id], down_weight_bytes_, MADV_WILLNEED);
+    madvise((void*)baseline_gate_scale_src_[expert_id], gate_scale_bytes_, MADV_WILLNEED);
+    madvise((void*)baseline_up_scale_src_[expert_id], up_scale_bytes_, MADV_WILLNEED);
+    madvise((void*)baseline_down_scale_src_[expert_id], down_scale_bytes_, MADV_WILLNEED);
+    if constexpr (requires { gate_bb_[expert_id]->mins; }) {
+      if (baseline_gate_mins_src_[expert_id] != nullptr) {
+        madvise((void*)baseline_gate_mins_src_[expert_id], gate_mins_bytes_, MADV_WILLNEED);
+      }
+      if (baseline_up_mins_src_[expert_id] != nullptr) {
+        madvise((void*)baseline_up_mins_src_[expert_id], up_mins_bytes_, MADV_WILLNEED);
+      }
+      if (baseline_down_mins_src_[expert_id] != nullptr) {
+        madvise((void*)baseline_down_mins_src_[expert_id], down_mins_bytes_, MADV_WILLNEED);
+      }
+    }
+
+    std::memcpy(gate_owner, baseline_gate_weight_src_[expert_id], gate_weight_bytes_);
+    std::memcpy(reinterpret_cast<char*>(gate_owner) + gate_weight_bytes_, baseline_gate_scale_src_[expert_id], gate_scale_bytes_);
+    std::memcpy(up_owner, baseline_up_weight_src_[expert_id], up_weight_bytes_);
+    std::memcpy(reinterpret_cast<char*>(up_owner) + up_weight_bytes_, baseline_up_scale_src_[expert_id], up_scale_bytes_);
+    std::memcpy(down_owner, baseline_down_weight_src_[expert_id], down_weight_bytes_);
+    std::memcpy(reinterpret_cast<char*>(down_owner) + down_weight_bytes_, baseline_down_scale_src_[expert_id], down_scale_bytes_);
+
+    if constexpr (requires { gate_bb_[expert_id]->mins; }) {
+      if (gate_mins_bytes_ > 0 && baseline_gate_mins_src_[expert_id] != nullptr) {
+        std::memcpy(reinterpret_cast<char*>(gate_owner) + gate_weight_bytes_ + gate_scale_bytes_,
+                    baseline_gate_mins_src_[expert_id], gate_mins_bytes_);
+      }
+      if (up_mins_bytes_ > 0 && baseline_up_mins_src_[expert_id] != nullptr) {
+        std::memcpy(reinterpret_cast<char*>(up_owner) + up_weight_bytes_ + up_scale_bytes_,
+                    baseline_up_mins_src_[expert_id], up_mins_bytes_);
+      }
+      if (down_mins_bytes_ > 0 && baseline_down_mins_src_[expert_id] != nullptr) {
+        std::memcpy(reinterpret_cast<char*>(down_owner) + down_weight_bytes_ + down_scale_bytes_,
+                    baseline_down_mins_src_[expert_id], down_mins_bytes_);
+      }
+    }
+
+    packed_gate_owner_[expert_id] = gate_owner;
+    packed_up_owner_[expert_id] = up_owner;
+    packed_down_owner_[expert_id] = down_owner;
+    apply_owned_ptrs(expert_id, gate_owner, up_owner, down_owner);
+    resident_expert_count_.fetch_add(1, std::memory_order_acq_rel);
+    expert_states_[expert_id].store(pin_after_copy ? EXPERT_PINNED : EXPERT_CACHED, std::memory_order_release);
+    return true;
+  }
+
+  void ensure_expert_ready(int expert_id, bool pin = false) {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+
+    for (;;) {
+      uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+      if (state == EXPERT_PINNED) {
+        return;
+      }
+      if (state == EXPERT_CACHED) {
+        if (!pin) {
+          return;
+        }
+        uint8_t expected = EXPERT_CACHED;
+        if (expert_states_[expert_id].compare_exchange_strong(
+                expected, EXPERT_PINNED, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          return;
+        }
+        continue;
+      }
+      if (state == EXPERT_BASELINE) {
+        uint8_t expected = EXPERT_BASELINE;
+        if (!expert_states_[expert_id].compare_exchange_strong(
+                expected, EXPERT_PACKING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          continue;
+        }
+        if (!allocate_and_copy_expert(expert_id, pin)) {
+          expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+          throw std::runtime_error("AMX lazy-copy promotion failed");
+        }
+        continue;
+      }
+      if (state == EXPERT_PACKING || state == EXPERT_DEMOTING) {
+        std::this_thread::yield();
+        continue;
+      }
+    }
+  }
+#endif
 
   // ============================================================================
   // CRTP buffer creation - no group_size
@@ -208,43 +578,26 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     if (config_.gate_projs.size()) {
       if (config_.use_mmap) {
-        // mmap zero-copy mode: point BufferB directly into mmap'd region.
-        // Free the original aligned_alloc'd buffers and replace with mmap pointers.
+        // mmap baseline mode: experts start on file-backed pointers and can be
+        // promoted into NUMA-local resident buffers on demand.
         pool->do_work_stealing_job(
             config_.expert_num, nullptr,
             [this, physical_to_logical_map](int expert_id) {
               uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
-              {
-                size_t scale_size = config_.intermediate_size * sizeof(float);
-                size_t size = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size) - scale_size;
-
-                // Free original buffer and point to mmap
-                std::free(gate_bb_[expert_id]->b);
-                gate_bb_[expert_id]->b =
-                    (decltype(gate_bb_[expert_id]->b))(config_.gate_projs[tp_part_idx][logical_expert_id]);
-
-                if constexpr (T::BufferB::SCALE) {
-                  gate_bb_[expert_id]->d = (float*)(config_.gate_scales[tp_part_idx][logical_expert_id]);
-                }
-
-                std::free(up_bb_[expert_id]->b);
-                up_bb_[expert_id]->b =
-                    (decltype(up_bb_[expert_id]->b))(config_.up_projs[tp_part_idx][logical_expert_id]);
-
-                if constexpr (T::BufferB::SCALE) {
-                  up_bb_[expert_id]->d = (float*)(config_.up_scales[tp_part_idx][logical_expert_id]);
-                }
+              float* gate_mins = nullptr;
+              float* up_mins = nullptr;
+              float* down_mins = nullptr;
+              if constexpr (requires { gate_bb_[expert_id]->mins; }) {
+                if (!config_.gate_zeros.empty()) gate_mins = (float*)(config_.gate_zeros[tp_part_idx][logical_expert_id]);
+                if (!config_.up_zeros.empty()) up_mins = (float*)(config_.up_zeros[tp_part_idx][logical_expert_id]);
+                if (!config_.down_zeros.empty()) down_mins = (float*)(config_.down_zeros[tp_part_idx][logical_expert_id]);
               }
-
-              {
-                std::free(down_bb_[expert_id]->b);
-                down_bb_[expert_id]->b =
-                    (decltype(down_bb_[expert_id]->b))(config_.down_projs[tp_part_idx][logical_expert_id]);
-
-                if constexpr (T::BufferB::SCALE) {
-                  down_bb_[expert_id]->d = (float*)(config_.down_scales[tp_part_idx][logical_expert_id]);
-                }
-              }
+              set_mmap_source_ptrs_quantized(
+                  expert_id, config_.gate_projs[tp_part_idx][logical_expert_id],
+                  config_.up_projs[tp_part_idx][logical_expert_id], config_.down_projs[tp_part_idx][logical_expert_id],
+                  (float*)config_.gate_scales[tp_part_idx][logical_expert_id],
+                  (float*)config_.up_scales[tp_part_idx][logical_expert_id],
+                  (float*)config_.down_scales[tp_part_idx][logical_expert_id], gate_mins, up_mins, down_mins);
             },
             nullptr);
       } else {
@@ -388,6 +741,96 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     }
   }
 
+  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+#ifndef _WIN32
+    std::unique_ptr<ExpertReadScope> expert_read_scope;
+    std::vector<int> active_experts;
+    if (config_.use_mmap) {
+      active_experts.reserve(qlen * k);
+      std::vector<uint8_t> seen(config_.expert_num, 0);
+
+      for (int i = 0; i < qlen * k; ++i) {
+        const int expert_id = (int)expert_ids[i];
+        if (config_.should_skip_expert(expert_id) || seen[expert_id]) {
+          continue;
+        }
+        seen[expert_id] = 1;
+        active_experts.push_back(expert_id);
+      }
+
+      expert_read_scope = std::make_unique<ExpertReadScope>(this, active_experts);
+      for (int expert_id : active_experts) {
+        ensure_expert_ready(expert_id, false);
+      }
+    }
+#endif
+    Base::forward(qlen, k, expert_ids, weights, input, output);
+#ifndef _WIN32
+    if (config_.use_mmap && config_.max_tier0_experts <= 0 && !active_experts.empty()) {
+      expert_read_scope.reset();
+      for (int expert_id : active_experts) {
+        demote_expert(expert_id);
+      }
+    }
+#endif
+  }
+
+  void promote_expert(int expert_id) {
+#ifndef _WIN32
+    ensure_expert_ready(expert_id, true);
+#else
+    (void)expert_id;
+#endif
+  }
+
+  void demote_expert(int expert_id) {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return;
+
+    for (;;) {
+      uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+      if (state == EXPERT_BASELINE) {
+        return;
+      }
+      if (state == EXPERT_PACKING) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (state != EXPERT_CACHED && state != EXPERT_PINNED) {
+        return;
+      }
+
+      uint8_t expected = state;
+      if (!expert_states_[expert_id].compare_exchange_strong(
+              expected, EXPERT_DEMOTING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        continue;
+      }
+
+      while (active_readers_[expert_id].load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+      }
+
+      free_packed_expert(expert_id);
+      apply_baseline_ptrs(expert_id);
+      resident_expert_count_.fetch_sub(1, std::memory_order_acq_rel);
+      expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      return;
+    }
+#else
+    (void)expert_id;
+#endif
+  }
+
+  bool is_expert_promoted(int expert_id) const {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    return expert_states_[expert_id].load(std::memory_order_acquire) == EXPERT_PINNED;
+#else
+    (void)expert_id;
+    return false;
+#endif
+  }
+
   // forward, forward_prefill, forward_decode, warm_up are inherited from Base
 };
 
@@ -462,6 +905,25 @@ class TP_MOE<AMX_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_MOE_TP<K>>> {
     } else {
       throw std::runtime_error("no weight source");
     }
+  }
+
+  void promote_expert(int expert_id) {
+    if (this->tp_count <= 1) {
+      this->tps[0]->promote_expert(expert_id);
+      return;
+    }
+    this->config.pool->dispense_backend()->do_numa_job(
+        [this, expert_id](int tp_id) { this->tps[tp_id]->promote_expert(expert_id); });
+  }
+
+  void demote_expert(int expert_id) {
+    for (int i = 0; i < this->tp_count; ++i) {
+      this->tps[i]->demote_expert(expert_id);
+    }
+  }
+
+  bool is_expert_promoted(int expert_id) const {
+    return !this->tps.empty() && this->tps[0]->is_expert_promoted(expert_id);
   }
 
   // merge_results is inherited from TP_MOE<AMX_MOE_BASE<K, AMX_MOE_TP<K>>>

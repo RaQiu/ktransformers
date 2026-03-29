@@ -19,6 +19,7 @@ import ctypes
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -49,10 +50,137 @@ def _madvise_willneed(addr: int, length: int):
     _libc.madvise(ctypes.c_void_p(aligned_addr), ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_WILLNEED))
 
 
+def _read_text_file(path: Path) -> Optional[str]:
+    try:
+        return path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _parse_mountinfo(mountinfo_text: Optional[str] = None) -> List[Tuple[str, str, str]]:
+    if mountinfo_text is None:
+        mountinfo_text = _read_text_file(Path("/proc/self/mountinfo")) or ""
+
+    mounts: List[Tuple[str, str, str]] = []
+    for line in mountinfo_text.splitlines():
+        left, sep, right = line.partition(" - ")
+        if not sep:
+            continue
+        left_parts = left.split()
+        right_parts = right.split()
+        if len(left_parts) < 5 or len(right_parts) < 3:
+            continue
+        mount_point = left_parts[4]
+        fs_type = right_parts[0]
+        super_opts = right_parts[2]
+        mounts.append((fs_type, mount_point, super_opts))
+    return mounts
+
+
+def _parse_self_cgroup(proc_self_cgroup_text: Optional[str] = None) -> List[Tuple[str, List[str], str]]:
+    if proc_self_cgroup_text is None:
+        proc_self_cgroup_text = _read_text_file(Path("/proc/self/cgroup")) or ""
+
+    entries: List[Tuple[str, List[str], str]] = []
+    for line in proc_self_cgroup_text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hierarchy_id, controllers_raw, rel_path = parts
+        controllers = [c for c in controllers_raw.split(",") if c]
+        entries.append((hierarchy_id, controllers, rel_path))
+    return entries
+
+
+def get_cgroup_memory_limit_current_bytes(
+    *,
+    proc_self_cgroup_text: Optional[str] = None,
+    mountinfo_text: Optional[str] = None,
+    mount_root_override: Optional[Path] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Return (limit_bytes, current_bytes) for the current process cgroup when available.
+
+    Supports cgroup v2 first, then falls back to cgroup v1 memory controller layouts.
+    Returns (None, None) when no finite cgroup limit can be determined.
+    """
+
+    entries = _parse_self_cgroup(proc_self_cgroup_text)
+    mounts = _parse_mountinfo(mountinfo_text)
+
+    def _read_limit_current(base: Path, limit_name: str, current_name: str) -> Tuple[Optional[int], Optional[int]]:
+        limit_text = _read_text_file(base / limit_name)
+        current_text = _read_text_file(base / current_name)
+        if limit_text is None or current_text is None:
+            return None, None
+        if limit_text == "max":
+            return None, None
+        try:
+            limit = int(limit_text)
+            current = int(current_text)
+        except ValueError:
+            return None, None
+        # Some v1 setups expose a huge sentinel instead of "max".
+        if limit <= 0 or limit >= (1 << 60):
+            return None, None
+        return limit, max(0, current)
+
+    rel_v2 = None
+    for hierarchy_id, controllers, rel_path in entries:
+        if hierarchy_id == "0" and not controllers:
+            rel_v2 = rel_path
+            break
+
+    mount_v2 = mount_root_override
+    if mount_v2 is None:
+        for fs_type, mount_point, _super_opts in mounts:
+            if fs_type == "cgroup2":
+                mount_v2 = Path(mount_point)
+                break
+    if mount_v2 is not None:
+        candidates = []
+        if rel_v2 and rel_v2 != "/":
+            candidates.append(mount_v2 / rel_v2.lstrip("/"))
+        candidates.append(mount_v2)
+        for candidate in candidates:
+            limit, current = _read_limit_current(candidate, "memory.max", "memory.current")
+            if limit is not None and current is not None:
+                return limit, current
+
+    rel_v1 = None
+    for _hierarchy_id, controllers, rel_path in entries:
+        if "memory" in controllers:
+            rel_v1 = rel_path
+            break
+
+    mount_v1 = mount_root_override
+    if mount_v1 is None:
+        for fs_type, mount_point, super_opts in mounts:
+            if fs_type == "cgroup" and "memory" in super_opts.split(","):
+                mount_v1 = Path(mount_point)
+                break
+    if mount_v1 is not None:
+        candidates = []
+        if rel_v1 and rel_v1 != "/":
+            candidates.append(mount_v1 / rel_v1.lstrip("/"))
+        candidates.append(mount_v1)
+        for candidate in candidates:
+            limit, current = _read_limit_current(candidate, "memory.limit_in_bytes", "memory.usage_in_bytes")
+            if limit is not None and current is not None:
+                return limit, current
+
+    return None, None
+
+
 def get_available_ram_bytes() -> int:
-    """Get available physical RAM in bytes."""
+    """Get available RAM in bytes, preferring the current process cgroup when finite."""
+    cgroup_limit, cgroup_current = get_cgroup_memory_limit_current_bytes()
+    if cgroup_limit is not None and cgroup_current is not None:
+        return max(0, cgroup_limit - cgroup_current)
+
     try:
         import psutil
+
         return psutil.virtual_memory().available
     except ImportError:
         pass
@@ -69,9 +197,14 @@ def get_available_ram_bytes() -> int:
 
 
 def get_total_ram_bytes() -> int:
-    """Get total physical RAM in bytes."""
+    """Get total RAM in bytes, preferring the current process cgroup when finite."""
+    cgroup_limit, _cgroup_current = get_cgroup_memory_limit_current_bytes()
+    if cgroup_limit is not None:
+        return cgroup_limit
+
     try:
         import psutil
+
         return psutil.virtual_memory().total
     except ImportError:
         pass
@@ -250,6 +383,25 @@ def resolve_auto_tier0_budget_bytes(
     return int(max(0.0, min(float(headroom_bytes), headroom_bytes * tier0_fraction)))
 
 
+def constrain_tier0_memory_bytes(
+    requested_bytes: int,
+    *,
+    available_ram_bytes: Optional[int] = None,
+    safety_bytes: int = 4 * 1024**3,
+) -> int:
+    """
+    Clamp an explicit Tier0 budget to the effective memory scope.
+
+    This makes a caller-provided Tier0 budget respect the current cgroup when one
+    is active, rather than assuming host-wide RAM is available.
+    """
+    if requested_bytes <= 0:
+        return 0
+    if available_ram_bytes is None:
+        available_ram_bytes = get_available_ram_bytes()
+    return min(requested_bytes, max(0, available_ram_bytes - safety_bytes))
+
+
 class ExpertHotnessTracker:
     """
     Track expert activation frequency to identify hot experts for Tier 0 promotion.
@@ -286,7 +438,7 @@ class ExpertHotnessTracker:
 
         with self._lock:
             # EMA update: decay all, then boost activated ones
-            self.counts *= (1 - self.ema_alpha)
+            self.counts *= 1 - self.ema_alpha
             self.counts[mask] += self.ema_alpha
 
     def get_top_k(self, k: int) -> List[int]:
@@ -300,7 +452,7 @@ class ExpertHotnessTracker:
     def decay(self):
         """Decay all counts (call periodically to let cold experts fade)."""
         with self._lock:
-            self.counts *= (1 - self.ema_alpha)
+            self.counts *= 1 - self.ema_alpha
 
 
 class MmapWeightRegion:
@@ -437,9 +589,7 @@ class TieredWeightProvider:
         """Drop mmap-region metadata for a layer before re-registering fresh slices."""
         self.mmap_regions.pop(layer_idx, None)
 
-    def register_mmap_region(
-        self, layer_idx: int, proj_name: str, expert_id: int, region: MmapWeightRegion
-    ):
+    def register_mmap_region(self, layer_idx: int, proj_name: str, expert_id: int, region: MmapWeightRegion):
         """Register an mmap region for a specific expert weight."""
         if layer_idx not in self.mmap_regions:
             self.mmap_regions[layer_idx] = {}
