@@ -9,7 +9,10 @@ import tempfile
 
 # Check if io_uring is available
 try:
-    import ktransformers.ktransformers_ext as ext
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../build"))
+    import kt_kernel_ext as ext
 
     HAS_IOURING = hasattr(ext, "AsyncExpertReader")
 except (ImportError, AttributeError):
@@ -56,7 +59,6 @@ def test_async_reader_basic(temp_test_file):
 
     # Cleanup
     os.close(fd)
-    reader.shutdown()
 
 
 def test_async_reader_batch(temp_test_file):
@@ -97,7 +99,6 @@ def test_async_reader_batch(temp_test_file):
         # Cleanup
         for fd in fds:
             os.close(fd)
-        reader.shutdown()
 
     finally:
         # Remove temp files
@@ -112,8 +113,6 @@ def test_async_reader_timeout():
 
     # Wait for non-existent expert (should timeout)
     assert not reader.wait_for_expert(999, timeout_ms=100), "Should have timed out"
-
-    reader.shutdown()
 
 
 def test_io_backend_enum():

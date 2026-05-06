@@ -13,10 +13,14 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 
 #ifdef HAVE_LIBURING
 #include <liburing.h>
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
 #endif
 
 namespace ktransformers {
@@ -100,6 +104,7 @@ private:
 
     // Track in-flight requests: user_data -> expert_id
     std::unordered_map<uint64_t, int> inflight_requests_;
+    std::unordered_set<int> completed_experts_;  // Track completed expert IDs
     mutable std::mutex mutex_;
 
     // Helper: wait for completion events

@@ -777,15 +777,14 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // Bind AsyncExpertReader for io_uring-based expert loading
   py::class_<ktransformers::AsyncExpertReader>(m, "AsyncExpertReader")
       .def(py::init<int>(), py::arg("queue_depth") = 128,
-           "Create AsyncExpertReader with specified queue depth")
+           "Create AsyncExpertReader with specified queue depth and worker threads")
       .def("submit_read",
            [](ktransformers::AsyncExpertReader& reader, int fd, intptr_t buffer, size_t size, off_t offset,
               int expert_id) { reader.submit_read(fd, reinterpret_cast<void*>(buffer), size, offset, expert_id); },
            py::arg("fd"), py::arg("buffer"), py::arg("size"), py::arg("offset"), py::arg("expert_id"),
            "Submit an async read request")
       .def("wait_for_expert", &ktransformers::AsyncExpertReader::wait_for_expert, py::arg("expert_id"),
-           py::arg("timeout_ms") = 5000, "Wait for a specific expert to be loaded")
-      .def("shutdown", &ktransformers::AsyncExpertReader::shutdown, "Shutdown the async reader and release resources");
+           py::arg("timeout_ms") = 5000, "Wait for a specific expert to be loaded");
 
   // Bind IOBackend enum
   py::enum_<IOBackend>(m, "IOBackend")

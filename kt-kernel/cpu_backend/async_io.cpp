@@ -141,7 +141,11 @@ bool AsyncExpertReader::wait_for_expert(int expert_id, int timeout_ms) {
                 }
             }
             if (!found) {
-                return true;  // Already completed
+                // Check if it was completed before
+                if (completed_experts_.count(expert_id) > 0) {
+                    return true;  // Already completed
+                }
+                return false;  // Never submitted or timed out
             }
         }
 
@@ -169,6 +173,7 @@ bool AsyncExpertReader::wait_for_expert(int expert_id, int timeout_ms) {
         if (it != inflight_requests_.end()) {
             int completed_id = it->second;
             inflight_requests_.erase(it);
+            completed_experts_.insert(completed_id);
 
             if (result >= 0 && completed_id == expert_id) {
                 return true;  // Target expert completed
