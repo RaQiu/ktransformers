@@ -776,8 +776,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 #ifdef HAVE_LIBURING
   // Bind AsyncExpertReader for io_uring-based expert loading
   py::class_<ktransformers::AsyncExpertReader>(m, "AsyncExpertReader")
-      .def(py::init<int, int>(), py::arg("queue_depth") = 128, py::arg("num_workers") = 4,
-           "Create AsyncExpertReader with specified queue depth and worker threads")
+      .def(py::init<int>(), py::arg("queue_depth") = 128,
+           "Create AsyncExpertReader with specified queue depth")
       .def("submit_read",
            [](ktransformers::AsyncExpertReader& reader, int fd, intptr_t buffer, size_t size, off_t offset,
               int expert_id) { reader.submit_read(fd, reinterpret_cast<void*>(buffer), size, offset, expert_id); },

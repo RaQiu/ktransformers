@@ -16,7 +16,7 @@ def get_global_async_reader():
     """
     global _global_async_reader
     if _global_async_reader is None:
-        _global_async_reader = ext.AsyncExpertReader(queue_depth=128, num_workers=4)
+        _global_async_reader = ext.AsyncExpertReader(queue_depth=128)
     return _global_async_reader
 
 

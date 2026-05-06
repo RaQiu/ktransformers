@@ -37,7 +37,7 @@ def test_async_reader_basic(temp_test_file):
     """Test AsyncExpertReader basic functionality."""
     test_file, test_data = temp_test_file
 
-    reader = ext.AsyncExpertReader(queue_depth=32, num_workers=2)
+    reader = ext.AsyncExpertReader(queue_depth=32)
 
     # Open file (without O_DIRECT for testing)
     fd = os.open(test_file, os.O_RDONLY)
@@ -63,7 +63,7 @@ def test_async_reader_batch(temp_test_file):
     """Test batch reading with multiple experts."""
     test_file, test_data = temp_test_file
 
-    reader = ext.AsyncExpertReader(queue_depth=128, num_workers=4)
+    reader = ext.AsyncExpertReader(queue_depth=128)
 
     num_experts = 8
     test_files = []
@@ -108,7 +108,7 @@ def test_async_reader_batch(temp_test_file):
 
 def test_async_reader_timeout():
     """Test timeout behavior."""
-    reader = ext.AsyncExpertReader(queue_depth=32, num_workers=2)
+    reader = ext.AsyncExpertReader(queue_depth=32)
 
     # Wait for non-existent expert (should timeout)
     assert not reader.wait_for_expert(999, timeout_ms=100), "Should have timed out"
