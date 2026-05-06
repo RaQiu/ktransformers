@@ -16,6 +16,10 @@
 #include "cpu_backend/worker_pool.h"
 #include "operators/common.hpp"
 
+#ifdef HAVE_LIBURING
+#include "cpu_backend/async_io.hpp"
+#endif
+
 #if defined(USE_MOE_KERNEL)
 #include "operators/moe_kernel/la/kernel.hpp"
 #include "operators/moe_kernel/moe.hpp"
@@ -574,6 +578,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("load", &GeneralMOEConfig::load)
       .def_readwrite("use_mmap", &GeneralMOEConfig::use_mmap)
       .def_readwrite("max_tier0_experts", &GeneralMOEConfig::max_tier0_experts)
+      .def_readwrite("max_resident_experts", &GeneralMOEConfig::max_resident_experts)
+      .def_readwrite("resident_cache_policy", &GeneralMOEConfig::resident_cache_policy)
       .def_readwrite("m_block", &GeneralMOEConfig::m_block)
       .def_readwrite("group_min_len", &GeneralMOEConfig::group_min_len)
       .def_readwrite("group_max_len", &GeneralMOEConfig::group_max_len)
@@ -766,4 +772,25 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 
   utils.def("from_float", &from_float_ptr, "Convert tensor from float32 to any GGML type", py::arg("input"),
             py::arg("size"), py::arg("type"));
+
+#ifdef HAVE_LIBURING
+  // Bind AsyncExpertReader for io_uring-based expert loading
+  py::class_<ktransformers::AsyncExpertReader>(m, "AsyncExpertReader")
+      .def(py::init<int, int>(), py::arg("queue_depth") = 128, py::arg("num_workers") = 4,
+           "Create AsyncExpertReader with specified queue depth and worker threads")
+      .def("submit_read",
+           [](ktransformers::AsyncExpertReader& reader, int fd, intptr_t buffer, size_t size, off_t offset,
+              int expert_id) { reader.submit_read(fd, reinterpret_cast<void*>(buffer), size, offset, expert_id); },
+           py::arg("fd"), py::arg("buffer"), py::arg("size"), py::arg("offset"), py::arg("expert_id"),
+           "Submit an async read request")
+      .def("wait_for_expert", &ktransformers::AsyncExpertReader::wait_for_expert, py::arg("expert_id"),
+           py::arg("timeout_ms") = 5000, "Wait for a specific expert to be loaded")
+      .def("shutdown", &ktransformers::AsyncExpertReader::shutdown, "Shutdown the async reader and release resources");
+
+  // Bind IOBackend enum
+  py::enum_<IOBackend>(m, "IOBackend")
+      .value("MMAP", IOBackend::MMAP, "Memory-mapped I/O (OS page cache)")
+      .value("IOURING", IOBackend::IOURING, "io_uring direct I/O (bypass page cache)")
+      .export_values();
+#endif
 }

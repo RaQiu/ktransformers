@@ -1343,3 +1343,92 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
             "up_scale": up_scales,
             "down_scale": down_scales,
         }
+
+
+def load_experts_iouring(
+    safetensors_path: str, layer_idx: int, expert_ids: list, tensor_names: list = None, use_direct_io: bool = True
+):
+    """
+    Load expert weights as file descriptors and offsets for io_uring.
+
+    Args:
+        safetensors_path: Path to safetensors file
+        layer_idx: Layer index
+        expert_ids: List of expert IDs to load
+        tensor_names: List of tensor names (default: ["gate_proj", "up_proj", "down_proj"])
+        use_direct_io: Whether to use O_DIRECT for direct I/O
+
+    Returns:
+        dict: {
+            "gate_proj": [(fd, offset, size), ...],
+            "up_proj": [(fd, offset, size), ...],
+            "down_proj": [(fd, offset, size), ...],
+            "gate_scale": [(fd, offset, size), ...],
+            "up_scale": [(fd, offset, size), ...],
+            "down_scale": [(fd, offset, size), ...]
+        }
+    """
+    if tensor_names is None:
+        tensor_names = ["gate_proj", "up_proj", "down_proj"]
+
+    # Open file with O_DIRECT if requested
+    flags = os.O_RDONLY
+    if use_direct_io and hasattr(os, "O_DIRECT"):
+        flags |= os.O_DIRECT
+
+    fd = os.open(safetensors_path, flags)
+
+    # Read safetensors header
+    with open(safetensors_path, "rb") as f:
+        header_size_bytes = f.read(8)
+        header_size = int.from_bytes(header_size_bytes, "little")
+        header_json = f.read(header_size).decode("utf-8")
+        header = json.loads(header_json)
+
+    base_offset = 8 + header_size
+
+    # Build file slots for each tensor type
+    file_slots = {name: [] for name in tensor_names}
+    file_slots["gate_scale"] = []
+    file_slots["up_scale"] = []
+    file_slots["down_scale"] = []
+
+    for eid in expert_ids:
+        for tensor_name in tensor_names:
+            # Try different naming patterns
+            key_patterns = [
+                f"model.layers.{layer_idx}.mlp.experts.{eid}.{tensor_name}.weight",
+                f"model.layers.{layer_idx}.block_sparse_moe.experts.{eid}.{tensor_name}.weight",
+                f"model.layers.{layer_idx}.feed_forward.experts.{eid}.{tensor_name}.weight",
+            ]
+
+            tensor_info = None
+            for key in key_patterns:
+                if key in header:
+                    tensor_info = header[key]
+                    break
+
+            if tensor_info is not None:
+                offset = base_offset + tensor_info["data_offsets"][0]
+                size = tensor_info["data_offsets"][1] - tensor_info["data_offsets"][0]
+                file_slots[tensor_name].append((fd, offset, size))
+
+            # Load scale tensor
+            scale_key_patterns = [
+                f"model.layers.{layer_idx}.mlp.experts.{eid}.{tensor_name}.scale",
+                f"model.layers.{layer_idx}.block_sparse_moe.experts.{eid}.{tensor_name}.scale",
+                f"model.layers.{layer_idx}.feed_forward.experts.{eid}.{tensor_name}.scale",
+            ]
+
+            scale_info = None
+            for key in scale_key_patterns:
+                if key in header:
+                    scale_info = header[key]
+                    break
+
+            if scale_info is not None:
+                offset = base_offset + scale_info["data_offsets"][0]
+                size = scale_info["data_offsets"][1] - scale_info["data_offsets"][0]
+                file_slots[f"{tensor_name.replace('_proj', '_scale')}"].append((fd, offset, size))
+
+    return file_slots

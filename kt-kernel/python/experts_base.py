@@ -19,6 +19,8 @@ from pathlib import Path
 
 from kt_kernel import kt_kernel_ext
 
+_PIN_MEMORY = torch.cuda.is_available()
+
 
 def generate_gpu_experts_masks(
     activation_freq: torch.Tensor,
@@ -98,27 +100,27 @@ class KExpertsCPUBuffer:
             return cls.temp_buffer
 
         input_tensor_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=True, dtype=torch.bfloat16)
+            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=_PIN_MEMORY, dtype=torch.bfloat16)
             for _ in range(cls.buffer_depth)
         ]
         immediate_experts_ids_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=True)
+            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=_PIN_MEMORY)
             for _ in range(cls.buffer_depth)
         ]
         deferred_experts_ids_cpu = [
-            torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=True)
+            torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=_PIN_MEMORY)
             for _ in range(cls.buffer_depth)
         ]
         weights_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=True)
+            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=_PIN_MEMORY)
             for _ in range(cls.buffer_depth)
         ]
         output_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=True, dtype=torch.bfloat16)
+            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=_PIN_MEMORY, dtype=torch.bfloat16)
             for _ in range(cls.buffer_depth)
         ]
         bsz_tensor_cpu = [
-            torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=True)
+            torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=_PIN_MEMORY)
             for _ in range(cls.buffer_depth)
         ]
         output_gpu = [
@@ -153,6 +155,7 @@ class BaseMoEWrapper(ABC):
     _active_wrapper_count: int = 0
     _layer_has_pending_deferred: Dict[int, bool] = {}
     _tiered_provider = None  # Singleton TieredWeightProvider
+    _tiered_provider_signature: Optional[Tuple[int, int, str, str]] = None
     _prev_topk_ids_by_layer: Dict[int, np.ndarray] = {}
     # Backends whose C++ MOE objects expose promote/demote hooks for Tier0 management.
     _provider_backends = frozenset({"LLAMAFILE", "BF16", "AMXINT4", "AMXINT8", "MOE_INT4", "MOE_INT8"})
@@ -256,11 +259,11 @@ class BaseMoEWrapper(ABC):
         threadpool_count: int,
         weight_path: str,
         chunked_prefill_size: int,
+        numa_nodes: Optional[List[int]] = None,
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         weight_strategy: str = "auto",
-        tier0_memory_gb: Optional[float] = None,
         max_tier0_experts: Optional[int] = None,
         num_moe_layers: Optional[int] = None,
     ):
@@ -279,6 +282,8 @@ class BaseMoEWrapper(ABC):
                               If None, all experts are on CPU.
             cpuinfer_threads: Number of CPU inference threads
             threadpool_count: Number of NUMA subpools
+            numa_nodes: Explicit NUMA node IDs for the CPU subpools. If None,
+                        use detected NUMA nodes in ascending order.
             weight_path: Path to weights
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Whether to save weights to CPU memory
@@ -288,15 +293,12 @@ class BaseMoEWrapper(ABC):
                              full-resident legacy mode and mmap+tier0 adaptive mode,
                              "legacy" forces malloc+copy, "tiered" forces mmap baseline
                              with hot experts promoted into Tier0 NUMA buffers.
-            tier0_memory_gb: Physical memory budget for Tier 0 NUMA-local buffers (in GB).
-                             If set, overrides max_tier0_experts by computing how many experts
-                             fit in this budget across all layers.
             max_tier0_experts: Maximum number of expert IDs promoted to Tier 0.
-                               If tier0_memory_gb is set, this is computed automatically.
-                               Defaults to 30.
-            num_moe_layers: Total number of MoE layers in the model. Required when
-                            tier0_memory_gb is set (for budget calculation). If None,
-                            estimated from registered layers.
+                               Defaults to an auto-derived value based on the
+                               current cgroup/host memory scope when omitted.
+            num_moe_layers: Total number of MoE layers in the model. Used when
+                            auto Tier0 sizing is enabled. If None, estimated
+                            from registered layers.
         """
         self.layer_idx = layer_idx
         self.num_experts = num_experts
@@ -313,7 +315,11 @@ class BaseMoEWrapper(ABC):
             weight_strategy = env_weight_strategy
 
         requested_weight_strategy = weight_strategy or "auto"
-        from .utils.weight_provider import backend_supports_tiered_strategy, resolve_backend_weight_strategy
+        from .utils.weight_provider import (
+            backend_supports_tiered_strategy,
+            normalize_residency_policy_name,
+            resolve_backend_weight_strategy,
+        )
 
         backend_has_tiered = backend_supports_tiered_strategy(method)
         if requested_weight_strategy in {"auto", "tiered"}:
@@ -363,14 +369,33 @@ class BaseMoEWrapper(ABC):
             f"resolved={self.weight_strategy!r} method={method!r} layer={layer_idx}"
         )
 
+        env_residency_policy = os.environ.get("KT_RESIDENCY_POLICY")
+        self.residency_policy = normalize_residency_policy_name(env_residency_policy or "baseline")
+        print(
+            "[KTResidencyPolicy] "
+            f"env={env_residency_policy!r} resolved={self.residency_policy!r} "
+            f"method={method!r} layer={layer_idx}"
+        )
+
+        # Read io_backend from environment
+        env_io_backend = os.environ.get("KT_IO_BACKEND", "MMAP").upper()
+        self.io_backend = env_io_backend
+        print(f"[KTIOBackend] io_backend={self.io_backend} method={method!r} layer={layer_idx}")
+
+        # Read enable_cache_stats from environment
+        env_enable_cache_stats = os.environ.get("KT_ENABLE_CACHE_STATS", "0")
+        self.enable_cache_stats = env_enable_cache_stats in ("1", "true", "True", "TRUE")
+        if self.enable_cache_stats:
+            print(f"[KTCacheStats] Cache statistics collection enabled for layer={layer_idx}")
+
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
         if gpu_experts_mask is None:
             # No GPU experts - all experts on CPU
-            self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu", pin_memory=True)
+            self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu", pin_memory=_PIN_MEMORY)
         else:
             # Create a new pinned tensor and copy data into it
-            self.gpu_experts_mask = torch.empty(num_experts, dtype=torch.bool, device="cpu", pin_memory=True)
+            self.gpu_experts_mask = torch.empty(num_experts, dtype=torch.bool, device="cpu", pin_memory=_PIN_MEMORY)
             self.gpu_experts_mask.copy_(gpu_experts_mask)
 
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
@@ -381,24 +406,47 @@ class BaseMoEWrapper(ABC):
         self.weight_path = weight_path
         self.chunked_prefill_size = chunked_prefill_size
         self.cpu_save = cpu_save
+        env_max_deferred_experts = os.environ.get("KT_MAX_DEFERRED_EXPERTS_PER_TOKEN")
+        if env_max_deferred_experts is not None:
+            try:
+                max_deferred_experts_per_token = int(env_max_deferred_experts)
+            except ValueError:
+                print(
+                    f"[KTDeferredExperts] ignoring invalid KT_MAX_DEFERRED_EXPERTS_PER_TOKEN="
+                    f"{env_max_deferred_experts!r}; using {max_deferred_experts_per_token or 0}"
+                )
         self.max_deferred_experts_per_token = (
             int(max_deferred_experts_per_token) if max_deferred_experts_per_token is not None else 0
+        )
+        print(
+            f"[KTDeferredExperts] layer={layer_idx} max_deferred_experts_per_token={self.max_deferred_experts_per_token}"
         )
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         self.method = method
         self.max_tier0_experts = int(max_tier0_experts) if max_tier0_experts is not None else 0
-        self.tier0_memory_gb = tier0_memory_gb
+        self.max_resident_experts = (
+            int(os.environ["KT_MAX_RESIDENT_EXPERTS"]) if "KT_MAX_RESIDENT_EXPERTS" in os.environ else 0
+        )
 
         if threadpool_count <= 0:
             raise ValueError(f"threadpool_count must be positive, got {threadpool_count}")
         if cpuinfer_threads < threadpool_count:
             raise ValueError(f"cpuinfer_threads ({cpuinfer_threads}) must be >= threadpool_count ({threadpool_count})")
 
-        available_numa_ids = BaseMoEWrapper._detect_available_numa_node_ids()
+        if numa_nodes is not None:
+            available_numa_ids = [int(node) for node in numa_nodes]
+            if len(available_numa_ids) == 0:
+                raise ValueError("numa_nodes must not be empty when provided")
+        else:
+            available_numa_ids = BaseMoEWrapper._detect_available_numa_node_ids()
         if threadpool_count > len(available_numa_ids):
             raise ValueError(
                 f"threadpool_count ({threadpool_count}) exceeds detected NUMA nodes " f"{available_numa_ids}"
+            )
+        if numa_nodes is not None and threadpool_count != len(available_numa_ids):
+            raise ValueError(
+                f"threadpool_count ({threadpool_count}) must match explicit numa_nodes {available_numa_ids}"
             )
 
         subpool_numa_map = available_numa_ids[:threadpool_count]
@@ -436,9 +484,9 @@ class BaseMoEWrapper(ABC):
         # mmap baseline + Tier0 promotion.
         # NOTE: self._provider is initially None for ALL backends.
         provider_backend = method in BaseMoEWrapper._provider_backends
+        tiered_policy_config_raw = os.environ.get("KT_RESIDENCY_POLICY_CONFIG", "")
         if provider_backend and self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is None:
             from .utils.weight_provider import (
-                constrain_tier0_memory_bytes,
                 TieredWeightProvider,
                 compute_max_tier0_experts,
                 get_available_ram_bytes,
@@ -447,16 +495,14 @@ class BaseMoEWrapper(ABC):
             )
 
             # Fallback to environment variables if parameters not provided
-            if tier0_memory_gb is None and "KT_TIER0_MEMORY_GB" in os.environ:
-                tier0_memory_gb = float(os.environ["KT_TIER0_MEMORY_GB"])
             if max_tier0_experts is None and "KT_MAX_TIER0_EXPERTS" in os.environ:
                 max_tier0_experts = int(os.environ["KT_MAX_TIER0_EXPERTS"])
 
-            # Auto-detect available memory if not specified
-            if tier0_memory_gb is None and max_tier0_experts is None:
+            # Auto-detect Tier0 budget from the effective memory scope when no
+            # explicit expert cap is provided.
+            if max_tier0_experts is None:
                 available_gb = get_available_ram_bytes() / (1024**3)
                 effective_num_layers = num_moe_layers or 60
-                model_bytes = 0
                 from .utils.weight_provider import estimate_model_weight_bytes
 
                 model_bytes = estimate_model_weight_bytes(
@@ -467,29 +513,8 @@ class BaseMoEWrapper(ABC):
                     bytes_per_element=method_bytes_per_element(method),
                 )
                 tier0_bytes = resolve_auto_tier0_budget_bytes(model_bytes=model_bytes)
-                tier0_memory_gb = tier0_bytes / (1024**3)
-                print(
-                    f"[TieredWeightProvider] Auto-adapted tier0 budget: "
-                    f"available_ram={available_gb:.1f}GB, tier0={tier0_memory_gb:.1f}GB"
-                )
-
-            effective_max_tier0 = max_tier0_experts or 30
-            if tier0_memory_gb is not None:
-                requested_tier0_bytes = int(tier0_memory_gb * 1024**3)
-                constrained_tier0_bytes = constrain_tier0_memory_bytes(
-                    requested_tier0_bytes,
-                    available_ram_bytes=get_available_ram_bytes(),
-                )
-                if constrained_tier0_bytes < requested_tier0_bytes:
-                    print(
-                        "[TieredWeightProvider] tier0_memory_gb request was clamped by effective memory scope: "
-                        f"requested={tier0_memory_gb:.1f}GB, "
-                        f"effective={constrained_tier0_bytes / 1024**3:.1f}GB"
-                    )
-                tier0_memory_gb = constrained_tier0_bytes / (1024**3)
-                effective_num_layers = num_moe_layers or 60  # fallback estimate
                 effective_max_tier0 = compute_max_tier0_experts(
-                    tier0_memory_bytes=constrained_tier0_bytes,
+                    tier0_memory_bytes=tier0_bytes,
                     num_layers=effective_num_layers,
                     num_experts=num_experts,
                     hidden_size=hidden_size,
@@ -497,9 +522,18 @@ class BaseMoEWrapper(ABC):
                     bytes_per_element=method_bytes_per_element(method),
                 )
                 print(
-                    f"[TieredWeightProvider] tier0_memory_gb={tier0_memory_gb:.1f} → "
-                    f"max_tier0_experts={effective_max_tier0} "
+                    f"[TieredWeightProvider] Auto-adapted tier0 budget: "
+                    f"available_ram={available_gb:.1f}GB, tier0={tier0_bytes / (1024**3):.1f}GB"
+                )
+                print(
+                    f"[TieredWeightProvider] auto max_tier0_experts={effective_max_tier0} "
                     f"(~{effective_max_tier0 * effective_num_layers * 3 * hidden_size * moe_intermediate_size * method_bytes_per_element(method) / 1024**3:.1f}GB)"
+                )
+            else:
+                effective_max_tier0 = int(max_tier0_experts)
+                print(
+                    f"[TieredWeightProvider] explicit max_tier0_experts={effective_max_tier0} "
+                    f"(~{effective_max_tier0 * (num_moe_layers or 60) * 3 * hidden_size * moe_intermediate_size * method_bytes_per_element(method) / 1024**3:.1f}GB)"
                 )
 
             self.max_tier0_experts = effective_max_tier0
@@ -508,23 +542,43 @@ class BaseMoEWrapper(ABC):
                 num_experts=num_experts,
                 num_layers=1,  # dict-based storage, supports arbitrary layer_idx
                 max_tier0_experts=effective_max_tier0,
+                residency_policy=self.residency_policy,
+            )
+            BaseMoEWrapper._tiered_provider_signature = (
+                int(num_experts),
+                int(effective_max_tier0),
+                self.residency_policy,
+                tiered_policy_config_raw,
             )
         elif provider_backend and self.weight_strategy == "tiered" and BaseMoEWrapper._tiered_provider is not None:
-            if BaseMoEWrapper._tiered_provider.num_experts != num_experts:
+            provider = BaseMoEWrapper._tiered_provider
+            desired_max_tier0 = provider.max_tier0_experts
+            if max_tier0_experts is not None:
+                desired_max_tier0 = int(max_tier0_experts)
+
+            desired_provider_signature = (
+                int(num_experts),
+                int(desired_max_tier0),
+                self.residency_policy,
+                tiered_policy_config_raw,
+            )
+            if BaseMoEWrapper._tiered_provider_signature != desired_provider_signature:
                 if BaseMoEWrapper._active_wrapper_count > 0:
                     raise RuntimeError(
-                        "TieredWeightProvider is already initialized for a different expert count. "
+                        "TieredWeightProvider is already initialized with different tiered settings. "
                         "Destroy existing MoE wrappers before loading another MoE topology."
                     )
-                BaseMoEWrapper._tiered_provider.stop_promotion_thread()
+                provider.stop_promotion_thread()
                 BaseMoEWrapper._tiered_provider = None
                 from .utils.weight_provider import TieredWeightProvider
 
                 BaseMoEWrapper._tiered_provider = TieredWeightProvider(
                     num_experts=num_experts,
                     num_layers=1,
-                    max_tier0_experts=max_tier0_experts or 30,
+                    max_tier0_experts=desired_max_tier0,
+                    residency_policy=self.residency_policy,
                 )
+                BaseMoEWrapper._tiered_provider_signature = desired_provider_signature
             self.max_tier0_experts = BaseMoEWrapper._tiered_provider.max_tier0_experts
         self._provider = None  # Set by subclass via _register_moe_with_provider()
 
@@ -838,6 +892,7 @@ class BaseMoEWrapper(ABC):
         if provider is not None:
             provider.stop_promotion_thread()
         BaseMoEWrapper._tiered_provider = None
+        BaseMoEWrapper._tiered_provider_signature = None
         BaseMoEWrapper._cpu_infer_instance = None
         BaseMoEWrapper._cpu_infer_signature = None
         BaseMoEWrapper._layer_has_pending_deferred.clear()
