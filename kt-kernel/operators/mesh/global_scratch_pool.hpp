@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -285,6 +286,33 @@ class GlobalScratchPool {
     if (idle) *idle = i;
     if (loading) *loading = l;
     if (in_use) *in_use = u;
+  }
+
+  std::string describe() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    int idle = 0, loading = 0, in_use = 0, other = 0;
+    for (int k = 0; k < capacity_; ++k) {
+      const uint8_t s = blocks_[k].state.load(std::memory_order_acquire);
+      if (s == static_cast<uint8_t>(GlobalSlotState::IDLE)) {
+        ++idle;
+      } else if (s == static_cast<uint8_t>(GlobalSlotState::LOADING)) {
+        ++loading;
+      } else if (s == static_cast<uint8_t>(GlobalSlotState::IN_USE)) {
+        ++in_use;
+      } else {
+        ++other;
+      }
+    }
+    std::ostringstream oss;
+    oss << " pool={initialized:" << (initialized_ ? "true" : "false")
+        << ",capacity:" << capacity_
+        << ",idle:" << idle
+        << ",idle_list:" << idle_size_
+        << ",loading:" << loading
+        << ",in_use:" << in_use
+        << ",other:" << other
+        << "}";
+    return oss.str();
   }
 
  private:

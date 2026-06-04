@@ -1057,9 +1057,11 @@ def _mesh_submit_forward_impl(
     current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
     next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
     bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+    bsz_slot_tensor[0] = qlen
 
     topk_ids_long = topk_ids.to(torch.long)
     self._mesh_prefetch_previous_topk()
+    is_decode_token = qlen == 1 and BaseMoEWrapper._mesh_decode_transition_done
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
         topk_weights,
@@ -1067,7 +1069,7 @@ def _mesh_submit_forward_impl(
         deferred_experts_ids_cpu[current_slot],
         output_cpu[next_slot],
         cuda_stream,
-        is_decode_token=qlen == 1,
+        is_decode_token=is_decode_token,
     )
 
     input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
@@ -1086,7 +1088,7 @@ def _mesh_submit_forward_impl(
         router_scores,
         current_slot,
         cuda_stream,
-        is_decode_token=qlen == 1,
+        is_decode_token=is_decode_token,
     )
 
     incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
@@ -1224,9 +1226,13 @@ def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int) -> None:
 def _maybe_mesh_transition_to_decode_cache(self, qlen: int) -> None:
     if qlen != 1 or not self._mesh_prefill_layer_mode_enabled():
         return
-    if not BaseMoEWrapper._mesh_prefill_session_seen or BaseMoEWrapper._mesh_decode_transition_done:
+    if BaseMoEWrapper._mesh_decode_transition_done:
         return
     if self.layer_idx != 0:
+        return
+    if not BaseMoEWrapper._mesh_prefill_session_seen and not self._env_flag(
+        "KT_MESH_DECODE_TRANSITION_ON_COLD_Q1", True
+    ):
         return
 
     for layer_idx, wrapper in sorted(BaseMoEWrapper._wrappers_by_layer.items()):
@@ -1239,6 +1245,9 @@ def _maybe_mesh_transition_to_decode_cache(self, qlen: int) -> None:
         fill_limit = wrapper._env_int("KT_MESH_DECODE_TRANSITION_FILL_LIMIT", decode_capacity)
         task = task_factory(int(decode_capacity), int(fill_limit))
         wrapper._submit_cpuinfer_task(task, None)
+
+    if self._env_flag("KT_MESH_DECODE_TRANSITION_SYNC", True):
+        self._sync_cpuinfer()
 
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
     BaseMoEWrapper._mesh_decode_transition_done = True

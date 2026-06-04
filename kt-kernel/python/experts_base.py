@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 import os
 from kt_kernel import kt_kernel_ext
 
-_PIN_MEMORY = torch.cuda.is_available()
+_PIN_MEMORY = torch.cuda.is_available() and os.getenv("KT_CPU_BUFFER_PIN_MEMORY", "1") != "0"
 
 
 def generate_gpu_experts_masks(
@@ -82,39 +82,55 @@ class KExpertsCPUBuffer:
     capture_bs: List = list()
     capture_buffers: Dict = dict()
     temp_bs: int = 0
+    temp_capacity: int = 0
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
+
+    @classmethod
+    def _slice_buffer(cls, buffer: tuple, batch_size: int) -> tuple:
+        if not buffer:
+            return buffer
+        sliced = []
+        for idx, item in enumerate(buffer):
+            if idx == 5:
+                sliced.append(item)
+                continue
+            sliced.append([tensor[:batch_size] for tensor in item])
+        return tuple(sliced)
 
     @classmethod
     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
         hidden_size = hidden_states.shape[-1]
         batch_size = hidden_states.shape[0]
 
-        pin_memory = True
+        pin_memory = _PIN_MEMORY
 
         if batch_size in cls.capture_buffers:
             return cls.capture_buffers[batch_size]
-        if batch_size == cls.temp_bs:
-            return cls.temp_buffer
+        if cls.temp_buffer and batch_size <= cls.temp_capacity:
+            cls.temp_bs = batch_size
+            return cls._slice_buffer(cls.temp_buffer, batch_size)
+
+        capacity = batch_size
 
         input_tensor_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+            torch.zeros((capacity, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
             for _ in range(cls.buffer_depth)
         ]
         immediate_experts_ids_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
+            torch.zeros((capacity, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
             for _ in range(cls.buffer_depth)
         ]
         deferred_experts_ids_cpu = [
-            torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
+            torch.full((capacity, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
             for _ in range(cls.buffer_depth)
         ]
         weights_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
+            torch.zeros((capacity, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
             for _ in range(cls.buffer_depth)
         ]
         output_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+            torch.zeros((capacity, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
             for _ in range(cls.buffer_depth)
         ]
         bsz_tensor_cpu = [
@@ -122,7 +138,7 @@ class KExpertsCPUBuffer:
             for _ in range(cls.buffer_depth)
         ]
         output_gpu = [
-            torch.zeros((batch_size, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+            torch.zeros((capacity, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
             for _ in range(cls.buffer_depth)
         ]
 
@@ -138,8 +154,9 @@ class KExpertsCPUBuffer:
         if batch_size in cls.capture_bs:
             cls.capture_buffers[batch_size] = cur_buffer
         cls.temp_bs = batch_size
+        cls.temp_capacity = capacity
         cls.temp_buffer = cur_buffer
-        return cur_buffer
+        return cls._slice_buffer(cur_buffer, batch_size)
 
 
 class _MoEBase:
@@ -504,6 +521,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         """
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
+        KExpertsCPUBuffer.temp_capacity = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
 
 

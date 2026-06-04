@@ -46,8 +46,10 @@ inline ResidentCapacityPlan build_resident_capacity_plan(const GeneralMOEConfig&
           : std::min(config.expert_num, std::max(plan.configured_resident, config.num_experts_per_tok));
   if (config.mesh_prefill_layer_mode_enabled && plan.cache_capacity > 0) {
     const int cpu_capacity = cpu_managed_expert_count(config);
-    const int requested_prefill_static =
-        config.mesh_prefill_static_experts > 0 ? config.mesh_prefill_static_experts : plan.requested_decode_resident;
+    // Python-side config preparation resolves the default static capacity.
+    // Preserve an explicit zero here: it means "no long-lived prefill static
+    // slots; use the scratch pool for prefill-layer temporary bindings."
+    const int requested_prefill_static = config.mesh_prefill_static_experts;
     plan.prefill_static_capacity =
         requested_prefill_static <= 0
             ? 0

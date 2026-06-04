@@ -130,6 +130,11 @@
       rebuild_prefill_static_expert_set_by_frequency(prefill_static_capacity_);
     }
     ensure_prefill_static_residents();
+    // The qlen==1 path can submit async prefetches into scratch slots before a
+    // later qlen>1 prefill chunk enters this streaming path. Drain them before
+    // scratch scheduling, otherwise release_prefill_scratch_slots observes
+    // SLOT_LOADING and correctly refuses to recycle the slot.
+    wait_for_all_pending_prefetches(false);
     // Unbind scratch slots from the previous scheduling round. Pool-backed
     // buffers return to IDLE with metadata preserved for warm restore; fallback
     // numa_alloc buffers are freed immediately.
@@ -219,15 +224,11 @@
       read_batch->clear();
       requests->clear();
       int next_scratch_slot = scratch_begin_slot;
-      // Slot picker: from the current cursor, skip past any scratch slot that
-      // currently holds an expert in protected_mask (i.e. an expert this layer's
-      // active set still needs). This is what keeps chunk-2's already-cached
-      // experts from being evicted by chunk-2's own new submissions.
-      auto advance_to_evictable_slot = [&]() {
+      // Slot picker: from the current cursor, skip past slots that cannot be
+      // rebound right now: protected experts, active readers, or in-flight loads.
+      auto advance_to_rebindable_slot = [&]() {
         while (next_scratch_slot < cache_capacity_) {
-          const int slot_expert = slot_to_expert_[next_scratch_slot];
-          if (slot_expert >= 0 && slot_expert < static_cast<int>(protected_mask.size()) &&
-              protected_mask[slot_expert]) {
+          if (!slot_has_rebindable_expert(next_scratch_slot, &protected_mask)) {
             next_scratch_slot += 1;
             continue;
           }
@@ -238,7 +239,7 @@
         const int expert_id = scratch_active_experts[idx];
         const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
         if (state != EXPERT_CACHED && state != EXPERT_PINNED && state != EXPERT_PREFETCHING) {
-          advance_to_evictable_slot();
+          advance_to_rebindable_slot();
           if (next_scratch_slot >= cache_capacity_) {
             std::ostringstream oss;
             oss << "AMX prefill scratch has no free slot layer=" << config_.layer_idx
@@ -363,21 +364,19 @@
       for (int expert_id : group) {
         (void)maybe_promote_prefill_scratch_expert_by_frequency(expert_id, &protected_mask);
       }
-      // INTENTIONALLY do NOT call release_prefill_scratch_slots here.
-      //
-      // Why: each chunk's experts often overlap heavily with the next chunk's
-      // active set (same prompt, adjacent tokens hit similar router top-k).
-      // Unbinding on every chunk forces the next chunk to re-read every expert
-      // from disk even if it's already in a slot. Measured 3x read amplification
-      // (25 GiB vs historical 8 GiB) when this was active.
-      //
-      // Instead let reserve_slot_for_loading do natural eviction on the next
-      // chunk: protected_mask already pins this chunk's still-needed experts,
-      // and the chunk-2 active set's protected_mask also pins what chunk-2
-      // needs. Overlapping experts stay resident, non-overlapping ones get
-      // evicted only when the new chunk actually needs the slot.
-      //
-      // Final teardown still runs through release_prefill_layer_window().
+      // Scratch slots are temporary bindings. Return pool-backed blocks to IDLE
+      // immediately after compute so a small global pool can serve later layers;
+      // the block metadata is preserved, so the next chunk can warm-restore a
+      // matching (layer, expert) without issuing another disk read.
+      if (!release_prefill_scratch_slots()) {
+        std::ostringstream oss;
+        oss << "AMX prefill scratch slots are still busy after chunk layer=" << config_.layer_idx
+            << " tp=" << tp_part_idx
+            << " group_size=" << group.size()
+            << " static_slots=" << prefill_static_slot_count_
+            << " capacity=" << cache_capacity_ << resident_debug_summary();
+        throw std::runtime_error(oss.str());
+      }
     };
 
     finish_scratch_chunk(scratch_compute_group, &scratch_promotions, scratch_requests);

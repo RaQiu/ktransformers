@@ -30,7 +30,11 @@
       update_lookahead_heat_from_forward(qlen, k, expert_ids, weights);
       refresh_lookahead_heat();
       expert_read_scope.reset();
-      if (config_.max_tier0_experts <= 0) {
+      const bool has_resident_cache_budget =
+          config_.max_tier0_experts > 0 ||
+          config_.max_resident_experts > 0 ||
+          config_.mesh_decode_resident_experts > 0;
+      if (!has_resident_cache_budget) {
         for (int expert_id : active_experts) {
           demote_expert(expert_id);
         }

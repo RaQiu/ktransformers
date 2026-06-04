@@ -395,6 +395,21 @@
     return config_.mesh_prefill_layer_mode_enabled && iouring_enabled();
   }
 
+  int global_scratch_pool_begin_slot() const {
+    if (!lazy_slot_buffers_enabled()) return cache_capacity_;
+    if (mesh_slot_mode_ == MESH_SLOT_PREFILL_LAYER) {
+      return std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
+    }
+    if (mesh_slot_mode_ == MESH_SLOT_DECODE_CACHE) {
+      return std::max(0, std::min(mesh::decode_cache_capacity(config_, cache_capacity_), cache_capacity_));
+    }
+    return cache_capacity_;
+  }
+
+  bool slot_uses_global_scratch_pool(int slot) const {
+    return lazy_slot_buffers_enabled() && slot >= global_scratch_pool_begin_slot();
+  }
+
   bool slot_has_buffers(int slot) const {
     return mesh::slot_has_buffers(resident_slot_pool_view(), slot);
   }
@@ -427,16 +442,18 @@
     if (slot < 0 || slot >= cache_capacity_) return false;
     if (slot_has_buffers(slot)) return true;
 
-    // Try to borrow a block from the cross-layer global pool first. This is
-    // the buffer-reuse path the design hinges on: 40 layers share one pool,
-    // so total memory becomes (per-layer permanent buffers + pool capacity)
-    // instead of (40 * cache_capacity_).
+    const bool uses_global_pool = slot_uses_global_scratch_pool(slot);
+    const int scratch_begin = global_scratch_pool_begin_slot();
+
+    // Try to borrow a block from the cross-layer global pool for scratch slots
+    // only. Static/decode-main slots are long-lived per-layer residents and
+    // would otherwise pin the global pool for the entire request.
     //
     // Only route through the pool when the prefill-layer-mode + iouring
     // (lazy buffer) configuration is active. When buffers are eagerly
     // preallocated (legacy path), every layer would otherwise drain the pool
     // on startup before any cross-layer sharing happens.
-    if (lazy_slot_buffers_enabled()) {
+    if (uses_global_pool) {
       auto& pool = mesh::GlobalScratchPoolRegistry::get(numa_node_);
       if (pool.initialized()) {
         std::vector<int> ids;
@@ -445,13 +462,57 @@
           pool.get_owners(ids[0], &slot_gate_owner_[slot], &slot_up_owner_[slot], &slot_down_owner_[slot]);
           return true;
         }
+        if (const char* trace = std::getenv("KT_MESH_POOL_TRACE");
+            trace != nullptr && trace[0] != '\0' && trace[0] != '0') {
+          std::fprintf(stderr,
+                       "[MESH-POOL] acquire failed layer=%d tp=%d numa=%d slot=%d scratch_begin=%d%s\n",
+                       config_.layer_idx,
+                       tp_part_idx,
+                       numa_node_,
+                       slot,
+                       global_scratch_pool_begin_slot(),
+                       pool.describe().c_str());
+        }
         // Pool exhausted — fall through to per-layer numa_alloc. This
         // shouldn't happen in steady state if KT_MESH_GLOBAL_POOL_CAPACITY
         // is sized for 40*stable_per_layer + peak temp.
       }
     }
     scratch_slot_pool_block_idx_[slot] = -1;
-    return allocate_expert_buffers(&slot_gate_owner_[slot], &slot_up_owner_[slot], &slot_down_owner_[slot]);
+    if (allocate_expert_buffers(&slot_gate_owner_[slot], &slot_up_owner_[slot], &slot_down_owner_[slot])) {
+      return true;
+    }
+    std::string pool_summary;
+    if (uses_global_pool) {
+      auto& pool = mesh::GlobalScratchPoolRegistry::get(numa_node_);
+      pool_summary = pool.describe();
+    }
+    std::fprintf(stderr,
+                 "[MESH-POOL] allocate_slot_buffers failed layer=%d tp=%d numa=%d slot=%d "
+                 "uses_pool=%d lazy=%d slot_mode=%d scratch_begin=%d capacity=%d "
+                 "gate_bytes=%zu up_bytes=%zu down_bytes=%zu%s\n",
+                 config_.layer_idx,
+                 tp_part_idx,
+                 numa_node_,
+                 slot,
+                 uses_global_pool ? 1 : 0,
+                 lazy_slot_buffers_enabled() ? 1 : 0,
+                 static_cast<int>(mesh_slot_mode_),
+                 scratch_begin,
+                 cache_capacity_,
+                 gate_total_bytes_,
+                 up_total_bytes_,
+                 down_total_bytes_,
+                 pool_summary.c_str());
+    return false;
+  }
+
+  void release_empty_slot_buffers_if_any(int slot) {
+    if (slot < 0 || slot >= cache_capacity_) return;
+    if (slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
+        slot_to_expert_[slot] < 0 && slot_has_buffers(slot)) {
+      release_slot_buffers(slot);
+    }
   }
 
   void release_slot_buffers(int slot) {
@@ -504,6 +565,7 @@
       if (block_idx >= 0) {
         auto& pool = mesh::GlobalScratchPoolRegistry::get(numa_node_);
         pool.set_block_metadata(block_idx, config_.layer_idx, expert_id);
+        pool.mark_in_use(block_idx);
       }
     }
   }
@@ -542,6 +604,9 @@
       const int slot = expert_to_slot_[expert_id];
       if (slot >= 0) {
         (void)unbind_slot(slot, true, false);
+        if (slot_uses_global_scratch_pool(slot)) {
+          release_empty_slot_buffers_if_any(slot);
+        }
         return;
       }
     }
@@ -758,6 +823,9 @@
         expert_states_[victim].store(state, std::memory_order_release);
         continue;
       }
+      if (slot_uses_global_scratch_pool(slot)) {
+        release_empty_slot_buffers_if_any(slot);
+      }
       note_expert_demote(victim);
       mesh::record_cache_eviction_demote(config_);
       return true;
@@ -772,6 +840,7 @@
       if (slot_states_[slot].load(std::memory_order_acquire) != SLOT_READY || slot_to_expert_[slot] < 0) continue;
       if (!slot_has_rebindable_expert(slot, protected_mask)) continue;
       if (!unbind_slot(slot, true, true)) continue;
+      release_empty_slot_buffers_if_any(slot);
       mesh::record_cache_eviction_demote(config_);
       return true;
     }
@@ -783,13 +852,7 @@
     if (slot_out == nullptr || !slot_pool_enabled()) return false;
     int slot = -1;
     if (decode_frequency_policy_active()) {
-      slot = find_decode_frequency_loading_slot(expert_id, protected_mask);
-      if (slot < 0) return false;
-      if (!reserve_slot_for_loading(slot, expert_id)) {
-        return false;
-      }
-      *slot_out = slot;
-      return true;
+      return reserve_decode_frequency_loading_slot_for_expert(expert_id, slot_out, protected_mask);
     }
 
     int wait_attempts = 0;
@@ -1228,6 +1291,7 @@
         break;
       }
     }
+    release_empty_slot_buffers_to_limit(target_capacity);
   }
 
   int decode_cache_capacity() const {
@@ -1359,6 +1423,62 @@
     const int main_slot = find_frequency_main_replacement_slot(expert_id, protected_mask);
     if (main_slot >= 0) return main_slot;
     return find_frequency_scratch_slot(protected_mask);
+  }
+
+  bool reserve_decode_frequency_loading_slot_for_expert(int expert_id,
+                                                        int* slot_out,
+                                                        const std::vector<uint8_t>* protected_mask) {
+    if (slot_out == nullptr || !decode_frequency_policy_active()) return false;
+
+    const int main_slot = find_frequency_main_replacement_slot(expert_id, protected_mask);
+    if (main_slot >= 0) {
+      if (reserve_slot_for_loading(main_slot, expert_id)) {
+        *slot_out = main_slot;
+        return true;
+      }
+      std::fprintf(stderr,
+                   "[MESH_DECODE_BATCH_WARN] layer=%d tp=%d reason=reserve_main_slot_failed "
+                   "expert=%d slot=%d main_slots=%d resident=%d capacity=%d%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   expert_id,
+                   main_slot,
+                   decode_main_slot_count(),
+                   resident_expert_count_.load(std::memory_order_acquire),
+                   cache_capacity_,
+                   resident_debug_summary().c_str());
+    }
+
+    const int scratch_slot = find_frequency_scratch_slot(protected_mask);
+    if (scratch_slot < 0) {
+      std::fprintf(stderr,
+                   "[MESH_DECODE_BATCH_WARN] layer=%d tp=%d reason=no_scratch_slot "
+                   "expert=%d main_slots=%d resident=%d capacity=%d%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   expert_id,
+                   decode_main_slot_count(),
+                   resident_expert_count_.load(std::memory_order_acquire),
+                   cache_capacity_,
+                   resident_debug_summary().c_str());
+      return false;
+    }
+    if (!reserve_slot_for_loading(scratch_slot, expert_id)) {
+      std::fprintf(stderr,
+                   "[MESH_DECODE_BATCH_WARN] layer=%d tp=%d reason=reserve_scratch_slot_failed "
+                   "expert=%d slot=%d main_slots=%d resident=%d capacity=%d%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   expert_id,
+                   scratch_slot,
+                   decode_main_slot_count(),
+                   resident_expert_count_.load(std::memory_order_acquire),
+                   cache_capacity_,
+                   resident_debug_summary().c_str());
+      return false;
+    }
+    *slot_out = scratch_slot;
+    return true;
   }
 
   void refresh_prefill_static_slot_metadata(int slot, int expert_id) {
@@ -1653,6 +1773,7 @@
           timing->request_build_us += elapsed_us(request_build_start, std::chrono::steady_clock::now());
         }
         (void)unbind_slot(slot, true, false);
+        release_empty_slot_buffers_if_any(slot);
         expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
         throw;
       }
@@ -1662,6 +1783,7 @@
       promotion.request_count = read_batch->size() - request_begin;
       if (promotion.request_count == 0) {
         (void)unbind_slot(slot, true, false);
+        release_empty_slot_buffers_if_any(slot);
         expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
         return false;
       }
@@ -1676,6 +1798,7 @@
     for (auto& promotion : *promotions) {
       if (promotion.slot >= 0) {
         (void)unbind_slot(promotion.slot, true, false);
+        release_empty_slot_buffers_if_any(promotion.slot);
       }
       if (promotion.expert_id >= 0 && promotion.expert_id < config_.expert_num) {
         expert_states_[promotion.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
@@ -1710,14 +1833,7 @@
           << " requests=" << all_requests.size() << " inflight=" << config_.async_reader->get_inflight_count()
           << " timeout_ms=" << timeout_ms << " detail="
           << config_.async_reader->describe_requests(all_requests);
-      for (auto& promotion : *promotions) {
-        if (promotion.slot >= 0) {
-          (void)unbind_slot(promotion.slot, true, false);
-        }
-        if (promotion.expert_id >= 0 && promotion.expert_id < config_.expert_num) {
-          expert_states_[promotion.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
-        }
-      }
+      rollback_prefill_promotions(promotions);
       throw std::runtime_error(oss.str());
     }
 
@@ -1862,24 +1978,32 @@
       if (submitted >= submit_limit) break;
       const int target_slot = find_main_slot_outside_frequency_set(desired_mask);
       if (target_slot < 0) {
-        std::ostringstream oss;
-        oss << "MESH frequency decode transition has no replaceable main slot layer=" << config_.layer_idx
-            << " tp=" << tp_part_idx << " expert=" << expert_id
-            << " target_capacity=" << target_capacity
-            << " main_slots=" << main_slots
-            << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
-            << " capacity=" << cache_capacity_ << resident_debug_summary();
-        throw std::runtime_error(oss.str());
+        std::fprintf(stderr,
+                     "[MESH_DECODE_TRANSITION_WARN] layer=%d tp=%d reason=no_replaceable_main_slot "
+                     "expert=%d target_capacity=%d main_slots=%d resident=%d capacity=%d%s\n",
+                     config_.layer_idx,
+                     tp_part_idx,
+                     expert_id,
+                     target_capacity,
+                     main_slots,
+                     resident_expert_count_.load(std::memory_order_acquire),
+                     cache_capacity_,
+                     resident_debug_summary().c_str());
+        break;
       }
       if (!submit_prefill_promotion_to_slot(expert_id, target_slot, &promotions, &read_batch, nullptr)) {
-        std::ostringstream oss;
-        oss << "MESH frequency decode transition could not reserve main slot layer=" << config_.layer_idx
-            << " tp=" << tp_part_idx << " expert=" << expert_id
-            << " slot=" << target_slot
-            << " target_capacity=" << target_capacity
-            << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
-            << " capacity=" << cache_capacity_ << resident_debug_summary();
-        throw std::runtime_error(oss.str());
+        std::fprintf(stderr,
+                     "[MESH_DECODE_TRANSITION_WARN] layer=%d tp=%d reason=reserve_main_slot_failed "
+                     "expert=%d slot=%d target_capacity=%d resident=%d capacity=%d%s\n",
+                     config_.layer_idx,
+                     tp_part_idx,
+                     expert_id,
+                     target_slot,
+                     target_capacity,
+                     resident_expert_count_.load(std::memory_order_acquire),
+                     cache_capacity_,
+                     resident_debug_summary().c_str());
+        break;
       }
       submitted += 1;
     }
@@ -1920,12 +2044,33 @@
       config_.mesh_decode_resident_experts = requested_decode_capacity;
     }
     const int target_capacity = decode_cache_capacity();
+    int submitted = 0;
+    const char* mode = "heat";
     if (config_.mesh_prefill_layer_mode_enabled && expert_frequency_total_ > 0) {
-      return transition_to_decode_frequency_cache(target_capacity, fill_limit);
+      mode = "frequency";
+      submitted = transition_to_decode_frequency_cache(target_capacity, fill_limit);
+    } else {
+      trim_cache_to_capacity();
+      release_empty_slot_buffers_to_limit(target_capacity);
+      submitted = submit_decode_heat_prefetches(target_capacity, fill_limit);
     }
-    trim_cache_to_capacity();
-    release_empty_slot_buffers_to_limit(target_capacity);
-    const int submitted = submit_decode_heat_prefetches(target_capacity, fill_limit);
+    if (const char* trace = std::getenv("KT_MESH_DECODE_TRANSITION_TRACE");
+        trace != nullptr && trace[0] != '\0' && trace[0] != '0') {
+      std::fprintf(stderr,
+                   "[MESH_DECODE_TRANSITION] layer=%d tp=%d mode=%s requested=%d target=%d "
+                   "fill_limit=%d submitted=%d resident=%d capacity=%d freq_total=%llu%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   mode,
+                   requested_decode_capacity,
+                   target_capacity,
+                   fill_limit,
+                   submitted,
+                   resident_expert_count_.load(std::memory_order_acquire),
+                   cache_capacity_,
+                   static_cast<unsigned long long>(expert_frequency_total_),
+                   resident_debug_summary().c_str());
+    }
     return submitted;
   }
 
@@ -1958,6 +2103,7 @@
     auto& pending = pending_prefetches_[expert_id];
     if (release_buffers && pending.slot_index >= 0) {
       (void)unbind_slot(pending.slot_index, true, false);
+      release_empty_slot_buffers_if_any(pending.slot_index);
     }
     pending.slot_index = -1;
     pending.requests.clear();
@@ -2049,6 +2195,7 @@
       std::vector<uint64_t> requests = submit_iouring_reads_for_expert(expert_id, gate_owner, up_owner, down_owner);
       if (requests.empty()) {
         (void)unbind_slot(slot, true, false);
+        release_empty_slot_buffers_if_any(slot);
         expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
         return false;
       }
@@ -2059,10 +2206,21 @@
       return true;
     } catch (...) {
       (void)unbind_slot(slot, true, false);
+      release_empty_slot_buffers_if_any(slot);
       expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
       throw;
     }
 #endif
+  }
+
+  void wait_for_all_pending_prefetches(bool pin_after_wait = false) {
+    if (!iouring_enabled() || config_.async_reader == nullptr) return;
+    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+      if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
+      if (!pending_prefetches_[expert_id].requests.empty()) {
+        wait_for_pending_prefetch(expert_id, pin_after_wait);
+      }
+    }
   }
 
   void ensure_expert_ready(int expert_id, bool pin = false) {
