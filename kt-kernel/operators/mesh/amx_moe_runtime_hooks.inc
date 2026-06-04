@@ -7,6 +7,7 @@
     std::unique_ptr<ExpertReadScope> expert_read_scope;
     std::vector<int> active_experts;
     if (resident_io_enabled()) {
+      maybe_transition_decode_cache_for_forward(qlen);
       complete_ready_prefetches();
       refresh_lookahead_heat();
       if (qlen > 1 && forward_prefill_streaming_slots(qlen, k, expert_ids, weights, input, output)) {

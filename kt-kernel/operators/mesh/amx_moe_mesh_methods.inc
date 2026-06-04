@@ -674,6 +674,26 @@
     return mesh::prefill_stream_trace_enabled();
   }
 
+  int mesh_env_int(const char* name, int fallback) const {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') return fallback;
+    char* end = nullptr;
+    long value = std::strtol(raw, &end, 10);
+    if (end == raw) return fallback;
+    return static_cast<int>(value);
+  }
+
+  void maybe_transition_decode_cache_for_forward(int qlen) {
+    if (qlen != 1 || !config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() ||
+        mesh_slot_mode_ != MESH_SLOT_PREFILL_LAYER) {
+      return;
+    }
+    const int requested =
+        config_.mesh_decode_resident_experts > 0 ? config_.mesh_decode_resident_experts : decode_cache_capacity();
+    const int fill_limit = mesh_env_int("KT_MESH_DECODE_TRANSITION_FILL_LIMIT", requested);
+    (void)transition_to_decode_cache(requested, fill_limit);
+  }
+
   void maybe_dump_prefill_expert_frequency(int qlen, int k, const int64_t* expert_ids,
                                            const std::vector<int>& active_experts) const {
     mesh::maybe_dump_prefill_expert_frequency(
