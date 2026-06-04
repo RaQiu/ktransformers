@@ -511,7 +511,7 @@ def build_env(mode: str, precision: str, cuda: str, expert_stats_path: Path, arg
         env.update(
             {
                 "KT_IO_BACKEND": "IOURING",
-                "KT_IOURING_DIRECT": "1",
+                "KT_IOURING_DIRECT": str(args.iouring_direct),
                 "KT_MAX_RESIDENT_EXPERTS": str(args.mesh_cap),
                 "KT_MAX_TIER0_EXPERTS": str(args.mesh_cap),
                 "KT_MESH_GLOBAL_POOL_CAPACITY": str(args.mesh_global_pool_capacity),
@@ -939,6 +939,7 @@ def main() -> int:
     parser.add_argument("--mesh-prefill-layer-window", type=int, default=0)
     parser.add_argument("--mesh-policy", default="sieve")
     parser.add_argument("--mesh-bootstrap-prefetch", action="store_true")
+    parser.add_argument("--iouring-direct", choices=["0", "1"], default="1")
     parser.add_argument("--bf16-expert-cache", choices=["0", "1"], default="1")
     parser.add_argument("--bf16-expert-cache-dir", default="")
     parser.add_argument("--disable-dynamic-expert-update", action="store_true")
