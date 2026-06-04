@@ -1,0 +1,11 @@
+--- mesh_paper_work/legacy_mmap_loader_fix/loader.build.py.before_bf16_packed_fix	2026-06-05 04:40:55
++++ mesh_paper_work/legacy_mmap_loader_fix/loader.build.py	2026-06-05 04:41:37
+@@ -723,7 +723,7 @@
+         }
+ 
+ 
+-class BF16SafeTensorLoader(SafeTensorLoader):
++class BF16SafeTensorLoaderLegacyUnpacked(SafeTensorLoader):
+     """Loader for native BF16 expert weights (no quantization, no scales).
+ 
+     Supported formats:
