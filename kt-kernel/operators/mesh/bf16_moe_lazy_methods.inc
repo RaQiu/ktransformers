@@ -173,6 +173,13 @@
 
   int cache_capacity_for_debug() const { return cache_capacity_; }
 
+  void pack_bf16_buffer_b(typename T::BufferB* buffer, ggml_bf16_t* raw, int n) {
+    const int nth = std::max(1, T::recommended_nth(n));
+    for (int ith = 0; ith < nth; ++ith) {
+      buffer->from_mat(raw, ith, nth);
+    }
+  }
+
   bool read_and_pack_iouring_expert(int expert_id, void* gate_owner, void* up_owner, void* down_owner) {
     const size_t down_full_bytes = full_down_weight_bytes();
     void* gate_raw = numa_alloc_onnode(gate_weight_bytes_, numa_node_);
@@ -214,11 +221,11 @@
     up_bb_[expert_id]->set_data(up_owner);
     down_bb_[expert_id]->set_data(down_owner);
 
-    gate_bb_[expert_id]->from_mat(static_cast<ggml_bf16_t*>(gate_raw), 0, 1);
-    up_bb_[expert_id]->from_mat(static_cast<ggml_bf16_t*>(up_raw), 0, 1);
+    pack_bf16_buffer_b(gate_bb_[expert_id].get(), static_cast<ggml_bf16_t*>(gate_raw), config_.intermediate_size);
+    pack_bf16_buffer_b(up_bb_[expert_id].get(), static_cast<ggml_bf16_t*>(up_raw), config_.intermediate_size);
 
     if (full_intermediate_size_ == config_.intermediate_size) {
-      down_bb_[expert_id]->from_mat(static_cast<ggml_bf16_t*>(down_full_raw), 0, 1);
+      pack_bf16_buffer_b(down_bb_[expert_id].get(), static_cast<ggml_bf16_t*>(down_full_raw), config_.hidden_size);
     } else {
       std::vector<ggml_bf16_t> down_contiguous((size_t)config_.hidden_size * (size_t)config_.intermediate_size);
       const size_t down_col_offset = (size_t)tp_part_idx * (size_t)config_.intermediate_size;
@@ -228,7 +235,7 @@
         ggml_bf16_t* dst_row = down_contiguous.data() + (size_t)row * (size_t)config_.intermediate_size;
         std::memcpy(dst_row, src_row, sizeof(ggml_bf16_t) * (size_t)config_.intermediate_size);
       }
-      down_bb_[expert_id]->from_mat(down_contiguous.data(), 0, 1);
+      pack_bf16_buffer_b(down_bb_[expert_id].get(), down_contiguous.data(), config_.hidden_size);
     }
 
     numa_free(gate_raw, gate_weight_bytes_);
@@ -319,11 +326,11 @@
     up_bb_[expert_id]->set_data(up_owner);
     down_bb_[expert_id]->set_data(down_owner);
 
-    gate_bb_[expert_id]->from_mat(const_cast<ggml_bf16_t*>(gate_raw), 0, 1);
-    up_bb_[expert_id]->from_mat(const_cast<ggml_bf16_t*>(up_raw), 0, 1);
+    pack_bf16_buffer_b(gate_bb_[expert_id].get(), const_cast<ggml_bf16_t*>(gate_raw), config_.intermediate_size);
+    pack_bf16_buffer_b(up_bb_[expert_id].get(), const_cast<ggml_bf16_t*>(up_raw), config_.intermediate_size);
 
     if (full_intermediate_size_ == config_.intermediate_size) {
-      down_bb_[expert_id]->from_mat(const_cast<ggml_bf16_t*>(down_full_raw), 0, 1);
+      pack_bf16_buffer_b(down_bb_[expert_id].get(), const_cast<ggml_bf16_t*>(down_full_raw), config_.hidden_size);
     } else {
       std::vector<ggml_bf16_t> down_contiguous((size_t)config_.hidden_size * (size_t)config_.intermediate_size);
       const size_t down_col_offset = (size_t)tp_part_idx * (size_t)config_.intermediate_size;
@@ -333,7 +340,7 @@
         ggml_bf16_t* dst_row = down_contiguous.data() + (size_t)row * (size_t)config_.intermediate_size;
         std::memcpy(dst_row, src_row, sizeof(ggml_bf16_t) * (size_t)config_.intermediate_size);
       }
-      down_bb_[expert_id]->from_mat(down_contiguous.data(), 0, 1);
+      pack_bf16_buffer_b(down_bb_[expert_id].get(), down_contiguous.data(), config_.hidden_size);
     }
 
     packed_gate_owner_[expert_id] = gate_owner;
