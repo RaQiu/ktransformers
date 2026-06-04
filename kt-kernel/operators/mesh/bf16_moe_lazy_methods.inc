@@ -161,6 +161,7 @@
       note_expert_demote(victim);
       resident_expert_count_.fetch_sub(1, std::memory_order_acq_rel);
       expert_states_[victim].store(EXPERT_BASELINE, std::memory_order_release);
+      mesh::record_cache_eviction_demote(config_);
       return true;
     }
 
@@ -349,6 +350,7 @@
     resident_expert_count_.fetch_add(1, std::memory_order_acq_rel);
     expert_states_[expert_id].store(pin_after_pack ? EXPERT_PINNED : EXPERT_CACHED, std::memory_order_release);
     note_expert_insert(expert_id, pin_after_pack);
+    mesh::record_cache_promote(config_, tp_part_idx, expert_id);
     return true;
   }
 
@@ -430,6 +432,7 @@
     resident_expert_count_.fetch_add(1, std::memory_order_acq_rel);
     expert_states_[expert_id].store(pin_after_pack ? EXPERT_PINNED : EXPERT_CACHED, std::memory_order_release);
     note_expert_insert(expert_id, pin_after_pack);
+    mesh::record_cache_promote(config_, tp_part_idx, expert_id);
     mesh::maybe_log_cpu_mem_resident(config_,
                                      tp_part_idx,
                                      expert_id,
@@ -444,12 +447,21 @@
   void ensure_expert_ready(int expert_id, bool pin = false) {
     if (expert_id < 0 || expert_id >= config_.expert_num) return;
 
+    mesh::record_cache_total_access(config_, tp_part_idx, expert_id);
+    bool counted_miss_for_this_access = false;
+
     for (;;) {
       uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
       if (state == EXPERT_PINNED) {
+        if (!counted_miss_for_this_access) {
+          mesh::record_cache_hit(config_, tp_part_idx, expert_id);
+        }
         return;
       }
       if (state == EXPERT_CACHED) {
+        if (!counted_miss_for_this_access) {
+          mesh::record_cache_hit(config_, tp_part_idx, expert_id);
+        }
         if (!pin) {
           return;
         }
@@ -462,6 +474,8 @@
         continue;
       }
       if (state == EXPERT_BASELINE) {
+        mesh::record_cache_cold_miss(config_, tp_part_idx, expert_id);
+        counted_miss_for_this_access = true;
         uint8_t expected = EXPERT_BASELINE;
         if (!expert_states_[expert_id].compare_exchange_strong(
                 expected, EXPERT_PACKING, std::memory_order_acq_rel, std::memory_order_acquire)) {

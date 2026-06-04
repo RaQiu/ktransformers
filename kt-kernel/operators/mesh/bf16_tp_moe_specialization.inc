@@ -439,6 +439,11 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE_Common<AMX_BF16_MOE_TP<K>> {
     (void)preload_bf16_cache_blob_experts(expert_ids, qlen * k, qlen);
 #endif
     Base::forward(qlen_ptr, k, expert_ids, weights, input, output, incremental);
+#ifndef _WIN32
+    if (this->config.enable_cache_stats && this->config.cache_stats != nullptr) {
+      this->config.cache_stats->maybe_dump_jsonl();
+    }
+#endif
   }
 
   void forward_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t weights, intptr_t input, intptr_t output,
