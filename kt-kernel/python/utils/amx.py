@@ -1,6 +1,7 @@
 import gc
 import logging
 import os
+import ctypes
 import torch
 from typing import List, Optional
 
@@ -18,7 +19,12 @@ from .loader import (
 )
 from kt_kernel_ext.moe import MOEConfig
 import kt_kernel_ext.moe as _moe_mod
-from .mesh import amx_helpers as mesh_amx
+
+
+def _mesh_amx_helpers():
+    from .mesh import amx_helpers as mesh_amx
+
+    return mesh_amx
 
 AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
@@ -31,6 +37,7 @@ AVX2BF16_MOE = getattr(_moe_mod, "AVX2BF16_MOE", None)
 AVX2FP8_MOE = getattr(_moe_mod, "AVX2FP8_MOE", None)
 AVX2GPTQInt4_MOE = getattr(_moe_mod, "AVX2GPTQInt4_MOE", None)
 AVX2RawInt4_MOE = getattr(_moe_mod, "AVX2RawInt4_MOE", None)
+AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
 
@@ -45,6 +52,7 @@ _HAS_AVX2_BF16_SUPPORT = AVX2BF16_MOE is not None
 _HAS_AVX2_FP8_SUPPORT = AVX2FP8_MOE is not None
 _HAS_AVX2_GPTQ_INT4_SUPPORT = AVX2GPTQInt4_MOE is not None
 _HAS_AVX2_RAWINT4_SUPPORT = AVX2RawInt4_MOE is not None
+_HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
@@ -140,6 +148,33 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
         return AVXVNNI256RawInt4_MOE
     if _HAS_AVX2_RAWINT4_SUPPORT:
         return AVX2RawInt4_MOE
+    return None
+
+
+def _select_mxfp4_backend():
+    """Select MXFP4 backend: AMX/AVX-512 preferred, AVX2 fallback."""
+    forced = os.getenv("KT_MXFP4_BACKEND", "").strip().lower()
+
+    if forced == "amx":
+        if not _HAS_MXFP4_SUPPORT:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=amx requested, but AMXFP4_KGroup_MOE is not compiled in. "
+                "Recompile with AVX512F + AVX512BW + AVX512_BF16 enabled."
+            )
+        return AMXFP4_KGroup_MOE
+
+    if forced == "avx2":
+        if not _HAS_AVX2_MXFP4_SUPPORT:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=avx2 requested, but AVX2MXFP4_MOE is not compiled in. "
+                "Recompile with AVX2 + FMA enabled."
+            )
+        return AVX2MXFP4_MOE
+
+    if _HAS_MXFP4_SUPPORT:
+        return AMXFP4_KGroup_MOE
+    if _HAS_AVX2_MXFP4_SUPPORT:
+        return AVX2MXFP4_MOE
     return None
 
 
@@ -286,7 +321,6 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
-        moe_config.resident_cache_policy = self.residency_policy
 
         # Enable save mode for online quantization
         moe_config.save = True
@@ -331,7 +365,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
         up_scale_ptrs = []
         down_scale_ptrs = []
 
-        use_iouring = mesh_amx.resolve_amx_weight_mode(self)
+        use_iouring = self.io_backend == "IOURING"
+        mesh_amx = _mesh_amx_helpers() if use_iouring else None
+        if use_iouring:
+            use_iouring = mesh_amx.resolve_amx_weight_mode(self)
         file_slots = None
 
         if self.load_merged_weight:
@@ -343,9 +380,55 @@ class AMXMoEWrapper(BaseMoEWrapper):
                 w = self.safetensor_loader.load_experts(base_key)
 
             if not use_iouring:
-                gate_ptrs, up_ptrs, down_ptrs, gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs = (
-                    mesh_amx.assign_amx_weight_views(self, w)
-                )
+                self.gate_weights = w["gate"]
+                self.up_weights = w["up"]
+                self.down_weights = w["down"]
+                self.gate_scales = w["gate_scale"]
+                self.up_scales = w["up_scale"]
+                self.down_scales = w["down_scale"]
+
+                gate_ptrs = [
+                    [
+                        ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                        for et in numa_array
+                    ]
+                    for numa_array in self.gate_weights
+                ]
+                up_ptrs = [
+                    [
+                        ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                        for et in numa_array
+                    ]
+                    for numa_array in self.up_weights
+                ]
+                down_ptrs = [
+                    [
+                        ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                        for et in numa_array
+                    ]
+                    for numa_array in self.down_weights
+                ]
+                gate_scale_ptrs = [
+                    [
+                        ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                        for et in numa_array
+                    ]
+                    for numa_array in self.gate_scales
+                ]
+                up_scale_ptrs = [
+                    [
+                        ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                        for et in numa_array
+                    ]
+                    for numa_array in self.up_scales
+                ]
+                down_scale_ptrs = [
+                    [
+                        ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                        for et in numa_array
+                    ]
+                    for numa_array in self.down_scales
+                ]
 
         # Configure MoE
         moe_config = MOEConfig(
@@ -368,7 +451,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
-        mesh_amx.apply_mesh_moe_config(self, moe_config, use_iouring=use_iouring, file_slots=file_slots)
+        if use_iouring:
+            mesh_amx.apply_mesh_moe_config(self, moe_config, use_iouring=True, file_slots=file_slots)
 
         if self.cpu_save:
             moe_config.save = True
@@ -421,7 +505,9 @@ class AMXMoEWrapper(BaseMoEWrapper):
         return dict(self.moe.cache_stats_snapshot())
 
     def close(self):
-        super().close()
+        base_close = getattr(super(), "close", None)
+        if base_close is not None:
+            base_close()
         self.gate_weights = None
         self.up_weights = None
         self.down_weights = None
@@ -435,7 +521,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         self.up_scale_file_slots = None
         self.down_scale_file_slots = None
         self._async_reader_keepalive = None
-        if BaseMoEWrapper._active_wrapper_count == 0:
+        if getattr(BaseMoEWrapper, "_active_wrapper_count", 0) == 0:
             if AMXMoEWrapper._safetensor_loader_instance is not None:
                 AMXMoEWrapper._safetensor_loader_instance.close_all_handles()
             AMXMoEWrapper._safetensor_loader_instance = None
@@ -514,11 +600,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "Please recompile kt_kernel_ext with GPTQ INT4 support enabled.\n"
                 "AVX-VNNI-256 will be selected automatically when available on the current CPU."
             )
-        if method == "MXFP4" and not _HAS_MXFP4_SUPPORT:
+        if method == "MXFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
             raise RuntimeError(
-                "MXFP4 backend not available. Required ISA:\n"
-                "  - AVX512F + AVX512BW + AVX512_BF16\n"
-                "Please recompile kt_kernel_ext with AVX512 + BF16 enabled."
+                "MXFP4 backend not available. Required ISA (any one of):\n"
+                "  - AVX512F + AVX512BW + AVX512_BF16 (for AMX/AVX-512 backend)\n"
+                "  - AVX2 + FMA (for AVX2 fallback backend)\n"
+                "Please recompile kt_kernel_ext with one of the above enabled."
             )
 
         super().__init__(
@@ -625,6 +712,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         t0 = time.time()
         base_key = f"model.layers.{self.layer_idx}"
         use_iouring = self.method == "BF16" and self.io_backend == "IOURING"
+        mesh_amx = _mesh_amx_helpers() if use_iouring else None
         file_slots = None
         weights = None
         if use_iouring:
@@ -686,15 +774,20 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         # Build pointer lists: [numa_id][expert_id] -> pointer
         # Since RAWINT4/FP8/BF16 has no numa sharding, numa dimension is 1
-        gate_ptrs = [] if use_iouring else [[mesh_amx.tensor_data_ptr(t) for t in self.gate_weights]]
-        up_ptrs = [] if use_iouring else [[mesh_amx.tensor_data_ptr(t) for t in self.up_weights]]
-        down_ptrs = [] if use_iouring else [[mesh_amx.tensor_data_ptr(t) for t in self.down_weights]]
+        gate_ptrs = [] if use_iouring else [[t.data_ptr() for t in self.gate_weights]]
+        up_ptrs = [] if use_iouring else [[t.data_ptr() for t in self.up_weights]]
+        down_ptrs = [] if use_iouring else [[t.data_ptr() for t in self.down_weights]]
 
         # BF16 has no scales, pass empty lists (will use 0/nullptr for consistency)
         if self.method == "BF16":
-            gate_scale_ptrs = []
-            up_scale_ptrs = []
-            down_scale_ptrs = []
+            if use_iouring:
+                gate_scale_ptrs = []
+                up_scale_ptrs = []
+                down_scale_ptrs = []
+            else:
+                gate_scale_ptrs = [[0 for _ in self.gate_weights]]
+                up_scale_ptrs = [[0 for _ in self.up_weights]]
+                down_scale_ptrs = [[0 for _ in self.down_weights]]
         else:
             gate_scale_ptrs = [[t.data_ptr() for t in self.gate_scales]]
             up_scale_ptrs = [[t.data_ptr() for t in self.up_scales]]
@@ -733,7 +826,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
-        mesh_amx.apply_mesh_moe_config(self, moe_config, use_iouring=use_iouring, file_slots=file_slots)
+        if use_iouring:
+            mesh_amx.apply_mesh_moe_config(self, moe_config, use_iouring=True, file_slots=file_slots)
 
         # Infer group_size from scale shape (column-major layout)
         # For gate/up projection: in_features = hidden_size
@@ -760,7 +854,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
-            self.moe = AMXFP4_KGroup_MOE(moe_config)
+            backend_cls = _select_mxfp4_backend()
+            if backend_cls is None:
+                raise RuntimeError(
+                    "No MXFP4 backend available after runtime selection. "
+                    "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
+                )
+            self.moe = backend_cls(moe_config)
         elif self.method == "FP8":
             moe_config.quant_config.bits = 8
             moe_config.quant_config.group_size = 128
@@ -870,8 +970,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
 
     def close(self):
-        super().close()
-        if BaseMoEWrapper._active_wrapper_count == 0:
+        base_close = getattr(super(), "close", None)
+        if base_close is not None:
+            base_close()
+        if getattr(BaseMoEWrapper, "_active_wrapper_count", 0) == 0:
             if NativeMoEWrapper._native_loader_instance is not None:
                 NativeMoEWrapper._native_loader_instance.close_all_handles()
             NativeMoEWrapper._native_loader_instance = None

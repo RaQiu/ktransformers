@@ -64,7 +64,9 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   AMX_BF16_MOE_TP() = default;
 
   AMX_BF16_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {
-    this->derived_init();
+    if (this->config_.io_backend == IOBackend::IOURING) {
+      this->derived_init();
+    }
   }
 
   void derived_init() {
@@ -79,7 +81,9 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
 
   ~AMX_BF16_MOE_TP() {
 #ifndef _WIN32
-    cleanup_lazy_weight_state();
+    if (this->config_.io_backend == IOBackend::IOURING) {
+      cleanup_lazy_weight_state();
+    }
 #endif
   }
 
@@ -184,7 +188,7 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
    */
   void load_weights() {
 #ifndef _WIN32
-    if (mesh_load_weights_from_lazy_sources()) return;
+    if (this->config_.io_backend == IOBackend::IOURING && mesh_load_weights_from_lazy_sources()) return;
 #endif
 
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;

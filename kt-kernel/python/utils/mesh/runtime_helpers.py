@@ -63,7 +63,7 @@ def _configure_base_runtime(
 
     env_residency_policy = os.environ.get("KT_RESIDENCY_POLICY")
     self.residency_policy = normalize_residency_policy_name(env_residency_policy or "baseline")
-    self.io_backend = os.environ.get("KT_IO_BACKEND", "IOURING").upper()
+    self.io_backend = os.environ.get("KT_IO_BACKEND", "FULL").upper()
     verbose_runtime_config = os.environ.get("KT_MESH_VERBOSE", "0") in ("1", "true", "True", "TRUE")
     explicit_mesh_runtime = (
         env_weight_strategy is not None

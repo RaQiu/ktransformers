@@ -211,7 +211,6 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         moe_config.group_min_len = 10  # Use forward_one when qlen < 10
         moe_config.max_len = self.chunked_prefill_size
         moe_config.group_max_len = max(1, int(self.chunked_prefill_size))
-        moe_config.resident_cache_policy = self.residency_policy
 
         # Set weight pointers
         moe_config.gate_proj = gate_data.data_ptr()

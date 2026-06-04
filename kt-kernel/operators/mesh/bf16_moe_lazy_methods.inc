@@ -15,19 +15,9 @@
   }
 
   void cleanup_lazy_weight_state() {
-    if (lazy_weight_enabled()) {
-      for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
-        free_packed_expert(expert_id);
-      }
-      return;
-    }
+    if (!lazy_weight_enabled()) return;
     for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
-      std::free(gate_bb_[expert_id]->b);
-      std::free(up_bb_[expert_id]->b);
-      std::free(down_bb_[expert_id]->b);
-      gate_bb_[expert_id]->b = nullptr;
-      up_bb_[expert_id]->b = nullptr;
-      down_bb_[expert_id]->b = nullptr;
+      free_packed_expert(expert_id);
     }
   }
 

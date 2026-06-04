@@ -15,13 +15,17 @@ def precache_mesh_experts(weight_path: Path | str, kt_method: str, tensor_parall
     use_direct_io = env.get("KT_IOURING_DIRECT", "1") not in false_values
 
     from kt_kernel.utils.loader import BF16SafeTensorLoader
+    from kt_kernel.utils.mesh import loader as mesh_loader
 
     old_env = os.environ.copy()
     os.environ.update(env)
     loader = None
     try:
         loader = BF16SafeTensorLoader(str(weight_path))
-        result = loader.precache_experts_iouring(
+        loader._ensure_mesh_index()
+        mesh_loader.bf16_detect_format(loader)
+        result = mesh_loader.precache_bf16_experts_iouring(
+            loader,
             tp_count=tensor_parallel_size,
             use_direct_io=use_direct_io,
         )

@@ -60,9 +60,13 @@ def load_amx_iouring_file_slots(wrapper, base_key: str):
 
 def load_native_bf16_iouring_file_slots(wrapper, base_key: str):
     from .async_io_manager import get_async_readers
+    from . import loader as mesh_loader
 
     direct_io_requested = os.environ.get("KT_IOURING_DIRECT", "1") not in ("0", "false", "False")
-    file_slots = wrapper.loader.load_experts_iouring(
+    wrapper.loader._ensure_mesh_index()
+    mesh_loader.bf16_detect_format(wrapper.loader)
+    file_slots = mesh_loader.load_bf16_experts_iouring(
+        wrapper.loader,
         base_key,
         tp_count=wrapper.threadpool_count,
         use_direct_io=direct_io_requested,

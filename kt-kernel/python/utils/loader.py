@@ -14,17 +14,28 @@ import torch
 from enum import IntEnum
 from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
-try:
-    from .mesh import loader as mesh_loader
-except ImportError:
-    import importlib.util
 
-    _mesh_loader_path = os.path.join(os.path.dirname(__file__), "mesh", "loader.py")
-    _mesh_loader_spec = importlib.util.spec_from_file_location("_kt_mesh_loader", _mesh_loader_path)
-    if _mesh_loader_spec is None or _mesh_loader_spec.loader is None:
-        raise
-    mesh_loader = importlib.util.module_from_spec(_mesh_loader_spec)
-    _mesh_loader_spec.loader.exec_module(mesh_loader)
+
+_MESH_LOADER = None
+
+
+def _mesh_loader():
+    global _MESH_LOADER
+    if _MESH_LOADER is not None:
+        return _MESH_LOADER
+    try:
+        from .mesh import loader as mesh_loader
+    except ImportError:
+        import importlib.util
+
+        mesh_loader_path = os.path.join(os.path.dirname(__file__), "mesh", "loader.py")
+        mesh_loader_spec = importlib.util.spec_from_file_location("_kt_mesh_loader", mesh_loader_path)
+        if mesh_loader_spec is None or mesh_loader_spec.loader is None:
+            raise
+        mesh_loader = importlib.util.module_from_spec(mesh_loader_spec)
+        mesh_loader_spec.loader.exec_module(mesh_loader)
+    _MESH_LOADER = mesh_loader
+    return mesh_loader
 
 
 class GGMLQuantizationType(IntEnum):
@@ -151,7 +162,6 @@ class SafeTensorLoader:
                         try:
                             handle = safe_open(tensor_path, framework="pt")
                             self.file_handle_map[tensor_path] = handle
-                            self._index_safetensor_file(tensor_path)
                         except Exception as e:
                             print(f"Error opening Safetensor file {tensor_path}: {e}")
                             continue
@@ -169,19 +179,27 @@ class SafeTensorLoader:
             raise FileNotFoundError(f"No Safetensor files found in {folder_path}")
 
     def _index_safetensor_file(self, file_path: str):
-        mesh_loader.index_safetensor_file(self, file_path)
+        _mesh_loader().index_safetensor_file(self, file_path)
+
+    def _ensure_mesh_index(self):
+        if self.tensor_info_map:
+            return
+        for file_path in self.file_handle_map:
+            self._index_safetensor_file(file_path)
 
     def _get_dense_moe_layout(self, base_key: str) -> tuple[list[int], list[int]]:
-        return mesh_loader.get_dense_moe_layout(self, base_key)
+        return _mesh_loader().get_dense_moe_layout(self, base_key)
 
     def _get_file_fd(self, file_path: str, use_direct_io: bool = True) -> int:
-        return mesh_loader.get_file_fd(self, file_path, use_direct_io=use_direct_io)
+        return _mesh_loader().get_file_fd(self, file_path, use_direct_io=use_direct_io)
 
     def get_file_slot(self, key: str, use_direct_io: bool = True) -> tuple[int, int, int]:
-        return mesh_loader.get_file_slot(self, key, use_direct_io=use_direct_io)
+        self._ensure_mesh_index()
+        return _mesh_loader().get_file_slot(self, key, use_direct_io=use_direct_io)
 
     def load_experts_iouring(self, base_key: str, use_direct_io: bool = True):
-        return mesh_loader.load_amx_experts_iouring(self, base_key, use_direct_io=use_direct_io)
+        self._ensure_mesh_index()
+        return _mesh_loader().load_amx_experts_iouring(self, base_key, use_direct_io=use_direct_io)
 
     def load_tensor(self, key: str, device: str = "cpu"):
         if key not in self.tensor_file_map:
@@ -194,10 +212,18 @@ class SafeTensorLoader:
         return tensor.to(device)
 
     def close_all_handles(self):
-        """Close all file handles and clear direct-I/O state."""
+        """Close all file handles and clear the handle map.
+
+        Note: safetensors.safe_open doesn't expose a close() method. Releasing
+        the mmap relies on reference counting: once file_handle_map is cleared
+        and no tensor holds a reference to the underlying mmap region, the OS
+        will reclaim the page cache. gc.collect() is called here to trigger
+        immediate reclamation rather than waiting for the next GC cycle.
+        """
         import gc
 
-        mesh_loader.close_mesh_handles(self)
+        if getattr(self, "file_fd_map", None):
+            _mesh_loader().close_mesh_handles(self)
         self.file_handle_map.clear()
         gc.collect()
 
@@ -220,9 +246,15 @@ class SafeTensorLoader:
         up_base_key = f"{base_key}.ffn_up_exps"
         gate_base_key = f"{base_key}.ffn_gate_exps"
         down_base_key = f"{base_key}.ffn_down_exps"
-        numa_ids, expert_ids = self._get_dense_moe_layout(base_key)
+        max_numa_id = -1
+        max_experts_count = -1
+        while self.has_tensor(f"{up_base_key}.{max_experts_count+1}.numa.{0}.weight"):
+            max_experts_count += 1
+        if max_experts_count == 0:
+            raise ValueError(f"No experts found for key {base_key}")
+        while self.has_tensor(f"{up_base_key}.{0}.numa.{max_numa_id+1}.weight"):
+            max_numa_id += 1
         # Initialize empty lists to store tensors for each projection type
-        max_numa_id = max(numa_ids) if numa_ids else -1
         up_weights = [[] for _ in range(max_numa_id + 1)]
         gate_weights = [[] for _ in range(max_numa_id + 1)]
         down_weights = [[] for _ in range(max_numa_id + 1)]
@@ -233,9 +265,7 @@ class SafeTensorLoader:
         up_bwd_base_key = f"{base_key}.ffn_up_bwd_exps"
         gate_bwd_base_key = f"{base_key}.ffn_gate_bwd_exps"
         down_bwd_base_key = f"{base_key}.ffn_down_bwd_exps"
-        has_bwd = bool(numa_ids and expert_ids) and self.has_tensor(
-            f"{gate_bwd_base_key}.{expert_ids[0]}.numa.{numa_ids[0]}.weight"
-        )
+        has_bwd = self.has_tensor(f"{gate_bwd_base_key}.{0}.numa.{0}.weight")
 
         if has_bwd:
             up_bwd_weights = [[] for _ in range(max_numa_id + 1)]
@@ -245,8 +275,8 @@ class SafeTensorLoader:
             gate_bwd_scales = [[] for _ in range(max_numa_id + 1)]
             down_bwd_scales = [[] for _ in range(max_numa_id + 1)]
 
-        for numa_id in numa_ids:
-            for expert_id in expert_ids:
+        for numa_id in range(max_numa_id + 1):
+            for expert_id in range(max_experts_count + 1):
                 up_key = f"{up_base_key}.{expert_id}.numa.{numa_id}.weight"
                 gate_key = f"{gate_base_key}.{expert_id}.numa.{numa_id}.weight"
                 down_key = f"{down_base_key}.{expert_id}.numa.{numa_id}.weight"
@@ -748,114 +778,6 @@ class CompressedSafeTensorLoader(SafeTensorLoader):
         }
 
 
-class BF16SafeTensorLoader(SafeTensorLoader):
-    """Loader for native BF16 expert weights (no quantization, no scales).
-
-    Supported formats:
-    - DeepSeek style: {base}.mlp.experts.{id}.{gate,up,down}_proj.weight
-    - Mixtral/MiniMax style: {base}.block_sparse_moe.experts.{id}.{w1,w3,w2}.weight
-
-    The format is auto-detected during initialization.
-    """
-
-    MOE_FORMATS = {
-        "deepseek": ("{base}.mlp.experts", "gate_proj", "up_proj", "down_proj"),
-        "mixtral": ("{base}.block_sparse_moe.experts", "w1", "w3", "w2"),
-    }
-
-    def __init__(self, file_path: str):
-        super().__init__(file_path)
-        self._detected_format = None
-        self._detect_format()
-
-    def _detect_format(self):
-        """Auto-detect the MoE naming format by checking tensor keys."""
-        sample_keys = list(self.tensor_file_map.keys())[:1000]
-
-        for fmt_name, (path_tpl, gate, up, down) in self.MOE_FORMATS.items():
-            for key in sample_keys:
-                if ".experts." in key and f".{gate}.weight" in key:
-                    if "block_sparse_moe.experts" in key and fmt_name == "mixtral":
-                        self._detected_format = fmt_name
-                        print(f"[BF16SafeTensorLoader] Detected format: {fmt_name}")
-                        return
-                    elif "mlp.experts" in key and "block_sparse_moe" not in key and fmt_name == "deepseek":
-                        self._detected_format = fmt_name
-                        print(f"[BF16SafeTensorLoader] Detected format: {fmt_name}")
-                        return
-
-        self._detected_format = "deepseek"
-        print("[BF16SafeTensorLoader] No MoE format detected, defaulting to: deepseek")
-
-    def _get_experts_prefix(self, base_key: str) -> str:
-        """Get the experts prefix based on detected format."""
-        path_tpl, _, _, _ = self.MOE_FORMATS[self._detected_format]
-        return path_tpl.format(base=base_key)
-
-    def _get_proj_names(self):
-        """Get projection names (gate, up, down) based on detected format."""
-        _, gate, up, down = self.MOE_FORMATS[self._detected_format]
-        return gate, up, down
-
-    def load_tensor(self, key: str, device: str = "cpu"):
-        if key not in self.tensor_file_map:
-            raise KeyError(f"Key {key} not found in Safetensor files")
-        file = self.tensor_file_map[key]
-        f = self.file_handle_map.get(file)
-        if f is None:
-            raise FileNotFoundError(f"File {file} not found in Safetensor files")
-        tensor = f.get_tensor(key)
-        if device == "cpu":
-            return tensor
-        return tensor.to(device)
-
-    def load_experts(self, base_key: str, device: str = "cpu"):
-        """Load BF16 expert weights (no scales needed).
-
-        Args:
-            base_key: Base key like "model.layers.{layer_index}"
-            device: Target device for tensors
-
-        Returns:
-            Dictionary with keys: gate, up, down, gate_scale (None), up_scale (None), down_scale (None)
-            gate/up/down: list of tensors [expert_id] -> tensor
-        """
-        experts_prefix = self._get_experts_prefix(base_key)
-        gate_name, up_name, down_name = self._get_proj_names()
-
-        expert_count = 0
-        while self.has_tensor(f"{experts_prefix}.{expert_count}.{gate_name}.weight"):
-            expert_count += 1
-
-        if expert_count == 0:
-            raise ValueError(f"No experts found for key {experts_prefix}")
-
-        gate_weights = [None] * expert_count
-        up_weights = [None] * expert_count
-        down_weights = [None] * expert_count
-
-        for exp_id in range(expert_count):
-            gate_w_key = f"{experts_prefix}.{exp_id}.{gate_name}.weight"
-            up_w_key = f"{experts_prefix}.{exp_id}.{up_name}.weight"
-            down_w_key = f"{experts_prefix}.{exp_id}.{down_name}.weight"
-
-            gate_weights[exp_id] = self.load_tensor(gate_w_key, device).contiguous()
-            up_weights[exp_id] = self.load_tensor(up_w_key, device).contiguous()
-            down_weights[exp_id] = self.load_tensor(down_w_key, device).contiguous()
-
-        return {
-            "gate": gate_weights,
-            "up": up_weights,
-            "down": down_weights,
-            "gate_scale": None,
-            "up_scale": None,
-            "down_scale": None,
-        }
-
-
-mesh_loader.patch_bf16_loader(BF16SafeTensorLoader)
-
-
 class GGUFLoader:
     """
     GGUF format loader using the official gguf library (gguf.gguf_reader.GGUFReader)
@@ -921,11 +843,7 @@ class GGUFLoader:
             }
             self.tensor_file_map[tensor.name] = file_path
 
-        # Use os.open + os.pread (in get_tensor) to read tensor bytes directly,
-        # avoiding mmap-based page-cache residency. This codebase is io_uring-only
-        # for the mesh runtime path; the GGUF startup loader uses pread to stay
-        # consistent (no mmap anywhere).
-        self.file_data_map[file_path] = os.open(file_path, os.O_RDONLY)
+        self.file_data_map[file_path] = np.memmap(file_path, mode="r")
 
     def _load_directory(self, dir_path: str):
         """Load all GGUF files from a directory (non-recursive)"""
@@ -959,11 +877,7 @@ class GGUFLoader:
                     }
                     self.tensor_file_map[tensor.name] = file_path
 
-        # Use os.open + os.pread (in get_tensor) to read tensor bytes directly,
-        # avoiding mmap-based page-cache residency. This codebase is io_uring-only
-        # for the mesh runtime path; the GGUF startup loader uses pread to stay
-        # consistent (no mmap anywhere).
-        self.file_data_map[file_path] = os.open(file_path, os.O_RDONLY)
+                self.file_data_map[file_path] = np.memmap(file_path, mode="r")
 
         if not found_gguf:
             raise FileNotFoundError(f"No .gguf files found in directory: {dir_path}")
@@ -1105,7 +1019,7 @@ class GGUFLoader:
 
         info = self.tensor_info[name]
         file_path = self.tensor_file_map[name]
-        gguf_fd = self.file_data_map[file_path]
+        mmap_data = self.file_data_map[file_path]
 
         offset = info["offset"]
         n_elements = info["n_elements"]
@@ -1146,28 +1060,10 @@ class GGUFLoader:
         block_size, type_size = GGML_QUANT_SIZES[ggml_type]
         n_bytes = n_elements * type_size // block_size
 
-        # pread is position-aware and does NOT mutate fd offset, so this is
-        # thread-safe across concurrent get_tensor() calls on the same fd.
-        data_bytes = os.pread(gguf_fd, n_bytes, offset)
+        data_bytes = mmap_data[offset : offset + n_bytes]
         data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
 
         return data, ggml_type
-
-    def close(self):
-        """Close all GGUF file descriptors. Safe to call multiple times."""
-        for fd in list(self.file_data_map.values()):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self.file_data_map.clear()
-
-    def __del__(self):
-        # Best-effort cleanup; close() is the explicit path.
-        try:
-            self.close()
-        except Exception:
-            pass
 
 
 class GPTQSafeTensorLoader(FP8SafeTensorLoader):

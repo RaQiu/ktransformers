@@ -150,7 +150,9 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
   AMX_MOE_TP() = default;
 
   AMX_MOE_TP(GeneralMOEConfig config, int tp_part_idx = 0) : Base(config, tp_part_idx) {
-    this->derived_init();
+    if (this->config_.io_backend == IOBackend::IOURING) {
+      this->derived_init();
+    }
   }
 
   void derived_init() {
@@ -180,7 +182,9 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
 
   ~AMX_MOE_TP() {
 #ifndef _WIN32
-    cleanup_resident_io_state();
+    if (this->config_.io_backend == IOBackend::IOURING) {
+      cleanup_resident_io_state();
+    }
 #endif
   }
 
@@ -237,7 +241,9 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     auto pool = config_.pool->get_subpool(tp_part_idx);
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
 #ifndef _WIN32
-    if (mesh_load_weights_from_resident_sources(physical_to_logical_map)) return;
+    if (this->config_.io_backend == IOBackend::IOURING &&
+        mesh_load_weights_from_resident_sources(physical_to_logical_map))
+      return;
 #endif
 
     if (config_.gate_projs.size()) {

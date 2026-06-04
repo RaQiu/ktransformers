@@ -1,8 +1,7 @@
 // This file is included inside AMX_MOE_TP / TP_MOE class definitions.
 // Keep declarations free of namespace wrappers and include guards.
 
-  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-               void* output) override {
+  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
 #ifndef _WIN32
     std::unique_ptr<ExpertReadScope> expert_read_scope;
     std::vector<int> active_experts;
@@ -49,7 +48,7 @@
     }
 #endif
   }
-  void promote_expert(int expert_id) override {
+  void promote_expert(int expert_id) {
 #ifndef _WIN32
     ensure_expert_ready(expert_id, true);
 #else
@@ -57,7 +56,7 @@
 #endif
   }
 
-  void demote_expert(int expert_id) override {
+  void demote_expert(int expert_id) {
 #ifndef _WIN32
     if (expert_id < 0 || expert_id >= config_.expert_num) return;
 
@@ -98,7 +97,7 @@
 #endif
   }
 
-  bool is_expert_promoted(int expert_id) const override {
+  bool is_expert_promoted(int expert_id) const {
 #ifndef _WIN32
     if (expert_id < 0 || expert_id >= config_.expert_num) return false;
     const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);

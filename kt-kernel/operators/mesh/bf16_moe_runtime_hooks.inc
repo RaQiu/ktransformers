@@ -1,8 +1,7 @@
 // This file is included inside AMX_BF16_MOE_TP / TP_MOE class definitions.
 // Keep declarations free of namespace wrappers and include guards.
 
-  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-               void* output) override {
+  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
 #ifndef _WIN32
     std::vector<int> active_experts;
     std::vector<int> expert_counts;
@@ -132,7 +131,7 @@
     Base::forward(qlen, k, expert_ids, weights, input, output);
   }
 
-  void promote_expert(int expert_id) override {
+  void promote_expert(int expert_id) {
 #ifndef _WIN32
     if (!lazy_weight_enabled()) return;
     ensure_expert_ready(expert_id, true);
@@ -140,7 +139,7 @@
     (void)expert_id;
 #endif
   }
-  void demote_expert(int expert_id) override {
+  void demote_expert(int expert_id) {
 #ifndef _WIN32
     if (!lazy_weight_enabled()) return;
     if (expert_id < 0 || expert_id >= config_.expert_num) return;
@@ -179,7 +178,7 @@
 #endif
   }
 
-  bool is_expert_promoted(int expert_id) const override {
+  bool is_expert_promoted(int expert_id) const {
 #ifndef _WIN32
     if (!lazy_weight_enabled()) return false;
     if (expert_id < 0 || expert_id >= config_.expert_num) return false;

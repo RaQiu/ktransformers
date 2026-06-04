@@ -1,12 +1,12 @@
 import os
 import torch
+import ctypes
 from typing import List, Optional
 
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
 from .loader import SafeTensorLoader
 from kt_kernel_ext.moe import MOEConfig
-from .mesh import amx_helpers as mesh_amx
 
 try:
     from kt_kernel_ext.moe import Int8_KERNEL_MOE
@@ -166,7 +166,6 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
-        moe_config.resident_cache_policy = self.residency_policy
 
         # Enable save mode for online quantization
         moe_config.save = True
@@ -215,9 +214,61 @@ class GeneralMoEWrapper(BaseMoEWrapper):
             base_key = f"blk.{self.layer_idx}"
             w = self.safetensor_loader.load_experts(base_key)
 
-            gate_ptrs, up_ptrs, down_ptrs, gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs = (
-                mesh_amx.assign_amx_weight_views(self, w)
-            )
+            self.gate_weights = w["gate"]
+            self.up_weights = w["up"]
+            self.down_weights = w["down"]
+            self.gate_scales = w["gate_scale"]
+            self.up_scales = w["up_scale"]
+            self.down_scales = w["down_scale"]
+
+            # Get pointers to weight arrays
+            gate_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.gate_weights
+            ]
+
+            up_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.up_weights
+            ]
+
+            down_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.down_weights
+            ]
+
+            gate_scale_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.gate_scales
+            ]
+
+            up_scale_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.up_scales
+            ]
+
+            down_scale_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.down_scales
+            ]
 
         # Configure MoE
         moe_config = MOEConfig(
@@ -240,7 +291,6 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
-        mesh_amx.apply_mesh_moe_config(self, moe_config, use_iouring=False)
 
         if self.cpu_save:
             moe_config.save = True
@@ -283,14 +333,16 @@ class GeneralMoEWrapper(BaseMoEWrapper):
             del self.down_scales
 
     def close(self):
-        super().close()
+        base_close = getattr(super(), "close", None)
+        if base_close is not None:
+            base_close()
         self.gate_weights = None
         self.up_weights = None
         self.down_weights = None
         self.gate_scales = None
         self.up_scales = None
         self.down_scales = None
-        if BaseMoEWrapper._active_wrapper_count == 0:
+        if getattr(BaseMoEWrapper, "_active_wrapper_count", 0) == 0:
             if GeneralMoEWrapper._safetensor_loader_instance is not None:
                 GeneralMoEWrapper._safetensor_loader_instance.close_all_handles()
             GeneralMoEWrapper._safetensor_loader_instance = None

@@ -15,7 +15,18 @@ from abc import ABC, abstractmethod
 import os
 from kt_kernel import kt_kernel_ext
 
-_PIN_MEMORY = torch.cuda.is_available() and os.getenv("KT_CPU_BUFFER_PIN_MEMORY", "1") != "0"
+_MESH_RUNTIME_INSTALLED = False
+
+
+def _ensure_mesh_runtime_installed():
+    global _MESH_RUNTIME_INSTALLED
+    if _MESH_RUNTIME_INSTALLED:
+        return
+    from .utils.mesh.runtime_helpers import install_base_moe_helpers
+
+    pin_memory = torch.cuda.is_available() and os.getenv("KT_CPU_BUFFER_PIN_MEMORY", "1") != "0"
+    install_base_moe_helpers(BaseMoEWrapper, KExpertsCPUBuffer, pin_memory)
+    _MESH_RUNTIME_INSTALLED = True
 
 
 def generate_gpu_experts_masks(
@@ -82,55 +93,39 @@ class KExpertsCPUBuffer:
     capture_bs: List = list()
     capture_buffers: Dict = dict()
     temp_bs: int = 0
-    temp_capacity: int = 0
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
-
-    @classmethod
-    def _slice_buffer(cls, buffer: tuple, batch_size: int) -> tuple:
-        if not buffer:
-            return buffer
-        sliced = []
-        for idx, item in enumerate(buffer):
-            if idx == 5:
-                sliced.append(item)
-                continue
-            sliced.append([tensor[:batch_size] for tensor in item])
-        return tuple(sliced)
 
     @classmethod
     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
         hidden_size = hidden_states.shape[-1]
         batch_size = hidden_states.shape[0]
 
-        pin_memory = _PIN_MEMORY
+        pin_memory = True
 
         if batch_size in cls.capture_buffers:
             return cls.capture_buffers[batch_size]
-        if cls.temp_buffer and batch_size <= cls.temp_capacity:
-            cls.temp_bs = batch_size
-            return cls._slice_buffer(cls.temp_buffer, batch_size)
-
-        capacity = batch_size
+        if batch_size == cls.temp_bs:
+            return cls.temp_buffer
 
         input_tensor_cpu = [
-            torch.zeros((capacity, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
             for _ in range(cls.buffer_depth)
         ]
         immediate_experts_ids_cpu = [
-            torch.zeros((capacity, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
+            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
             for _ in range(cls.buffer_depth)
         ]
         deferred_experts_ids_cpu = [
-            torch.full((capacity, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
+            torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
             for _ in range(cls.buffer_depth)
         ]
         weights_cpu = [
-            torch.zeros((capacity, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
+            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
             for _ in range(cls.buffer_depth)
         ]
         output_cpu = [
-            torch.zeros((capacity, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
             for _ in range(cls.buffer_depth)
         ]
         bsz_tensor_cpu = [
@@ -138,7 +133,7 @@ class KExpertsCPUBuffer:
             for _ in range(cls.buffer_depth)
         ]
         output_gpu = [
-            torch.zeros((capacity, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+            torch.zeros((batch_size, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
             for _ in range(cls.buffer_depth)
         ]
 
@@ -154,9 +149,8 @@ class KExpertsCPUBuffer:
         if batch_size in cls.capture_bs:
             cls.capture_buffers[batch_size] = cur_buffer
         cls.temp_bs = batch_size
-        cls.temp_capacity = capacity
         cls.temp_buffer = cur_buffer
-        return cls._slice_buffer(cur_buffer, batch_size)
+        return cur_buffer
 
 
 class _MoEBase:
@@ -313,26 +307,37 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.moe_intermediate_size = moe_intermediate_size
         self.cpuinfer_threads = cpuinfer_threads
         self.threadpool_count = threadpool_count
+        self.io_backend = os.environ.get("KT_IO_BACKEND", "FULL").upper()
+        self.weight_strategy = weight_strategy or "legacy"
+        self.residency_policy = "baseline"
+        self.enable_cache_stats = False
+        self.max_tier0_experts = int(max_tier0_experts) if max_tier0_experts is not None else 0
+        self.max_resident_experts = 0
 
-        self._configure_base_runtime(
-            kt_kernel_ext,
-            method=method,
-            weight_strategy=weight_strategy,
-            max_tier0_experts=max_tier0_experts,
-            num_moe_layers=num_moe_layers,
-            cpuinfer_threads=cpuinfer_threads,
-            threadpool_count=threadpool_count,
-            numa_nodes=numa_nodes,
-        )
+        if self.io_backend == "IOURING":
+            _ensure_mesh_runtime_installed()
+            self._configure_base_runtime(
+                kt_kernel_ext,
+                method=method,
+                weight_strategy=weight_strategy,
+                max_tier0_experts=max_tier0_experts,
+                num_moe_layers=num_moe_layers,
+                cpuinfer_threads=cpuinfer_threads,
+                threadpool_count=threadpool_count,
+                numa_nodes=numa_nodes,
+            )
+        else:
+            # FULL keeps the original KTransformers CPUInfer construction path.
+            self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
 
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
         if gpu_experts_mask is None:
             # No GPU experts - all experts on CPU
-            self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu", pin_memory=_PIN_MEMORY)
+            self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu", pin_memory=True)
         else:
             # Create a new pinned tensor and copy data into it
-            self.gpu_experts_mask = torch.empty(num_experts, dtype=torch.bool, device="cpu", pin_memory=_PIN_MEMORY)
+            self.gpu_experts_mask = torch.empty(num_experts, dtype=torch.bool, device="cpu", pin_memory=True)
             self.gpu_experts_mask.copy_(gpu_experts_mask)
 
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
@@ -344,7 +349,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.chunked_prefill_size = chunked_prefill_size
         self.cpu_save = cpu_save
         env_max_deferred_experts = os.environ.get("KT_MAX_DEFERRED_EXPERTS_PER_TOKEN")
-        if env_max_deferred_experts is not None:
+        if self.io_backend == "IOURING" and env_max_deferred_experts is not None:
             try:
                 max_deferred_experts_per_token = int(env_max_deferred_experts)
             except ValueError:
@@ -367,8 +372,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # Backend-specific initialization happens in subclasses
         self.moe = None
         self._closed = False
-        BaseMoEWrapper._wrappers_by_layer[self.layer_idx] = self
-        BaseMoEWrapper._active_wrapper_count += 1
+        if self.io_backend == "IOURING":
+            BaseMoEWrapper._wrappers_by_layer[self.layer_idx] = self
+            BaseMoEWrapper._active_wrapper_count += 1
 
     @abstractmethod
     def load_weights_from_tensors(
@@ -447,7 +453,72 @@ class BaseMoEWrapper(_MoEBase, ABC):
             topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
             cuda_stream: CUDA stream for synchronization
         """
-        return self._mesh_submit_forward_impl(hidden_states, topk_ids, topk_weights, cuda_stream, router_scores)
+        if self.io_backend == "IOURING":
+            return self._mesh_submit_forward_impl(hidden_states, topk_ids, topk_weights, cuda_stream, router_scores)
+
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        batch_size = flat_hidden_states.shape[0]
+
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            _output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
+
+        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+
+        topk_ids_long = topk_ids.to(torch.long)
+        immediate_ids: torch.Tensor
+        deferred_ids: Optional[torch.Tensor]
+        if self.max_deferred_experts_per_token > 0:
+            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+
+            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+        else:
+            immediate_ids = topk_ids_long
+            deferred_ids = None
+
+        input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
+        weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+        immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+
+        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        self.cpu_infer.submit_with_cuda_stream(
+            cuda_stream,
+            self.moe.forward_task(
+                bsz_slot_tensor.data_ptr(),
+                immediate_experts_ids_cpu[current_slot].size(-1),
+                immediate_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                output_cpu[current_slot].data_ptr(),
+                incremental,
+            ),
+        )
+
+        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+        if deferred_ids is not None:
+            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+            self.cpu_infer.submit_with_cuda_stream(
+                cuda_stream,
+                self.moe.forward_task(
+                    bsz_slot_tensor.data_ptr(),
+                    deferred_experts_ids_cpu[current_slot].size(-1),
+                    deferred_experts_ids_cpu[current_slot].data_ptr(),
+                    weights_cpu[current_slot].data_ptr(),
+                    input_tensor_cpu[current_slot].data_ptr(),
+                    output_cpu[next_slot].data_ptr(),
+                    False,
+                ),
+            )
+            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def sync_forward(self, hidden_states: torch.Tensor, topk_ids_or_stream=None, cuda_stream=None) -> torch.Tensor:
         """
@@ -461,7 +532,28 @@ class BaseMoEWrapper(_MoEBase, ABC):
         Returns:
             output_gpu: Output tensor on GPU
         """
-        return self._mesh_sync_forward_impl(hidden_states, topk_ids_or_stream, cuda_stream)
+        if self.io_backend == "IOURING":
+            return self._mesh_sync_forward_impl(hidden_states, topk_ids_or_stream, cuda_stream)
+
+        if cuda_stream is None:
+            cuda_stream = topk_ids_or_stream
+
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        (
+            _input_tensor_cpu,
+            _immediate_experts_ids_cpu,
+            _deferred_experts_ids_cpu,
+            _weights_cpu,
+            output_cpu,
+            _bsz_tensor_cpu,
+            output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
+        self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+        return output_gpu[current_slot]
 
     def forward(
         self,
@@ -483,7 +575,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
         Returns:
             Output tensor on GPU
         """
-        return self._mesh_forward_impl(hidden_states, topk_ids, topk_weights, cuda_stream, router_scores)
+        if self.io_backend == "IOURING":
+            return self._mesh_forward_impl(hidden_states, topk_ids, topk_weights, cuda_stream, router_scores)
+        self.submit_forward(hidden_states, topk_ids, topk_weights, cuda_stream)
+        return self.sync_forward(hidden_states, cuda_stream)
 
     @staticmethod
     def set_capture_batch_sizes(capture_bs: List[int]):
@@ -521,10 +616,4 @@ class BaseMoEWrapper(_MoEBase, ABC):
         """
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
-        KExpertsCPUBuffer.temp_capacity = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
-
-
-from .utils.mesh.runtime_helpers import install_base_moe_helpers as _install_mesh_base_moe_helpers
-
-_install_mesh_base_moe_helpers(BaseMoEWrapper, KExpertsCPUBuffer, _PIN_MEMORY)
