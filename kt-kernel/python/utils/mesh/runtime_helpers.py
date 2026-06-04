@@ -1231,7 +1231,7 @@ def _maybe_mesh_transition_to_decode_cache(self, qlen: int) -> None:
     if self.layer_idx != 0:
         return
     if not BaseMoEWrapper._mesh_prefill_session_seen and not self._env_flag(
-        "KT_MESH_DECODE_TRANSITION_ON_COLD_Q1", True
+        "KT_MESH_DECODE_TRANSITION_ON_COLD_Q1", False
     ):
         return
 

@@ -41,7 +41,7 @@ MESH_PREFILL_LAYER_WINDOW = 0
 MESH_PREFILL_STATIC_EXPERTS: int | None = None
 MESH_EARLY_LAYER_EXPERTS = "global"
 MESH_DECODE_TRANSITION_SYNC = True
-MESH_DECODE_TRANSITION_ON_COLD_Q1 = True
+MESH_DECODE_TRANSITION_ON_COLD_Q1 = False
 MESH_DECODE_TRANSITION_FILL_LIMIT: int | None = None
 MESH_BOOTSTRAP_PREFETCH = True
 MESH_CPU_BUFFER_PIN_MEMORY = True
@@ -822,7 +822,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mesh-prefill-static-experts", type=int)
     parser.add_argument("--mesh-early-layer-experts", default=MESH_EARLY_LAYER_EXPERTS)
     parser.add_argument("--mesh-decode-transition-sync", choices=["0", "1"], default="1")
-    parser.add_argument("--mesh-decode-transition-on-cold-q1", choices=["0", "1"], default="1")
+    parser.add_argument("--mesh-decode-transition-on-cold-q1", choices=["0", "1"], default="0")
     parser.add_argument("--mesh-decode-transition-fill-limit", type=int)
     parser.add_argument("--mesh-bootstrap-prefetch", choices=["0", "1"], default="1")
     parser.add_argument("--mesh-cpu-buffer-pin-memory", choices=["0", "1"], default="1")

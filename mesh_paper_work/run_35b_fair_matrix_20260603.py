@@ -522,7 +522,7 @@ def build_env(mode: str, precision: str, cuda: str, expert_stats_path: Path, arg
                 "KT_MESH_PREFILL_LAYER_MODE": "1",
                 "KT_MESH_PREFILL_LAYER_WINDOW": str(args.mesh_prefill_layer_window),
                 "KT_MESH_DECODE_TRANSITION_SYNC": "1",
-                "KT_MESH_DECODE_TRANSITION_ON_COLD_Q1": "1",
+                "KT_MESH_DECODE_TRANSITION_ON_COLD_Q1": "0",
                 "KT_ENABLE_CACHE_STATS": "1",
                 "KT_EXPERT_STATS_PATH": str(expert_stats_path),
                 "KT_EXPERT_STATS_DUMP_EVERY": "128",
