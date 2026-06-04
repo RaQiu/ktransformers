@@ -374,8 +374,8 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE_Common<AMX_BF16_MOE_TP<K>> {
 
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
-            [&](int expert_id) {
-              const size_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
+            [&](int expert_id_) {
+              const size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
 
               ggml_bf16_t* gate_dst = (ggml_bf16_t*)tpc.gate_proj + expert_id * tp_weight_elems;
               ggml_bf16_t* up_dst = (ggml_bf16_t*)tpc.up_proj + expert_id * tp_weight_elems;
@@ -386,15 +386,15 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE_Common<AMX_BF16_MOE_TP<K>> {
               const ggml_bf16_t* down_src;
 
               if (use_per_expert_ptrs) {
-                gate_src = (const ggml_bf16_t*)config.gate_projs[0][logical_expert_id] + gate_up_weight_src_offset;
-                up_src = (const ggml_bf16_t*)config.up_projs[0][logical_expert_id] + gate_up_weight_src_offset;
-                down_src = (const ggml_bf16_t*)config.down_projs[0][logical_expert_id];
+                gate_src = (const ggml_bf16_t*)config.gate_projs[0][expert_id] + gate_up_weight_src_offset;
+                up_src = (const ggml_bf16_t*)config.up_projs[0][expert_id] + gate_up_weight_src_offset;
+                down_src = (const ggml_bf16_t*)config.down_projs[0][expert_id];
               } else {
-                gate_src = (const ggml_bf16_t*)config.gate_proj + logical_expert_id * full_weight_elems +
+                gate_src = (const ggml_bf16_t*)config.gate_proj + expert_id * full_weight_elems +
                            gate_up_weight_src_offset;
                 up_src =
-                    (const ggml_bf16_t*)config.up_proj + logical_expert_id * full_weight_elems + gate_up_weight_src_offset;
-                down_src = (const ggml_bf16_t*)config.down_proj + logical_expert_id * full_weight_elems;
+                    (const ggml_bf16_t*)config.up_proj + expert_id * full_weight_elems + gate_up_weight_src_offset;
+                down_src = (const ggml_bf16_t*)config.down_proj + expert_id * full_weight_elems;
               }
 
               std::memcpy(gate_dst, gate_src, tp_weight_elems * sizeof(ggml_bf16_t));

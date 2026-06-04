@@ -13,6 +13,7 @@ import torch
 from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 import os
+import ctypes
 from kt_kernel import kt_kernel_ext
 
 _MESH_RUNTIME_INSTALLED = False
@@ -260,10 +261,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
+        swiglu_limit: float = 0.0,
         weight_strategy: str = "legacy",
         max_tier0_experts: Optional[int] = None,
         num_moe_layers: Optional[int] = None,
-        swiglu_limit: float = 0.0,
     ):
         """
         Initialize base MoE Wrapper.

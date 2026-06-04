@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-MODULE_PATH = Path(__file__).resolve().parents[2] / "python" / "utils" / "mesh" / "runtime_helpers.py"
+MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "utils" / "mesh" / "runtime_helpers.py"
 SPEC = importlib.util.spec_from_file_location("mesh_runtime_helpers", MODULE_PATH)
 runtime_helpers = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None and SPEC.loader is not None
@@ -68,4 +68,3 @@ def test_cuda_stream_hooks_are_used_during_cuda_graph_capture():
 
     assert cpu_infer.submitted == [(123, "task")]
     assert cpu_infer.synced == [(123, 1)]
-

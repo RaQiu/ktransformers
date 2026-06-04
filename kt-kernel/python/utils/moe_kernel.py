@@ -23,6 +23,8 @@ except (ImportError, AttributeError):
     Int4_KERNEL_MOE = None
     _HAS_INT4_SUPPORT = False
 
+from typing import Optional
+
 
 class GeneralMoEWrapper(BaseMoEWrapper):
     """
@@ -31,7 +33,6 @@ class GeneralMoEWrapper(BaseMoEWrapper):
     """
 
     _safetensor_loader_instance = None  # Singleton SafeTensorLoader
-    _safetensor_loader_path = None
 
     def __init__(
         self,
@@ -49,9 +50,6 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "MOE_INT8",
         numa_nodes: Optional[List[int]] = None,
-        weight_strategy: str = "legacy",
-        max_tier0_experts: Optional[int] = None,
-        num_moe_layers: Optional[int] = None,
     ):
         """
         Initialize general MoE Wrapper.
@@ -68,8 +66,6 @@ class GeneralMoEWrapper(BaseMoEWrapper):
                               If None, all experts are on CPU.
             cpuinfer_threads: Number of CPU inference threads
             threadpool_count: Number of NUMA subpools
-            numa_nodes: Explicit NUMA node IDs for the CPU subpools. If None,
-                        use detected NUMA nodes in ascending order.
             weight_path: Path to weights (SafeTensor format)
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Whether to save weights to CPU memory
@@ -97,15 +93,12 @@ class GeneralMoEWrapper(BaseMoEWrapper):
             gpu_experts_mask=gpu_experts_mask,
             cpuinfer_threads=cpuinfer_threads,
             threadpool_count=threadpool_count,
-            numa_nodes=numa_nodes,
             weight_path=weight_path,
             chunked_prefill_size=chunked_prefill_size,
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
-            weight_strategy=weight_strategy,
-            max_tier0_experts=max_tier0_experts,
-            num_moe_layers=num_moe_layers,
+            numa_nodes=numa_nodes,
         )
 
         # moe-specific: Check if we should load merged safetensor weights
@@ -117,13 +110,8 @@ class GeneralMoEWrapper(BaseMoEWrapper):
 
         # Initialize SafeTensor loader (singleton)
         if self.load_merged_weight:
-            resolved_weight_path = os.path.abspath(weight_path)
-            if (
-                GeneralMoEWrapper._safetensor_loader_instance is None
-                or GeneralMoEWrapper._safetensor_loader_path != resolved_weight_path
-            ):
+            if GeneralMoEWrapper._safetensor_loader_instance is None:
                 GeneralMoEWrapper._safetensor_loader_instance = SafeTensorLoader(weight_path)
-                GeneralMoEWrapper._safetensor_loader_path = resolved_weight_path
             self.safetensor_loader = GeneralMoEWrapper._safetensor_loader_instance
 
         # moe-specific weight storage
@@ -331,19 +319,3 @@ class GeneralMoEWrapper(BaseMoEWrapper):
             del self.gate_scales
             del self.up_scales
             del self.down_scales
-
-    def close(self):
-        base_close = getattr(super(), "close", None)
-        if base_close is not None:
-            base_close()
-        self.gate_weights = None
-        self.up_weights = None
-        self.down_weights = None
-        self.gate_scales = None
-        self.up_scales = None
-        self.down_scales = None
-        if getattr(BaseMoEWrapper, "_active_wrapper_count", 0) == 0:
-            if GeneralMoEWrapper._safetensor_loader_instance is not None:
-                GeneralMoEWrapper._safetensor_loader_instance.close_all_handles()
-            GeneralMoEWrapper._safetensor_loader_instance = None
-            GeneralMoEWrapper._safetensor_loader_path = None

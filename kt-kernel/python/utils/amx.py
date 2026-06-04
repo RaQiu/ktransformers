@@ -1,8 +1,8 @@
 import gc
 import logging
 import os
-import ctypes
 import torch
+import ctypes
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,11 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
 
 
 def _select_mxfp4_backend():
-    """Select MXFP4 backend: AMX/AVX-512 preferred, AVX2 fallback."""
+    """Select MXFP4 backend: AMX/AVX-512 (preferred) > AVX2 (fallback).
+
+    Override with KT_MXFP4_BACKEND=avx2|amx.
+    Returns None if no MXFP4 backend is available.
+    """
     forced = os.getenv("KT_MXFP4_BACKEND", "").strip().lower()
 
     if forced == "amx":
@@ -185,7 +189,6 @@ class AMXMoEWrapper(BaseMoEWrapper):
     """
 
     _safetensor_loader_instance = None  # Singleton SafeTensorLoader
-    _safetensor_loader_path = None
 
     def __init__(
         self,
@@ -251,12 +254,12 @@ class AMXMoEWrapper(BaseMoEWrapper):
             gpu_experts_mask=gpu_experts_mask,
             cpuinfer_threads=cpuinfer_threads,
             threadpool_count=threadpool_count,
-            numa_nodes=numa_nodes,
             weight_path=weight_path,
             chunked_prefill_size=chunked_prefill_size,
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
+            numa_nodes=numa_nodes,
             weight_strategy=weight_strategy,
             max_tier0_experts=max_tier0_experts,
             num_moe_layers=num_moe_layers,
@@ -271,13 +274,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
         # Initialize SafeTensor loader (singleton)
         if self.load_merged_weight:
-            resolved_weight_path = os.path.abspath(weight_path)
-            if (
-                AMXMoEWrapper._safetensor_loader_instance is None
-                or AMXMoEWrapper._safetensor_loader_path != resolved_weight_path
-            ):
+            if AMXMoEWrapper._safetensor_loader_instance is None:
                 AMXMoEWrapper._safetensor_loader_instance = SafeTensorLoader(weight_path)
-                AMXMoEWrapper._safetensor_loader_path = resolved_weight_path
             self.safetensor_loader = AMXMoEWrapper._safetensor_loader_instance
 
         # AMX-specific weight storage
@@ -525,14 +523,12 @@ class AMXMoEWrapper(BaseMoEWrapper):
             if AMXMoEWrapper._safetensor_loader_instance is not None:
                 AMXMoEWrapper._safetensor_loader_instance.close_all_handles()
             AMXMoEWrapper._safetensor_loader_instance = None
-            AMXMoEWrapper._safetensor_loader_path = None
 
 
 class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for RAWINT4/FP8/FP8_PERCHANNEL/BF16 experts stored in compressed SafeTensor format."""
 
     _native_loader_instance = None
-    _native_loader_signature = None
 
     def __init__(
         self,
@@ -550,10 +546,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "RAWINT4",
         numa_nodes: Optional[List[int]] = None,
+        swiglu_limit: float = 0.0,
         weight_strategy: str = "legacy",
         max_tier0_experts: Optional[int] = None,
         num_moe_layers: Optional[int] = None,
-        swiglu_limit: float = 0.0,
     ):
         # Defence in depth: reject swiglu_limit on non-MXFP4 methods even
         # if the experts.py guard is bypassed (e.g., by a future caller
@@ -617,26 +613,20 @@ class NativeMoEWrapper(BaseMoEWrapper):
             gpu_experts_mask=gpu_experts_mask,
             cpuinfer_threads=cpuinfer_threads,
             threadpool_count=threadpool_count,
-            numa_nodes=numa_nodes,
             weight_path=weight_path,
             chunked_prefill_size=chunked_prefill_size,
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
+            numa_nodes=numa_nodes,
             weight_strategy=weight_strategy,
             max_tier0_experts=max_tier0_experts,
             num_moe_layers=num_moe_layers,
             swiglu_limit=swiglu_limit,
         )
 
-        resolved_weight_path = os.path.abspath(weight_path)
-        loader_signature = (method, resolved_weight_path)
-        if (
-            NativeMoEWrapper._native_loader_instance is None
-            or NativeMoEWrapper._native_loader_signature != loader_signature
-        ):
+        if NativeMoEWrapper._native_loader_instance is None:
             NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(method, weight_path)
-            NativeMoEWrapper._native_loader_signature = loader_signature
         self.loader = NativeMoEWrapper._native_loader_instance
 
         self.gate_weights = None
@@ -668,15 +658,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if NativeMoEWrapper._native_loader_instance is not None:
             NativeMoEWrapper._native_loader_instance.close_all_handles()
             NativeMoEWrapper._native_loader_instance = None
-            NativeMoEWrapper._native_loader_signature = None
             if layer_idx >= 0:
                 logger.info(
                     "[KT] Released NativeMoEWrapper loader after layer %d: "
-                    "safetensors file handles freed.", layer_idx,
+                    "safetensors mmap handles freed.", layer_idx,
                 )
             else:
                 logger.info(
-                    "[KT] Released NativeMoEWrapper loader: safetensors file handles freed."
+                    "[KT] Released NativeMoEWrapper loader: safetensors mmap handles freed."
                 )
 
     @staticmethod
@@ -977,4 +966,3 @@ class NativeMoEWrapper(BaseMoEWrapper):
             if NativeMoEWrapper._native_loader_instance is not None:
                 NativeMoEWrapper._native_loader_instance.close_all_handles()
             NativeMoEWrapper._native_loader_instance = None
-            NativeMoEWrapper._native_loader_signature = None

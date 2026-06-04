@@ -38,13 +38,10 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         threadpool_count: int,
         weight_path: str,
         chunked_prefill_size: int,
-        numa_nodes: Optional[List[int]] = None,
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "LLAMAFILE",
-        weight_strategy: str = "legacy",
-        max_tier0_experts: Optional[int] = None,
-        num_moe_layers: Optional[int] = None,
+        numa_nodes: Optional[List[int]] = None,
     ):
         """
         Initialize Llamafile MoE Wrapper.
@@ -61,8 +58,6 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
                               If None, all experts are on CPU.
             cpuinfer_threads: Number of CPU inference threads
             threadpool_count: Number of NUMA subpools (TP count)
-            numa_nodes: Explicit NUMA node IDs for the CPU subpools. If None,
-                        use detected NUMA nodes in ascending order.
             weight_path: Path to GGUF weights
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Not supported for Llamafile backend
@@ -134,15 +129,12 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
             gpu_experts_mask=gpu_experts_mask,
             cpuinfer_threads=cpuinfer_threads,
             threadpool_count=threadpool_count,
-            numa_nodes=numa_nodes,
             weight_path=weight_path,
             chunked_prefill_size=chunked_prefill_size,
             cpu_save=cpu_save,
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
-            weight_strategy=weight_strategy,
-            max_tier0_experts=max_tier0_experts,
-            num_moe_layers=num_moe_layers,
+            numa_nodes=numa_nodes,
         )
 
         self.weights_to_keep = None
@@ -184,13 +176,14 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
 
         base_key = f"blk.{self.layer_idx}"
 
-        gate_data, gate_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(
-            f"{base_key}.ffn_gate_exps.weight"
-        )
+        # Load quantized tensors from GGUF
+        gate_data, gate_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(f"{base_key}.ffn_gate_exps.weight")
+
         up_data, up_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(f"{base_key}.ffn_up_exps.weight")
-        down_data, down_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(
-            f"{base_key}.ffn_down_exps.weight"
-        )
+
+        down_data, down_type = self.gguf_loader.get_undequanted_tensor_and_ggml_type(f"{base_key}.ffn_down_exps.weight")
+
+        # Keep tensors alive
         self.weights_to_keep = (gate_data, up_data, down_data)
 
         hidden_type = ggml_type.BF16

@@ -16,7 +16,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 
-WEIGHT_PROVIDER_PATH = Path(__file__).resolve().parents[2] / "python" / "utils" / "weight_provider.py"
+WEIGHT_PROVIDER_PATH = Path(__file__).resolve().parents[3] / "python" / "utils" / "mesh" / "weight_provider.py"
 SPEC = importlib.util.spec_from_file_location("weight_provider", WEIGHT_PROVIDER_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Failed to load weight_provider from {WEIGHT_PROVIDER_PATH}")

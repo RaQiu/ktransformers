@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-WEIGHT_PROVIDER_PATH = REPO_ROOT / "python" / "utils" / "weight_provider.py"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WEIGHT_PROVIDER_PATH = REPO_ROOT / "python" / "utils" / "mesh" / "weight_provider.py"
 
 SPEC = importlib.util.spec_from_file_location("weight_provider", WEIGHT_PROVIDER_PATH)
 if SPEC is None or SPEC.loader is None:

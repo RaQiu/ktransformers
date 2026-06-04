@@ -128,15 +128,12 @@ class KTMoEWrapper:
         threadpool_count: int,
         weight_path: str,
         chunked_prefill_size: int,
-        numa_nodes: Optional[List[int]] = None,
         # Inference-specific parameters
         cpu_save: bool = False,
         max_deferred_experts_per_token: Optional[int] = None,
         # Mode and method selection
         method: str = "AMXINT4",
-        weight_strategy: str = "legacy",
-        max_tier0_experts: Optional[int] = None,
-        num_moe_layers: Optional[int] = None,
+        numa_nodes: Optional[List[int]] = None,
         mode: str = "inference",
         # SFT-specific parameters (only used when mode="sft")
         num_gpu_experts: int = 0,
@@ -152,6 +149,9 @@ class KTMoEWrapper:
         # _apply_swiglu_limit). Plumbed into MOEConfig.swiglu_limit and
         # consumed by amx::act_fn. Origin: kt-sglang 耦合.
         swiglu_limit: float = 0.0,
+        weight_strategy: str = "legacy",
+        max_tier0_experts: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -168,17 +168,12 @@ class KTMoEWrapper:
                               If None, all experts are on CPU.
                               SFT mode uses num_gpu_experts instead.
             cpuinfer_threads: Number of CPU inference threads
-            threadpool_count: Number of NUMA subpools
-            numa_nodes: Explicit NUMA node IDs for the subpools. If None, use
-                        detected NUMA nodes in ascending order.
+            threadpool_count: Number of NUMA subpools (TP count)
             weight_path: Path to weights
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Whether to save weights to CPU memory (inference only)
             max_deferred_experts_per_token: Experts per token to defer (inference only)
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping. If None, defaults to sequential.
-            weight_strategy: Inference weight residency strategy.
-            max_tier0_experts: Inference Tier0 expert capacity override.
-            num_moe_layers: Total MoE layer count for Tier0 auto sizing.
             method: Backend method (see INFERENCE_METHODS and SFT_METHODS)
             mode: Operation mode ("inference" or "sft")
             lora_rank: LoRA rank (SFT only)
@@ -186,6 +181,9 @@ class KTMoEWrapper:
             max_cache_depth: Maximum forward cache depth (SFT only)
             group_size: Quantization group size (SFT K-Group methods only)
             zero_point: Use zero point quantization (SFT K-Group methods only)
+            weight_strategy: Inference weight residency strategy.
+            max_tier0_experts: Inference Tier0 expert capacity override.
+            num_moe_layers: Total MoE layer count for Tier0 auto sizing.
 
         Returns:
             BaseMoEWrapper for inference mode, BaseSFTMoEWrapper for SFT mode
@@ -326,10 +324,10 @@ def _create_inference_wrapper(
     max_deferred_experts_per_token: Optional[int],
     method: str,
     numa_nodes: Optional[List[int]] = None,
+    swiglu_limit: float = 0.0,
     weight_strategy: str = "legacy",
     max_tier0_experts: Optional[int] = None,
     num_moe_layers: Optional[int] = None,
-    swiglu_limit: float = 0.0,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -371,6 +369,14 @@ def _create_inference_wrapper(
             f"environment while the current launch does not actually use "
             f"MXFP4 weights — either unset the env or pass --kt-method MXFP4."
         )
+    if backend_cls in (AMXMoEWrapper, NativeMoEWrapper):
+        extra_kwargs.update(
+            {
+                "weight_strategy": weight_strategy,
+                "max_tier0_experts": max_tier0_experts,
+                "num_moe_layers": num_moe_layers,
+            }
+        )
     return backend_cls(
         layer_idx=layer_idx,
         num_experts=num_experts,
@@ -386,9 +392,6 @@ def _create_inference_wrapper(
         max_deferred_experts_per_token=max_deferred_experts_per_token,
         method=method,
         numa_nodes=numa_nodes,
-        weight_strategy=weight_strategy,
-        max_tier0_experts=max_tier0_experts,
-        num_moe_layers=num_moe_layers,
         **extra_kwargs,
     )
 

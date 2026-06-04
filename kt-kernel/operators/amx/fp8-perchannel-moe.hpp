@@ -46,7 +46,7 @@ class AMX_FP8_PERCHANNEL_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_PERCHANNEL_MOE_
   AMX_FP8_PERCHANNEL_MOE_TP() = default;
 
   AMX_FP8_PERCHANNEL_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {
-    this->derived_init();
+    // Initialization now happens in derived_init() which is called by base constructor
   }
 
   void derived_init() {

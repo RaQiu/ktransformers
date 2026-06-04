@@ -14,7 +14,7 @@ import pytest
 from safetensors.numpy import save_file
 
 
-MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "python", "utils", "loader.py")
+MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "python", "utils", "loader.py")
 
 
 class _FakeTensor:
@@ -121,7 +121,10 @@ def test_bf16_loader_builds_iouring_slots_for_packed_experts(tmp_path):
 
     loader_module = _import_loader_module()
     loader = loader_module.BF16SafeTensorLoader(str(tmp_path))
-    slots = loader.load_experts_iouring("model.layers.0", tp_count=2, use_direct_io=False)
+    mesh_loader = loader_module._mesh_loader()
+    loader._ensure_mesh_index()
+    mesh_loader.bf16_detect_format(loader)
+    slots = mesh_loader.load_bf16_experts_iouring(loader, "model.layers.0", tp_count=2, use_direct_io=False)
 
     assert slots["packed_bf16"] is True
     assert slots["bf16_expert_cache"] is True
@@ -154,7 +157,10 @@ def test_bf16_loader_materializes_cache_for_unpacked_experts(tmp_path, monkeypat
 
     loader_module = _import_loader_module()
     loader = loader_module.BF16SafeTensorLoader(str(tmp_path))
-    slots = loader.load_experts_iouring("model.layers.0", tp_count=2, use_direct_io=False)
+    mesh_loader = loader_module._mesh_loader()
+    loader._ensure_mesh_index()
+    mesh_loader.bf16_detect_format(loader)
+    slots = mesh_loader.load_bf16_experts_iouring(loader, "model.layers.0", tp_count=2, use_direct_io=False)
 
     assert slots["packed_bf16"] is False
     assert slots["bf16_expert_cache"] is True
@@ -184,8 +190,11 @@ def test_bf16_loader_precaches_all_discovered_layers(tmp_path, monkeypatch):
 
     loader_module = _import_loader_module()
     loader = loader_module.BF16SafeTensorLoader(str(tmp_path))
-    first = loader.precache_experts_iouring(tp_count=2, use_direct_io=False)
-    second = loader.precache_experts_iouring(tp_count=2, use_direct_io=False)
+    mesh_loader = loader_module._mesh_loader()
+    loader._ensure_mesh_index()
+    mesh_loader.bf16_detect_format(loader)
+    first = mesh_loader.precache_bf16_experts_iouring(loader, tp_count=2, use_direct_io=False)
+    second = mesh_loader.precache_bf16_experts_iouring(loader, tp_count=2, use_direct_io=False)
 
     assert first["layers"] == 2
     assert first["generated"] == 2

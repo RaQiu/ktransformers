@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "compare_residency_policies.py"
+SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "mesh" / "compare_residency_policies.py"
 
 
 def test_compare_residency_policies_script_replays_trace(tmp_path):

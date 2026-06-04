@@ -42,7 +42,7 @@ This keeps online provider behavior and offline replay behavior aligned.
 
 ### Offline comparison
 
-`kt-kernel/scripts/compare_residency_policies.py` replays a JSONL trace against multiple policies and reports:
+`kt-kernel/scripts/mesh/compare_residency_policies.py` replays a JSONL trace against multiple policies and reports:
 
 - hits / misses / hit rate
 - promotions / demotions

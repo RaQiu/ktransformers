@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-MODULE_PATH = Path(__file__).resolve().parents[2] / "python" / "utils" / "weight_provider.py"
+MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "utils" / "mesh" / "weight_provider.py"
 SPEC = importlib.util.spec_from_file_location("weight_provider", MODULE_PATH)
 weight_provider = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None and SPEC.loader is not None

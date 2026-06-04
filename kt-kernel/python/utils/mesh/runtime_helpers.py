@@ -49,7 +49,7 @@ def _configure_base_runtime(
         weight_strategy = env_weight_strategy
 
     requested_weight_strategy = weight_strategy or "legacy"
-    from ..weight_provider import normalize_residency_policy_name
+    from .weight_provider import normalize_residency_policy_name
 
     if requested_weight_strategy in {"auto", "tiered"}:
         self.weight_strategy = "legacy"

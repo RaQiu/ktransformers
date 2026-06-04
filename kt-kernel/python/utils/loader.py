@@ -132,6 +132,7 @@ class SafeTensorLoader:
     tensor_type_map: dict
     file_handle_map: dict
     tensor_device_map: dict
+    file_path_map: dict
     tensor_info_map: dict
 
     def __init__(self, file_path: str):
@@ -146,6 +147,7 @@ class SafeTensorLoader:
             folder_path = file_path
         self.file_handle_map = {}
         self.file_fd_map = {}
+        self.file_path_map = {}
         self.tensor_file_map = {}
         self.tensor_type_map = {}
         self.tensor_device_map = {}
@@ -158,20 +160,21 @@ class SafeTensorLoader:
                 if file.endswith(".safetensors"):
                     found_safetensor = True
                     tensor_path = os.path.join(root, file)
-                    if tensor_path not in self.file_handle_map:
+                    if file not in self.file_handle_map:
                         try:
                             handle = safe_open(tensor_path, framework="pt")
-                            self.file_handle_map[tensor_path] = handle
+                            self.file_handle_map[file] = handle
+                            self.file_path_map[file] = tensor_path
                         except Exception as e:
                             print(f"Error opening Safetensor file {tensor_path}: {e}")
                             continue
 
-                    f = self.file_handle_map.get(tensor_path)
+                    f = self.file_handle_map.get(file)
                     if f is None:
                         continue
                     try:
                         for key in f.keys():
-                            self.tensor_file_map[key] = tensor_path
+                            self.tensor_file_map[key] = file
                     except Exception as e:
                         print(f"Error reading Safetensor file {tensor_path}: {e}")
 
@@ -184,8 +187,8 @@ class SafeTensorLoader:
     def _ensure_mesh_index(self):
         if self.tensor_info_map:
             return
-        for file_path in self.file_handle_map:
-            self._index_safetensor_file(file_path)
+        for file in self.file_handle_map:
+            self._index_safetensor_file(self.file_path_map.get(file, file))
 
     def _get_dense_moe_layout(self, base_key: str) -> tuple[list[int], list[int]]:
         return _mesh_loader().get_dense_moe_layout(self, base_key)

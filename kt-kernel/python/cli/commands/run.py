@@ -106,8 +106,8 @@ from kt_kernel.cli.utils.user_model_registry import UserModelRegistry
     "--io-backend",
     "io_backend",
     type=click.Choice(["iouring"], case_sensitive=False),
-    default="iouring",
-    help="I/O backend for expert weight loading (only iouring is supported in this codebase)",
+    default=None,
+    help="Opt into MESH I/O backend for expert weight loading.",
 )
 @click.option(
     "--enable-cache-stats",
@@ -618,6 +618,11 @@ def _run_impl(
             "--mesh-prefill-rolling-depth is ignored without --mesh-prefill-rolling"
         )
 
+    # Fail fast if a conflicting env var would crash sglang during model loading.
+    # Check against the fully-assembled env dict (shell + kt config settings) so
+    # nothing slips through regardless of where the variable was set.
+    _check_conflicting_env_vars(final_kt_method, env)
+
     # Step 5: Show configuration summary
     console.print()
     print_step("Configuration")
@@ -642,8 +647,10 @@ def _run_impl(
     if mesh_prefill_rolling:
         depth = int(mesh_prefill_rolling_depth) if mesh_prefill_rolling_depth is not None else 10
         console.print(f"  Mesh Prefill Rolling: [cyan]enabled depth={depth}[/cyan]")
-    console.print(f"  Weight Strategy: [cyan]{final_weight_strategy or 'legacy'}[/cyan]")
-    console.print(f"  Residency Policy: [cyan]{final_residency_policy or 'baseline'}[/cyan]")
+    if final_io_backend or final_weight_strategy or final_residency_policy or final_max_tier0_experts is not None:
+        console.print(f"  IO Backend: [cyan]{final_io_backend or 'full'}[/cyan]")
+        console.print(f"  Weight Strategy: [cyan]{final_weight_strategy or 'legacy'}[/cyan]")
+        console.print(f"  Residency Policy: [cyan]{final_residency_policy or 'baseline'}[/cyan]")
     if final_max_tier0_experts is not None:
         console.print(f"  Max Tier0 Experts: [cyan]{final_max_tier0_experts}[/cyan]")
     console.print(f"  Attention: [cyan]{final_attention_backend}[/cyan]")
@@ -719,6 +726,26 @@ def _run_impl(
 
 # Dead code removed: _find_model_path() and _find_weights_path()
 # These functions were part of the old builtin model system
+
+
+def _check_conflicting_env_vars(kt_method: str, env: dict) -> None:
+    """Exit early if environment variables conflict with the chosen kt-method.
+
+    Receives the fully-assembled subprocess env dict (shell + kt config settings)
+    so that variables injected via inference.env or advanced.env are also caught.
+    Catches copy-paste mistakes such as keeping SGLANG_DSV4_2604_SUBMODE=2604B
+    in the shell after switching from a MXFP4 launch to another method.
+    """
+    dsv4_submode = env.get("SGLANG_DSV4_2604_SUBMODE", "")
+    if dsv4_submode == "2604B" and (not kt_method or kt_method.upper() != "MXFP4"):
+        print_error(
+            f"SGLANG_DSV4_2604_SUBMODE=2604B is set but kt-method is "
+            f"{kt_method!r} (not MXFP4). "
+            f"This will raise a ValueError during model loading. "
+            f"Either unset the variable (unset SGLANG_DSV4_2604_SUBMODE) "
+            f"or switch to --kt-method MXFP4."
+        )
+        raise typer.Exit(1)
 
 
 def _build_sglang_command(
