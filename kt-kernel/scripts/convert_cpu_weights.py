@@ -802,47 +802,59 @@ class OnlineQuantConverter(ConverterBase):
 
             projs = sorted(proj_set)
             print(f"  [Fused] layer {layer_idx} fused proj keys: {projs}")
-            if len(projs) < 2:
+            required = {"down_proj", "gate_up_proj"}
+            if not required.issubset(proj_set):
                 raise ValueError(
-                    f"[Fused] Expect at least 2 fused tensors (down & gate_up) in layer {layer_idx}, got {len(projs)}"
+                    f"[Fused] Expected fused tensors {sorted(required)} in layer {layer_idx}, got {projs}"
                 )
 
-            fused_tensors = []
-            for p in projs:
-                key = f"model.layers.{layer_idx}.mlp.experts.{p}"
+            def _load_fused_projection(proj_name: str) -> torch.Tensor:
+                key = f"model.layers.{layer_idx}.mlp.experts.{proj_name}"
                 if key not in self.tensor_file_map:
                     raise KeyError(f"[Fused] Missing fused tensor {key} for layer {layer_idx}")
-                w = self._load_tensor(key)
+                weight = self._load_tensor(key)
                 if self.input_type == "fp16":
-                    w = w.to(torch.bfloat16)
-                print(f"    [Fused] tensor {p} shape: {tuple(w.shape)}")
-                fused_tensors.append(w)
+                    weight = weight.to(torch.bfloat16)
+                print(f"    [Fused] tensor {proj_name} shape: {tuple(weight.shape)}")
+                return weight
 
-            #   fused_tensors[0] : down-like, [E, I, H]
-            #   fused_tensors[1] : gate_up-like, [E, H, 2I]
-            down_fused = fused_tensors[0]
-            gate_up_fused = fused_tensors[1]
+            down_fused = _load_fused_projection("down_proj")
+            gate_up_fused = _load_fused_projection("gate_up_proj")
 
-            #    gate_up_fused: [E, H, 2I] -> [E, 2I, H] -> gate / up
+            # Qwen3.5 fused experts are stored as:
+            #   gate_up_proj: [E, 2I, H]
+            #   down_proj:    [E, H, I]
+            # KTMoEWrapper expects:
+            #   gate/up:      [E, I, H]
+            #   down:         [E, H, I]
             if gate_up_fused.dim() != 3:
                 raise ValueError(
                     f"[Fused] Expect gate_up fused tensor to be 3D, got shape {tuple(gate_up_fused.shape)}"
                 )
-            E, H, twoI = gate_up_fused.shape
-            if twoI % 2 != 0:
-                raise ValueError(f"[Fused] gate_up last dim (2I) not even: {twoI}")
-            I = twoI // 2
+            E, twoI, H = gate_up_fused.shape
+            if H != self.hidden_size:
+                raise ValueError(
+                    f"[Fused] gate_up hidden dim mismatch for layer {layer_idx}: {H} vs {self.hidden_size}"
+                )
+            if twoI != 2 * self.moe_intermediate_size:
+                raise ValueError(
+                    f"[Fused] gate_up intermediate dim mismatch for layer {layer_idx}: "
+                    f"{twoI} vs {2 * self.moe_intermediate_size}"
+                )
 
-            gate_up_T = gate_up_fused.transpose(1, 2).contiguous()  # [E, 2I, H]
-            gate_proj = gate_up_T[:, :I, :]  # [E, I, H]
-            up_proj = gate_up_T[:, I:, :]  # [E, I, H]
+            I = self.moe_intermediate_size
+            gate_proj = gate_up_fused[:, :I, :].contiguous()
+            up_proj = gate_up_fused[:, I:, :].contiguous()
 
             if down_fused.dim() != 3:
                 raise ValueError(f"[Fused] Expect down fused tensor to be 3D, got shape {tuple(down_fused.shape)}")
-            if down_fused.shape[0] != E:
-                raise ValueError(f"[Fused] down_fused expert dim mismatch: {down_fused.shape[0]} vs gate_up {E}")
-            down_proj = down_fused.transpose(1, 2).contiguous()  # [E, H, I]
-            del fused_tensors
+            expected_down_shape = (E, self.hidden_size, self.moe_intermediate_size)
+            if tuple(down_fused.shape) != expected_down_shape:
+                raise ValueError(
+                    f"[Fused] down_proj shape mismatch for layer {layer_idx}: "
+                    f"{tuple(down_fused.shape)} vs {expected_down_shape}"
+                )
+            down_proj = down_fused.contiguous()
             del gate_up_fused
             del down_fused
         else:
