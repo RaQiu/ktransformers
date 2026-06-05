@@ -1,0 +1,21 @@
+--- /tmp/full_v3_model_config.before_textonly_qwen35.py	2026-06-05 10:24:20.757409613 +0000
++++ /mnt/data2/tmp/qujing_full_v3/ktransformers_raqiu_official_full_v3_clean_20260605/third_party/sglang/python/sglang/srt/configs/model_config.py	2026-06-05 10:24:22.757373340 +0000
+@@ -153,7 +153,17 @@
+                 "Llama4ForConditionalGeneration",
+                 "Step3VLForConditionalGeneration",
+             ]
+-            if self.hf_config.architectures[0] in mm_disabled_models:
++            text_only_qwen35 = (
++                self.hf_config.architectures[0]
++                in (
++                    "Qwen3_5ForConditionalGeneration",
++                    "Qwen3_5MoeForConditionalGeneration",
++                )
++                and getattr(self.hf_config, "vision_config", None) is None
++                and getattr(self.hf_config, "image_token_id", None) is None
++                and getattr(self.hf_config, "video_token_id", None) is None
++            )
++            if self.hf_config.architectures[0] in mm_disabled_models or text_only_qwen35:
+                 enable_multimodal = False
+                 logger.info(
+                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
