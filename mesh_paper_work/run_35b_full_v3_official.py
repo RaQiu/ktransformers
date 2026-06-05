@@ -775,6 +775,8 @@ def build_command(
     ]
     if not args.disable_dynamic_expert_update:
         cmd.insert(cmd.index("--attention-backend"), "--kt-enable-dynamic-expert-update")
+    if args.language_only:
+        cmd.append("--language-only")
     if args.enable_p2p_check:
         cmd.append("--enable-p2p-check")
     return cmd
@@ -833,6 +835,7 @@ def make_plan(args: argparse.Namespace, prompts: list[dict[str, str]]) -> list[d
                         "bf16_expert_cache_dir": None,
                         "memory_max": args.memory_max,
                         "mem_fraction_static": args.mem_fraction_static,
+                        "language_only": args.language_only,
                         "request_mode": args.request_mode,
                         "prompt_file": str(args.prompts_file),
                         "expected_prompt_count": len(prompts),
@@ -857,13 +860,13 @@ def write_matrix_markdown(out_root: Path, plan: list[dict[str, Any]]) -> None:
         f"Official checkout: `{OFFICIAL_ROOT}`",
         f"Official venv: `{OFFICIAL_VENV_ROOT}`",
         "",
-        "| model | precision | mode | code_version_policy | model_path | kt_weight_path | runner | cuda | cgroup | TP | GE | defer | mesh_cap | pool_cap | prefill_window | mem_fraction_static | prompt_file | status |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| model | precision | mode | code_version_policy | model_path | kt_weight_path | runner | cuda | cgroup | TP | GE | defer | mesh_cap | pool_cap | prefill_window | mem_fraction_static | language_only | prompt_file | status |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
     ]
     for r in plan:
         runner = "official checkout via venv"
         lines.append(
-            "| {model} | {precision} | {mode} | {policy} | {mp} | {wp} | {runner} | assigned at runtime | {mem} | {tp} | {ge} | {defer} | {cap} | {pool} | {window} | {mf} | {pf} | pending |".format(
+            "| {model} | {precision} | {mode} | {policy} | {mp} | {wp} | {runner} | assigned at runtime | {mem} | {tp} | {ge} | {defer} | {cap} | {pool} | {window} | {mf} | {lang} | {pf} | pending |".format(
                 model=r["model"],
                 precision=r["precision"],
                 mode=r["mode"],
@@ -879,6 +882,7 @@ def write_matrix_markdown(out_root: Path, plan: list[dict[str, Any]]) -> None:
                 pool="" if r["mesh_global_pool_capacity"] is None else r["mesh_global_pool_capacity"],
                 window="" if r["mesh_prefill_layer_window"] is None else r["mesh_prefill_layer_window"],
                 mf=r["mem_fraction_static"],
+                lang=r["language_only"],
                 pf=r["prompt_file"],
             )
         )
@@ -913,6 +917,7 @@ def write_run_record(run_dir: Path, entry: dict[str, Any]) -> None:
         f"- TP/GE/defer: {entry.get('tp')}/{entry.get('gpu_experts')}/{entry.get('defer')}",
         f"- CUDA_VISIBLE_DEVICES: {entry.get('cuda')}",
         f"- MemoryMax: {entry.get('memory_max')}",
+        f"- language_only: {entry.get('language_only')}",
         f"- peak_gib: {mem.get('peak_gib')}",
         f"- memory_peak_gib_from_cgroup: {mem.get('memory_peak_gib_from_cgroup')}",
         f"- anon_peak_gib: {mem.get('peak_anon_gib')}",
@@ -1111,6 +1116,7 @@ def aggregate(out_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
                 "gpu_experts": r.get("gpu_experts"),
                 "defer": r.get("defer"),
                 "memory_max": r.get("memory_max"),
+                "language_only": r.get("language_only"),
                 "mesh_cap": r.get("mesh_cap"),
                 "mesh_global_pool_capacity": r.get("mesh_global_pool_capacity"),
                 "mesh_prefill_layer_window": r.get("mesh_prefill_layer_window"),
@@ -1218,6 +1224,7 @@ def main() -> int:
     parser.add_argument("--max-total-tokens", type=int, default=4096)
     parser.add_argument("--max-running-requests", type=int, default=2)
     parser.add_argument("--disable-dynamic-expert-update", action="store_true")
+    parser.add_argument("--language-only", action="store_true")
     parser.add_argument("--enable-p2p-check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
