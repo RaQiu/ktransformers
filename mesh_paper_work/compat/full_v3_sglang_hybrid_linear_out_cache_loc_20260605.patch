@@ -1,0 +1,12 @@
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index d700f588b..7a559d5dc 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -732,6 +732,7 @@ class HybridLinearAttnBackend(AttentionBackend):
+         forward_mode: ForwardMode,
+         spec_info: Optional[SpecInput],
+         seq_lens_cpu: Optional[torch.Tensor],
++        out_cache_loc: Optional[torch.Tensor] = None,
+     ):
+         for attn_backend in self.attn_backend_list:
+             attn_backend.init_forward_metadata_replay_cuda_graph(
