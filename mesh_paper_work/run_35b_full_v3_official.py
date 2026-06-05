@@ -18,7 +18,7 @@ import requests
 OFFICIAL_REPO_URL = "https://github.com/RaQiu/ktransformers.git"
 OFFICIAL_COMMIT = "97c5dcac8863dc28fe28e8f5d389c45be090dee8"
 OFFICIAL_SGLANG_COMMIT = "43ed1ec77a7fc37e6eeedbf9191e23abd418ae85"
-OFFICIAL_ROOT = "/mnt/data3/work/ktransformers_raqiu_official_full_v3_20260605"
+OFFICIAL_ROOT = "/mnt/data2/work/ktransformers_raqiu_official_full_v3_clean_20260605"
 OFFICIAL_SGLANG_PY = f"{OFFICIAL_ROOT}/third_party/sglang/python"
 OFFICIAL_KT_LIB = f"{OFFICIAL_ROOT}/kt-kernel/build/lib.linux-x86_64-cpython-310"
 OFFICIAL_KT_SRC = f"{OFFICIAL_ROOT}/kt-kernel"
