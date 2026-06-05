@@ -755,7 +755,7 @@ def build_command(
         "--chunked-prefill-size",
         str(args.chunked_prefill_size),
         "--max-running-requests",
-        "1",
+        str(args.max_running_requests),
         "--max-total-tokens",
         str(args.max_total_tokens),
         "--watchdog-timeout",
@@ -1206,6 +1206,7 @@ def main() -> int:
     parser.add_argument("--mem-fraction-static", default="0.85")
     parser.add_argument("--chunked-prefill-size", type=int, default=4096)
     parser.add_argument("--max-total-tokens", type=int, default=4096)
+    parser.add_argument("--max-running-requests", type=int, default=2)
     parser.add_argument("--disable-dynamic-expert-update", action="store_true")
     parser.add_argument("--enable-p2p-check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
