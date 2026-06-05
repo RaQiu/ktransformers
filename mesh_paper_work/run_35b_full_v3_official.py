@@ -391,12 +391,6 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def wait_ready(port: int, log_path: Path, timeout_s: int, health_timeout_s: int) -> tuple[str, str]:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        try:
-            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=health_timeout_s)
-            if r.status_code == 200:
-                return "ready", ""
-        except Exception:
-            pass
         tail = read_text(log_path, max_bytes=80000)
         if "The server is fired up and ready to roll!" in tail:
             return "ready", ""
@@ -404,6 +398,12 @@ def wait_ready(port: int, log_path: Path, timeout_s: int, health_timeout_s: int)
             return "fail", tail[-16000:]
         if log_path.exists() and "Running as unit" in tail and not pids_for_port(port):
             return "dead", tail[-16000:]
+        try:
+            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=health_timeout_s)
+            if r.status_code == 200:
+                return "ready", ""
+        except Exception:
+            pass
         time.sleep(5)
     return "timeout", read_text(log_path, max_bytes=16000)
 
@@ -982,21 +982,62 @@ def launch_one(run: dict[str, Any], out_root: Path, prompts: list[dict[str, str]
             status, fail_tail = wait_ready(port, log_path, args.ready_timeout_s, args.health_timeout_s)
             entry["ready_status"] = status
             entry["ready_after_s"] = time.time() - start
+            print(
+                json.dumps(
+                    {
+                        "event": "server_ready_check",
+                        "label": run["label"],
+                        "ready_status": status,
+                        "ready_after_s": entry["ready_after_s"],
+                        "time": time.time(),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
             if status == "ready":
                 rows = []
                 for prompt in prompts:
-                    rows.append(
-                        bench_one(
-                            port,
-                            name,
-                            prompt,
-                            args.max_tokens,
-                            args.request_mode,
-                            args.request_timeout_s,
-                            args.stream_read_timeout_s,
-                        )
+                    print(
+                        json.dumps(
+                            {
+                                "event": "prompt_start",
+                                "label": run["label"],
+                                "prompt_id": prompt["id"],
+                                "request_mode": args.request_mode,
+                                "time": time.time(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
                     )
+                    row = bench_one(
+                        port,
+                        name,
+                        prompt,
+                        args.max_tokens,
+                        args.request_mode,
+                        args.request_timeout_s,
+                        args.stream_read_timeout_s,
+                    )
+                    rows.append(row)
                     write_json(run_dir / "rows.partial.json", rows)
+                    print(
+                        json.dumps(
+                            {
+                                "event": "prompt_done",
+                                "label": run["label"],
+                                "prompt_id": prompt["id"],
+                                "status": row.get("status"),
+                                "request_mode_effective": row.get("request_mode_effective"),
+                                "completion_tokens": row.get("completion_tokens"),
+                                "elapsed_s": row.get("elapsed_s"),
+                                "time": time.time(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
                 entry["rows"] = rows
                 entry["row_summary"] = summarize_rows(rows)
                 if entry["row_summary"]["ok_count"] == len(prompts):
