@@ -22,7 +22,8 @@ OFFICIAL_ROOT = "/mnt/data3/work/ktransformers_raqiu_official_full_v3_20260605"
 OFFICIAL_SGLANG_PY = f"{OFFICIAL_ROOT}/third_party/sglang/python"
 OFFICIAL_KT_LIB = f"{OFFICIAL_ROOT}/kt-kernel/build/lib.linux-x86_64-cpython-310"
 OFFICIAL_KT_SRC = f"{OFFICIAL_ROOT}/kt-kernel"
-OFFICIAL_VENV = "/mnt/data3/work/venv-ktransformers-raqiu/bin"
+OFFICIAL_VENV_ROOT = "/mnt/data2/work/venvs/ktransformers-official-full-v3-20260605"
+OFFICIAL_VENV = f"{OFFICIAL_VENV_ROOT}/bin"
 
 PROMPT_FILE = Path("/mnt/data3/work/mesh_standard_5domain_prompts_20260602.json")
 DEFAULT_OUT_ROOT = Path("/mnt/data3/work/mesh_paper_35b_runs/full_v3_official_20260605")
@@ -693,6 +694,8 @@ def build_env(mode: str, precision: str, cuda: str, expert_stats_path: Path, arg
             "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
             "PYTHONUNBUFFERED": "1",
             "PYTHONFAULTHANDLER": "1",
+            "PYTHONNOUSERSITE": "1",
+            "VIRTUAL_ENV": OFFICIAL_VENV_ROOT,
             "KT_LANG": "en",
         }
     )
@@ -702,8 +705,6 @@ def build_env(mode: str, precision: str, cuda: str, expert_stats_path: Path, arg
 
     env["PATH"] = f"{OFFICIAL_VENV}:" + env.get("PATH", "")
     pythonpath = f"{OFFICIAL_SGLANG_PY}:{OFFICIAL_KT_LIB}:{OFFICIAL_KT_SRC}:{OFFICIAL_ROOT}"
-    if env.get("PYTHONPATH"):
-        pythonpath = f"{pythonpath}:{env['PYTHONPATH']}"
     env["PYTHONPATH"] = pythonpath
     return f"{OFFICIAL_VENV}/python3", env
 
@@ -807,6 +808,7 @@ def make_plan(args: argparse.Namespace, prompts: list[dict[str, str]]) -> list[d
                         "official_checkout": OFFICIAL_ROOT,
                         "official_sglang_py": OFFICIAL_SGLANG_PY,
                         "official_kt_lib": OFFICIAL_KT_LIB,
+                        "official_venv_root": OFFICIAL_VENV_ROOT,
                         "official_python": f"{OFFICIAL_VENV}/python3",
                         "model_path": spec["model_path"],
                         "kt_weight_path": spec["kt_weight_path"],
@@ -844,6 +846,7 @@ def write_matrix_markdown(out_root: Path, plan: list[dict[str, Any]]) -> None:
         f"Official commit: `{OFFICIAL_COMMIT}`",
         f"Official SGLang commit: `{OFFICIAL_SGLANG_COMMIT}`",
         f"Official checkout: `{OFFICIAL_ROOT}`",
+        f"Official venv: `{OFFICIAL_VENV_ROOT}`",
         "",
         "| model | precision | mode | code_version_policy | model_path | kt_weight_path | runner | cuda | cgroup | TP | GE | defer | mesh_cap | pool_cap | prefill_window | mem_fraction_static | prompt_file | status |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
@@ -891,6 +894,7 @@ def write_run_record(run_dir: Path, entry: dict[str, Any]) -> None:
         f"- official_checkout: {entry.get('official_checkout')}",
         f"- official_sglang_py: {entry.get('official_sglang_py')}",
         f"- official_kt_lib: {entry.get('official_kt_lib')}",
+        f"- official_venv_root: {entry.get('official_venv_root')}",
         f"- official_python: {entry.get('official_python')}",
         f"- model_path: {entry.get('model_path')}",
         f"- kt_weight_path: {entry.get('kt_weight_path')}",
@@ -1133,6 +1137,7 @@ def aggregate(out_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
         f"Official commit: `{OFFICIAL_COMMIT}`",
         f"Official SGLang commit: `{OFFICIAL_SGLANG_COMMIT}`",
         f"Official checkout: `{OFFICIAL_ROOT}`",
+        f"Official venv: `{OFFICIAL_VENV_ROOT}`",
         "",
         "| label | precision | mode | policy | request | TP | GE | defer | status | ok/expected | API decode tok/s | API total tok/s | log decode tok/s | log prefill tok/s | peak GiB | memory.peak GiB | anon GiB | file GiB | file_mapped GiB | OOM | summary |",
         "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
