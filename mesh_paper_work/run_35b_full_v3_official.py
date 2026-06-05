@@ -518,6 +518,7 @@ def bench_one_generate(
             "max_new_tokens": max_tokens,
             "temperature": 0.0,
             "top_p": 1.0,
+            "ignore_eos": True,
         },
     }
     t0 = time.time()
