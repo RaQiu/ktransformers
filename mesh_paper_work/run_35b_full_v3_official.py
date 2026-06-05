@@ -797,11 +797,16 @@ def make_plan(args: argparse.Namespace, prompts: list[dict[str, str]]) -> list[d
                 if precision == "BF16" and args.bf16_model_path:
                     spec["model_path"] = args.bf16_model_path
                     spec["kt_weight_path"] = args.bf16_kt_weight_path or args.bf16_model_path
-                label = f"35b_{precision.lower()}_{mode}_tp{tp}"
+                if precision == "AMXINT4":
+                    if args.amxint4_model_path:
+                        spec["model_path"] = args.amxint4_model_path
+                    if args.amxint4_kt_weight_path:
+                        spec["kt_weight_path"] = args.amxint4_kt_weight_path
+                label = f"{args.label_prefix}_{precision.lower()}_{mode}_tp{tp}"
                 plan.append(
                     {
                         "label": label,
-                        "model": "Qwen3.5-35B-A3B",
+                        "model": args.model_label,
                         "precision": precision,
                         "mode": mode,
                         "code_version_policy": mode_policy(mode),
@@ -950,7 +955,7 @@ def launch_one(run: dict[str, Any], out_root: Path, prompts: list[dict[str, str]
     cuda = choose_gpus(int(run["tp"]), args.min_gpu_free_mib, args.wait_gpu_s)
     run_dir = out_root / run["label"]
     run_dir.mkdir(parents=True, exist_ok=True)
-    name = f"official-full-v3-35b-{run['precision'].lower()}-tp{run['tp']}-{now_stamp()}"
+    name = f"official-full-v3-{args.label_prefix}-{run['precision'].lower()}-tp{run['tp']}-{now_stamp()}"
     log_path = run_dir / "server.log"
     mem_path = run_dir / "memory_samples.jsonl"
     expert_stats_path = run_dir / "expert_stats.jsonl"
@@ -1185,8 +1190,12 @@ def main() -> int:
     parser.add_argument("--precisions", nargs="+", default=["AMXINT4"])
     parser.add_argument("--modes", nargs="+", default=["full-v3"])
     parser.add_argument("--tps", nargs="+", type=int, default=[2, 4])
+    parser.add_argument("--model-label", default="Qwen3.5-35B-A3B")
+    parser.add_argument("--label-prefix", default="35b")
     parser.add_argument("--bf16-model-path", default="")
     parser.add_argument("--bf16-kt-weight-path", default="")
+    parser.add_argument("--amxint4-model-path", default="")
+    parser.add_argument("--amxint4-kt-weight-path", default="")
     parser.add_argument("--only", nargs="*", default=[])
     parser.add_argument("--port", type=int, default=31850)
     parser.add_argument("--memory-max", default="768G")
