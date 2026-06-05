@@ -375,12 +375,14 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ok = [r for r in rows if r.get("status") == "ok"]
     decode = [float(r["api_decode_tok_s"]) for r in ok if r.get("api_decode_tok_s")]
     prefill = [float(r["api_prefill_tok_s"]) for r in ok if r.get("api_prefill_tok_s")]
+    total = [float(r["api_total_tok_s"]) for r in ok if r.get("api_total_tok_s")]
     return {
         "ok_count": len(ok),
         "decode_tok_s_avg_api": sum(decode) / len(decode) if decode else None,
         "decode_tok_s_min_api": min(decode) if decode else None,
         "decode_tok_s_max_api": max(decode) if decode else None,
         "prefill_tok_s_avg_api": sum(prefill) / len(prefill) if prefill else None,
+        "total_tok_s_avg_api": sum(total) / len(total) if total else None,
         "completion_tokens_total": sum(int(r.get("completion_tokens", 0) or 0) for r in ok),
         "prompt_tokens_total": sum(int(r.get("prompt_tokens", 0) or 0) for r in ok),
     }
@@ -404,7 +406,159 @@ def wait_ready(port: int, log_path: Path, timeout_s: int) -> tuple[str, str]:
     return "timeout", read_text(log_path, max_bytes=16000)
 
 
-def bench_one(port: int, model_name: str, prompt_obj: dict[str, str], max_tokens: int) -> dict[str, Any]:
+def _base_row(prompt_obj: dict[str, str]) -> dict[str, Any]:
+    return {
+        "prompt_id": prompt_obj["id"],
+        "domain": prompt_obj["domain"],
+        "prompt_words": len(prompt_obj["input_prompt"].split()),
+    }
+
+
+def _finish_nonstream_row(
+    prompt_obj: dict[str, str],
+    output: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    elapsed_s: float,
+    request_mode_effective: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    row = {
+        **_base_row(prompt_obj),
+        "status": "ok" if completion_tokens > 0 and output else "bad_output",
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "elapsed_s": elapsed_s,
+        "ttft_s": None,
+        "api_prefill_tok_s": None,
+        "api_decode_tok_s": None,
+        "api_total_tok_s": completion_tokens / elapsed_s if elapsed_s and completion_tokens else None,
+        "chunks": 0,
+        "output_chars": len(output),
+        "output_preview": output[:600],
+        "request_mode_effective": request_mode_effective,
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def bench_one_chat_nonstream(
+    port: int,
+    model_name: str,
+    prompt_obj: dict[str, str],
+    max_tokens: int,
+    request_timeout_s: int,
+) -> dict[str, Any]:
+    payload = {
+        "model": model_name,
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "messages": [{"role": "user", "content": prompt_obj["input_prompt"]}],
+    }
+    t0 = time.time()
+    try:
+        resp = requests.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            json=payload,
+            timeout=(10, request_timeout_s),
+        )
+        if resp.status_code != 200:
+            return {
+                **_base_row(prompt_obj),
+                "status": "http_error",
+                "request_mode_effective": "chat-nonstream",
+                "code": resp.status_code,
+                "body": resp.text[:4000],
+            }
+        obj = resp.json()
+    except Exception as exc:
+        return {
+            **_base_row(prompt_obj),
+            "status": "exception",
+            "request_mode_effective": "chat-nonstream",
+            "error": repr(exc),
+        }
+    t1 = time.time()
+    usage = obj.get("usage") or {}
+    parts: list[str] = []
+    for choice in obj.get("choices") or []:
+        msg = choice.get("message") or {}
+        text = msg.get("content") or choice.get("text") or ""
+        if text:
+            parts.append(text)
+    return _finish_nonstream_row(
+        prompt_obj,
+        "".join(parts),
+        int(usage.get("prompt_tokens") or 0),
+        int(usage.get("completion_tokens") or 0),
+        t1 - t0,
+        "chat-nonstream",
+        {"raw_finish_reason": (obj.get("choices") or [{}])[0].get("finish_reason")},
+    )
+
+
+def bench_one_generate(
+    port: int,
+    prompt_obj: dict[str, str],
+    max_tokens: int,
+    request_timeout_s: int,
+) -> dict[str, Any]:
+    payload = {
+        "text": prompt_obj["input_prompt"],
+        "stream": False,
+        "sampling_params": {
+            "max_new_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        },
+    }
+    t0 = time.time()
+    try:
+        resp = requests.post(
+            f"http://127.0.0.1:{port}/generate",
+            json=payload,
+            timeout=(10, request_timeout_s),
+        )
+        if resp.status_code != 200:
+            return {
+                **_base_row(prompt_obj),
+                "status": "http_error",
+                "request_mode_effective": "generate",
+                "code": resp.status_code,
+                "body": resp.text[:4000],
+            }
+        obj = resp.json()
+    except Exception as exc:
+        return {
+            **_base_row(prompt_obj),
+            "status": "exception",
+            "request_mode_effective": "generate",
+            "error": repr(exc),
+        }
+    t1 = time.time()
+    meta = obj.get("meta_info") or {}
+    output = str(obj.get("text") or obj.get("output") or "")
+    return _finish_nonstream_row(
+        prompt_obj,
+        output,
+        int(meta.get("prompt_tokens") or 0),
+        int(meta.get("completion_tokens") or 0),
+        t1 - t0,
+        "generate",
+        {"raw_finish_reason": meta.get("finish_reason")},
+    )
+
+
+def bench_one_chat_stream(
+    port: int,
+    model_name: str,
+    prompt_obj: dict[str, str],
+    max_tokens: int,
+    stream_read_timeout_s: int,
+) -> dict[str, Any]:
     payload = {
         "model": model_name,
         "stream": True,
@@ -424,13 +578,13 @@ def bench_one(port: int, model_name: str, prompt_obj: dict[str, str], max_tokens
             f"http://127.0.0.1:{port}/v1/chat/completions",
             json=payload,
             stream=True,
-            timeout=max(1200, max_tokens * 30),
+            timeout=(10, stream_read_timeout_s),
         ) as resp:
             if resp.status_code != 200:
                 return {
+                    **_base_row(prompt_obj),
                     "status": "http_error",
-                    "prompt_id": prompt_obj["id"],
-                    "domain": prompt_obj["domain"],
+                    "request_mode_effective": "chat-stream",
                     "code": resp.status_code,
                     "body": resp.text[:4000],
                 }
@@ -453,9 +607,9 @@ def bench_one(port: int, model_name: str, prompt_obj: dict[str, str], max_tokens
                             first = time.time()
     except Exception as exc:
         return {
+            **_base_row(prompt_obj),
             "status": "exception",
-            "prompt_id": prompt_obj["id"],
-            "domain": prompt_obj["domain"],
+            "request_mode_effective": "chat-stream",
             "error": repr(exc),
         }
     t1 = time.time()
@@ -465,20 +619,56 @@ def bench_one(port: int, model_name: str, prompt_obj: dict[str, str], max_tokens
     ttft = first - t0 if first else None
     decode_window = t1 - first if first else None
     return {
+        **_base_row(prompt_obj),
         "status": "ok" if completion_tokens > 0 and output else "bad_output",
-        "prompt_id": prompt_obj["id"],
-        "domain": prompt_obj["domain"],
-        "prompt_words": len(prompt_obj["input_prompt"].split()),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "elapsed_s": t1 - t0,
         "ttft_s": ttft,
         "api_prefill_tok_s": prompt_tokens / ttft if ttft and prompt_tokens else None,
         "api_decode_tok_s": completion_tokens / decode_window if decode_window and completion_tokens else None,
+        "api_total_tok_s": completion_tokens / (t1 - t0) if t1 > t0 and completion_tokens else None,
         "chunks": chunks,
         "output_chars": len(output),
         "output_preview": output[:600],
+        "request_mode_effective": "chat-stream",
     }
+
+
+def bench_one(
+    port: int,
+    model_name: str,
+    prompt_obj: dict[str, str],
+    max_tokens: int,
+    request_mode: str,
+    request_timeout_s: int,
+    stream_read_timeout_s: int,
+) -> dict[str, Any]:
+    if request_mode == "chat-stream":
+        return bench_one_chat_stream(port, model_name, prompt_obj, max_tokens, stream_read_timeout_s)
+    if request_mode == "chat-nonstream":
+        return bench_one_chat_nonstream(port, model_name, prompt_obj, max_tokens, request_timeout_s)
+    if request_mode == "generate":
+        return bench_one_generate(port, prompt_obj, max_tokens, request_timeout_s)
+    if request_mode != "auto":
+        raise ValueError(f"unknown request mode {request_mode}")
+
+    first = bench_one_chat_nonstream(port, model_name, prompt_obj, max_tokens, request_timeout_s)
+    if first.get("status") == "ok":
+        first["request_mode_requested"] = "auto"
+        return first
+    second = bench_one_generate(port, prompt_obj, max_tokens, request_timeout_s)
+    second["request_mode_requested"] = "auto"
+    second["fallback_from"] = first.get("request_mode_effective")
+    second["fallback_reason"] = {
+        "status": first.get("status"),
+        "error": first.get("error"),
+        "code": first.get("code"),
+        "body": first.get("body"),
+        "output_chars": first.get("output_chars"),
+        "completion_tokens": first.get("completion_tokens"),
+    }
+    return second
 
 
 def mode_policy(mode: str) -> str:
@@ -630,6 +820,7 @@ def make_plan(args: argparse.Namespace, prompts: list[dict[str, str]]) -> list[d
                         "bf16_expert_cache_dir": None,
                         "memory_max": args.memory_max,
                         "mem_fraction_static": args.mem_fraction_static,
+                        "request_mode": args.request_mode,
                         "prompt_file": str(args.prompts_file),
                         "expected_prompt_count": len(prompts),
                         "max_new_tokens": args.max_tokens,
@@ -714,8 +905,10 @@ def write_run_record(run_dir: Path, entry: dict[str, Any]) -> None:
         f"- oom_kill_events_max: {mem.get('oom_kill_events_max')}",
         f"- api_decode_tok_s_avg: {row.get('decode_tok_s_avg_api')}",
         f"- api_prefill_tok_s_avg: {row.get('prefill_tok_s_avg_api')}",
+        f"- api_total_tok_s_avg: {row.get('total_tok_s_avg_api')}",
         f"- hit_rate: {expert.get('hit_rate')}",
         f"- iouring_read_gib: {expert.get('iouring_read_gib')}",
+        f"- request_mode: {entry.get('request_mode')}",
         f"- bf16_expert_cache: {entry.get('bf16_expert_cache')}",
         f"- bf16_expert_cache_dir: {entry.get('bf16_expert_cache_dir')}",
         "",
@@ -790,7 +983,17 @@ def launch_one(run: dict[str, Any], out_root: Path, prompts: list[dict[str, str]
             if status == "ready":
                 rows = []
                 for prompt in prompts:
-                    rows.append(bench_one(port, name, prompt, args.max_tokens))
+                    rows.append(
+                        bench_one(
+                            port,
+                            name,
+                            prompt,
+                            args.max_tokens,
+                            args.request_mode,
+                            args.request_timeout_s,
+                            args.stream_read_timeout_s,
+                        )
+                    )
                     write_json(run_dir / "rows.partial.json", rows)
                 entry["rows"] = rows
                 entry["row_summary"] = summarize_rows(rows)
@@ -860,6 +1063,7 @@ def aggregate(out_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
                 "expected_prompt_count": r.get("expected_prompt_count"),
                 "api_decode_tok_s": row.get("decode_tok_s_avg_api"),
                 "api_prefill_tok_s": row.get("prefill_tok_s_avg_api"),
+                "api_total_tok_s": row.get("total_tok_s_avg_api"),
                 "log_decode_tok_s": (r.get("runtime_log_summary") or {}).get("decode_tps_avg_log"),
                 "log_prefill_tok_s": (r.get("runtime_log_summary") or {}).get("prefill_tps_hmean"),
                 "peak_gib": mem.get("peak_gib"),
@@ -871,6 +1075,7 @@ def aggregate(out_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
                 "hit_rate": expert.get("hit_rate"),
                 "iouring_read_gib": expert.get("iouring_read_gib"),
                 "summary": str(Path(r.get("run_dir", "")) / "summary.json") if r.get("run_dir") else None,
+                "request_mode": r.get("request_mode"),
             }
         )
     agg = {"generated_at": now_stamp(), "out_root": str(out_root), "runs": rows}
@@ -886,24 +1091,27 @@ def aggregate(out_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
         f"Official SGLang commit: `{OFFICIAL_SGLANG_COMMIT}`",
         f"Official checkout: `{OFFICIAL_ROOT}`",
         "",
-        "| label | precision | mode | policy | TP | GE | defer | status | ok/expected | decode tok/s | prefill tok/s | peak GiB | memory.peak GiB | anon GiB | file GiB | file_mapped GiB | OOM | summary |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| label | precision | mode | policy | request | TP | GE | defer | status | ok/expected | API decode tok/s | API total tok/s | log decode tok/s | log prefill tok/s | peak GiB | memory.peak GiB | anon GiB | file GiB | file_mapped GiB | OOM | summary |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for r in rows:
         ok = "" if r["ok_count"] is None else f"{r['ok_count']}/{r['expected_prompt_count']}"
         md.append(
-            "| {label} | {precision} | {mode} | {policy} | {tp} | {ge} | {defer} | {status} | {ok} | {dec} | {pre} | {peak} | {mempeak} | {anon} | {file} | {mapped} | {oom} | {summary} |".format(
+            "| {label} | {precision} | {mode} | {policy} | {request} | {tp} | {ge} | {defer} | {status} | {ok} | {dec} | {total} | {logdec} | {logpre} | {peak} | {mempeak} | {anon} | {file} | {mapped} | {oom} | {summary} |".format(
                 label=r["label"],
                 precision=r["precision"],
                 mode=r["mode"],
                 policy=r["code_version_policy"],
+                request=r["request_mode"],
                 tp=r["tp"],
                 ge=r["gpu_experts"],
                 defer=r["defer"],
                 status=r["status"],
                 ok=ok,
                 dec=f"{r['api_decode_tok_s']:.3f}" if r["api_decode_tok_s"] is not None else "",
-                pre=f"{r['api_prefill_tok_s']:.3f}" if r["api_prefill_tok_s"] is not None else "",
+                total=f"{r['api_total_tok_s']:.3f}" if r["api_total_tok_s"] is not None else "",
+                logdec=f"{r['log_decode_tok_s']:.3f}" if r["log_decode_tok_s"] is not None else "",
+                logpre=f"{r['log_prefill_tok_s']:.3f}" if r["log_prefill_tok_s"] is not None else "",
                 peak=f"{r['peak_gib']:.3f}" if r["peak_gib"] is not None else "",
                 mempeak=f"{r['memory_peak_gib_from_cgroup']:.3f}" if r["memory_peak_gib_from_cgroup"] is not None else "",
                 anon=f"{r['anon_peak_gib']:.3f}" if r["anon_peak_gib"] is not None else "",
@@ -931,6 +1139,9 @@ def main() -> int:
     parser.add_argument("--memory-max", default="768G")
     parser.add_argument("--max-tokens", type=int, default=0)
     parser.add_argument("--ready-timeout-s", type=int, default=1800)
+    parser.add_argument("--request-mode", choices=["auto", "chat-nonstream", "chat-stream", "generate"], default="auto")
+    parser.add_argument("--request-timeout-s", type=int, default=1800)
+    parser.add_argument("--stream-read-timeout-s", type=int, default=120)
     parser.add_argument("--wait-gpu-s", type=int, default=7200)
     parser.add_argument("--min-gpu-free-mib", type=int, default=40000)
     parser.add_argument("--gpu-experts", type=int, default=32)
