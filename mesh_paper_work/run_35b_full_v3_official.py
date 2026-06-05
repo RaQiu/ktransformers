@@ -388,16 +388,18 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def wait_ready(port: int, log_path: Path, timeout_s: int) -> tuple[str, str]:
+def wait_ready(port: int, log_path: Path, timeout_s: int, health_timeout_s: int) -> tuple[str, str]:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=3)
+            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=health_timeout_s)
             if r.status_code == 200:
                 return "ready", ""
         except Exception:
             pass
         tail = read_text(log_path, max_bytes=80000)
+        if "The server is fired up and ready to roll!" in tail:
+            return "ready", ""
         if any(marker in tail for marker in FAIL_MARKERS):
             return "fail", tail[-16000:]
         if log_path.exists() and "Running as unit" in tail and not pids_for_port(port):
@@ -977,7 +979,7 @@ def launch_one(run: dict[str, Any], out_root: Path, prompts: list[dict[str, str]
         with MemorySampler(port, mem_path):
             proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env, preexec_fn=os.setsid)
             entry["launcher_pid"] = proc.pid
-            status, fail_tail = wait_ready(port, log_path, args.ready_timeout_s)
+            status, fail_tail = wait_ready(port, log_path, args.ready_timeout_s, args.health_timeout_s)
             entry["ready_status"] = status
             entry["ready_after_s"] = time.time() - start
             if status == "ready":
@@ -1139,6 +1141,7 @@ def main() -> int:
     parser.add_argument("--memory-max", default="768G")
     parser.add_argument("--max-tokens", type=int, default=0)
     parser.add_argument("--ready-timeout-s", type=int, default=1800)
+    parser.add_argument("--health-timeout-s", type=int, default=10)
     parser.add_argument("--request-mode", choices=["auto", "chat-nonstream", "chat-stream", "generate"], default="auto")
     parser.add_argument("--request-timeout-s", type=int, default=1800)
     parser.add_argument("--stream-read-timeout-s", type=int, default=120)
