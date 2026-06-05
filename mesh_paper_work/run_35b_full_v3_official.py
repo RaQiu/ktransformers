@@ -23,6 +23,7 @@ OFFICIAL_ROOT = f"{OFFICIAL_WORK_ROOT}/ktransformers_raqiu_official_full_v3_clea
 OFFICIAL_SGLANG_PY = f"{OFFICIAL_ROOT}/third_party/sglang/python"
 OFFICIAL_KT_LIB = f"{OFFICIAL_ROOT}/kt-kernel/build/lib.linux-x86_64-cpython-310"
 OFFICIAL_KT_SRC = f"{OFFICIAL_ROOT}/kt-kernel"
+OFFICIAL_KT_PY = f"{OFFICIAL_ROOT}/kt-kernel/python"
 OFFICIAL_VENV_ROOT = f"{OFFICIAL_WORK_ROOT}/venvs/ktransformers-official-full-v3-20260605"
 OFFICIAL_VENV = f"{OFFICIAL_VENV_ROOT}/bin"
 
@@ -705,7 +706,7 @@ def build_env(mode: str, precision: str, cuda: str, expert_stats_path: Path, arg
             del env[key]
 
     env["PATH"] = f"{OFFICIAL_VENV}:" + env.get("PATH", "")
-    pythonpath = f"{OFFICIAL_SGLANG_PY}:{OFFICIAL_KT_LIB}:{OFFICIAL_KT_SRC}:{OFFICIAL_ROOT}"
+    pythonpath = f"{OFFICIAL_SGLANG_PY}:{OFFICIAL_KT_PY}:{OFFICIAL_KT_LIB}:{OFFICIAL_KT_SRC}:{OFFICIAL_ROOT}"
     env["PYTHONPATH"] = pythonpath
     return f"{OFFICIAL_VENV}/python3", env
 
@@ -808,6 +809,7 @@ def make_plan(args: argparse.Namespace, prompts: list[dict[str, str]]) -> list[d
                         "official_sglang_commit": OFFICIAL_SGLANG_COMMIT,
                         "official_checkout": OFFICIAL_ROOT,
                         "official_sglang_py": OFFICIAL_SGLANG_PY,
+                        "official_kt_py": OFFICIAL_KT_PY,
                         "official_kt_lib": OFFICIAL_KT_LIB,
                         "official_venv_root": OFFICIAL_VENV_ROOT,
                         "official_python": f"{OFFICIAL_VENV}/python3",
@@ -894,6 +896,7 @@ def write_run_record(run_dir: Path, entry: dict[str, Any]) -> None:
         f"- official_sglang_commit: {entry.get('official_sglang_commit')}",
         f"- official_checkout: {entry.get('official_checkout')}",
         f"- official_sglang_py: {entry.get('official_sglang_py')}",
+        f"- official_kt_py: {entry.get('official_kt_py')}",
         f"- official_kt_lib: {entry.get('official_kt_lib')}",
         f"- official_venv_root: {entry.get('official_venv_root')}",
         f"- official_python: {entry.get('official_python')}",
