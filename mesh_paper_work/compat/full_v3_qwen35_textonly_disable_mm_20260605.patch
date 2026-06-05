@@ -1,19 +1,22 @@
---- /tmp/full_v3_model_config.before_textonly_qwen35.py	2026-06-05 10:24:20.757409613 +0000
-+++ /mnt/data2/tmp/qujing_full_v3/ktransformers_raqiu_official_full_v3_clean_20260605/third_party/sglang/python/sglang/srt/configs/model_config.py	2026-06-05 10:24:22.757373340 +0000
-@@ -153,7 +153,17 @@
+--- /tmp/full_v3_model_config.before_textonly_qwen35_v2.py	2026-06-05 10:30:58.126175152 +0000
++++ /mnt/data2/tmp/qujing_full_v3/ktransformers_raqiu_official_full_v3_clean_20260605/third_party/sglang/python/sglang/srt/configs/model_config.py	2026-06-05 10:30:59.942141992 +0000
+@@ -153,7 +153,20 @@
                  "Llama4ForConditionalGeneration",
                  "Step3VLForConditionalGeneration",
              ]
 -            if self.hf_config.architectures[0] in mm_disabled_models:
-+            text_only_qwen35 = (
-+                self.hf_config.architectures[0]
-+                in (
-+                    "Qwen3_5ForConditionalGeneration",
-+                    "Qwen3_5MoeForConditionalGeneration",
-+                )
-+                and getattr(self.hf_config, "vision_config", None) is None
-+                and getattr(self.hf_config, "image_token_id", None) is None
-+                and getattr(self.hf_config, "video_token_id", None) is None
++            raw_config = {}
++            try:
++                with open(Path(self.model_path) / "config.json") as f:
++                    raw_config = json.load(f)
++            except Exception:
++                raw_config = {}
++            text_only_qwen35 = self.hf_config.architectures[0] in (
++                "Qwen3_5ForConditionalGeneration",
++                "Qwen3_5MoeForConditionalGeneration",
++            ) and not any(
++                raw_config.get(key) is not None
++                for key in ("vision_config", "image_token_id", "video_token_id")
 +            )
 +            if self.hf_config.architectures[0] in mm_disabled_models or text_only_qwen35:
                  enable_multimodal = False
