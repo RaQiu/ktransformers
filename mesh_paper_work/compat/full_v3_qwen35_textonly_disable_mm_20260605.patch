@@ -1,6 +1,6 @@
---- /tmp/full_v3_model_config.before_textonly_qwen35_v2.py	2026-06-05 10:30:58.126175152 +0000
-+++ /mnt/data2/tmp/qujing_full_v3/ktransformers_raqiu_official_full_v3_clean_20260605/third_party/sglang/python/sglang/srt/configs/model_config.py	2026-06-05 10:30:59.942141992 +0000
-@@ -153,7 +153,20 @@
+--- /tmp/full_v3_model_config.before_textonly_qwen35_v3.py	2026-06-05 10:37:31.842973305 +0000
++++ /mnt/data2/tmp/qujing_full_v3/ktransformers_raqiu_official_full_v3_clean_20260605/third_party/sglang/python/sglang/srt/configs/model_config.py	2026-06-05 10:37:33.538942241 +0000
+@@ -153,8 +153,26 @@
                  "Llama4ForConditionalGeneration",
                  "Step3VLForConditionalGeneration",
              ]
@@ -20,5 +20,11 @@
 +            )
 +            if self.hf_config.architectures[0] in mm_disabled_models or text_only_qwen35:
                  enable_multimodal = False
++                if text_only_qwen35:
++                    if self.hf_config.architectures[0] == "Qwen3_5MoeForConditionalGeneration":
++                        self.hf_config.architectures[0] = "Qwen3_5MoeForCausalLM"
++                    elif self.hf_config.architectures[0] == "Qwen3_5ForConditionalGeneration":
++                        self.hf_config.architectures[0] = "Qwen3_5ForCausalLM"
                  logger.info(
                      f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                 )
