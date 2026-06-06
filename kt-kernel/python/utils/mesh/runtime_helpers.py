@@ -949,91 +949,13 @@ def _mesh_before_submit_forward(self, qlen: int) -> None:
     self._maybe_mesh_transition_to_decode_cache(qlen)
 
 
-def _mesh_prefetch_previous_topk(self, topk_ids, qlen: int, cuda_stream=None) -> None:
-    if topk_ids is None or qlen != 1:
-        return
-
-    provider = getattr(self, "_provider", None)
-    if provider is not None:
-        provider_topk_ids = topk_ids
-        if torch.is_tensor(provider_topk_ids):
-            provider_topk_ids = provider_topk_ids.detach().cpu().numpy()
-        provider.prefetch_layer(self.layer_idx, provider_topk_ids)
-
-    if self.io_backend != "IOURING":
-        return
-    if not self._env_flag("KT_MESH_PREV_TOPK_PREFETCH", True):
-        return
-
-    if torch.is_tensor(topk_ids):
-        prev_ids_cpu = topk_ids.detach()
-        if prev_ids_cpu.device.type != "cpu":
-            prev_ids_cpu = prev_ids_cpu.cpu()
-        if prev_ids_cpu.dtype != torch.long:
-            prev_ids_cpu = prev_ids_cpu.to(torch.long)
-    else:
-        prev_ids_cpu = torch.as_tensor(topk_ids, dtype=torch.long, device="cpu")
-    prev_ids_cpu = prev_ids_cpu.reshape(-1).contiguous()
-    count = int(prev_ids_cpu.numel())
-    if count <= 0:
-        return
-
-    raw_limit = os.environ.get("KT_MESH_PREV_TOPK_PREFETCH_LIMIT")
-    if raw_limit is None:
-        max_to_submit = min(count, max(1, int(self.num_experts_per_tok)))
-    else:
-        max_to_submit = self._env_int("KT_MESH_PREV_TOPK_PREFETCH_LIMIT", 0)
-        if max_to_submit < 0:
-            return
-
-    # Keep the tensor backing the C++ task pointer alive even if a later
-    # deferred-prefetch submission updates _mesh_prefetch_ids_keepalive.
-    keepalive_ring = getattr(self, "_mesh_prev_topk_prefetch_keepalive_ring", None)
-    if keepalive_ring is None:
-        keepalive_ring = []
-        self._mesh_prev_topk_prefetch_keepalive_ring = keepalive_ring
-    keepalive_ring.append(prev_ids_cpu)
-    if len(keepalive_ring) > 8:
-        del keepalive_ring[:-8]
-    self._submit_iouring_prefetch(
-        prev_ids_cpu,
-        count,
-        max_to_submit=max_to_submit,
-        cuda_stream=cuda_stream,
-    )
-
-
-def _mesh_next_registered_layer_idx(self) -> Optional[int]:
-    wrappers = getattr(BaseMoEWrapper, "_wrappers_by_layer", {})
-    if not wrappers:
-        return None
-    current = int(self.layer_idx)
-    layer_indices = sorted(
-        int(layer_idx)
-        for layer_idx, wrapper in wrappers.items()
-        if wrapper is not None and getattr(wrapper, "moe", None) is not None
-    )
-    if not layer_indices:
-        return None
-    for layer_idx in layer_indices:
-        if layer_idx > current:
-            return layer_idx
-    return layer_indices[0]
-
-
-def _mesh_prefetch_next_layer_previous_topk(self, qlen: int, cuda_stream=None) -> None:
-    if qlen != 1:
-        return
-    next_layer_idx = self._mesh_next_registered_layer_idx()
-    if next_layer_idx is None:
-        return
-    next_wrapper = BaseMoEWrapper._wrappers_by_layer.get(next_layer_idx)
-    if next_wrapper is None or getattr(next_wrapper, "moe", None) is None:
-        return
-    prev_topk_ids = BaseMoEWrapper._prev_topk_ids_by_layer.get(next_layer_idx)
-    if prev_topk_ids is None:
-        return
-    next_wrapper._mesh_prefetch_previous_topk(prev_topk_ids, qlen, cuda_stream)
+def _mesh_prefetch_previous_topk(self) -> None:
+    # Intentionally disabled in the current MESH runtime. Wiring previous-token
+    # top-k into prefetch_experts_task turns a speculative hint into a heavy
+    # resident-cache promotion: it may evict cached experts and marks candidates
+    # as EXPERT_PREFETCHING, which state-defer still treats as non-ready.
+    # Re-enable only with a non-evicting speculative path.
+    return
 
 
 def _mesh_select_forward_experts(
@@ -1112,22 +1034,7 @@ def _mesh_after_sync_forward(
         self._flush_pending_full_gate_batch(cuda_stream)
 
     if topk_ids is not None:
-        prev_ids_cpu = topk_ids.detach()
-        if prev_ids_cpu.device.type != "cpu":
-            prev_ids_cpu = prev_ids_cpu.cpu()
-        if prev_ids_cpu.dtype != torch.long:
-            prev_ids_cpu = prev_ids_cpu.to(torch.long)
-        provider = getattr(self, "_provider", None)
-        if provider is not None:
-            record_activations = getattr(provider, "record_activations", None)
-            if record_activations is not None:
-                record_activations(self.layer_idx, prev_ids_cpu.numpy())
-        if int(flat_hidden_states.shape[0]) == 1:
-            prev_ids_cpu = prev_ids_cpu.contiguous()
-            BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = prev_ids_cpu
-            self._mesh_prefetch_next_layer_previous_topk(int(flat_hidden_states.shape[0]), cuda_stream)
-        else:
-            BaseMoEWrapper._prev_topk_ids_by_layer.pop(self.layer_idx, None)
+        BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = topk_ids.detach().cpu().numpy()
 
 
 def _mesh_submit_forward_impl(
@@ -1158,6 +1065,7 @@ def _mesh_submit_forward_impl(
     bsz_slot_tensor[0] = qlen
 
     topk_ids_long = topk_ids.to(torch.long)
+    self._mesh_prefetch_previous_topk()
     is_decode_token = qlen == 1 and BaseMoEWrapper._mesh_decode_transition_done
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
@@ -1609,8 +1517,6 @@ _INSTANCE_METHODS = (
     "_submit_mesh_noarg_task",
     "_mesh_before_submit_forward",
     "_mesh_prefetch_previous_topk",
-    "_mesh_next_registered_layer_idx",
-    "_mesh_prefetch_next_layer_previous_topk",
     "_mesh_select_forward_experts",
     "_mesh_prefetch_deferred_ids",
     "_mesh_after_sync_forward",
