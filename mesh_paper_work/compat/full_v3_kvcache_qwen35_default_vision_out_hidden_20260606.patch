@@ -1,0 +1,25 @@
+--- /mnt/data3/work/full_v3_kvcache_model_config.before_qwen35_default_vision_20260606.py	2026-06-06 02:06:24.921656493 +0000
++++ /mnt/data2/tmp/qujing_full_v3/ktransformers_kvcache_official_clean_20260606/third_party/sglang/python/sglang/srt/configs/model_config.py	2026-06-06 02:06:24.921656493 +0000
+@@ -161,6 +161,22 @@
+             else:
+                 enable_multimodal = True
+ 
++        raw_config = {}
++        try:
++            with open(Path(self.model_path) / "config.json") as f:
++                raw_config = json.load(f)
++        except Exception:
++            raw_config = {}
++        qwen35_default_vision_config = self.hf_config.architectures[0] in (
++            "Qwen3_5ForConditionalGeneration",
++            "Qwen3_5MoeForConditionalGeneration",
++        ) and raw_config.get("vision_config") is None
++        if qwen35_default_vision_config:
++            vision_config = getattr(self.hf_config, "vision_config", None)
++            text_hidden_size = getattr(self.hf_text_config, "hidden_size", None)
++            if vision_config is not None and text_hidden_size is not None:
++                vision_config.out_hidden_size = text_hidden_size
++
+         # Config draft model
+         self._config_draft_model()
+ 
