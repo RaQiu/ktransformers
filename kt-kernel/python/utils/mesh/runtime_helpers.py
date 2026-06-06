@@ -949,8 +949,59 @@ def _mesh_before_submit_forward(self, qlen: int) -> None:
     self._maybe_mesh_transition_to_decode_cache(qlen)
 
 
-def _mesh_prefetch_previous_topk(self) -> None:
-    return
+def _mesh_prefetch_previous_topk(self, qlen: int, cuda_stream=None) -> None:
+    prev_topk_ids = BaseMoEWrapper._prev_topk_ids_by_layer.get(self.layer_idx)
+    if prev_topk_ids is None:
+        return
+
+    provider = getattr(self, "_provider", None)
+    if provider is not None:
+        provider_topk_ids = prev_topk_ids
+        if torch.is_tensor(provider_topk_ids):
+            provider_topk_ids = provider_topk_ids.detach().cpu().numpy()
+        provider.prefetch_layer(self.layer_idx, provider_topk_ids)
+
+    if self.io_backend != "IOURING" or qlen != 1:
+        return
+    if not self._env_flag("KT_MESH_PREV_TOPK_PREFETCH", True):
+        return
+
+    if torch.is_tensor(prev_topk_ids):
+        prev_ids_cpu = prev_topk_ids.detach()
+        if prev_ids_cpu.device.type != "cpu":
+            prev_ids_cpu = prev_ids_cpu.cpu()
+        if prev_ids_cpu.dtype != torch.long:
+            prev_ids_cpu = prev_ids_cpu.to(torch.long)
+    else:
+        prev_ids_cpu = torch.as_tensor(prev_topk_ids, dtype=torch.long, device="cpu")
+    prev_ids_cpu = prev_ids_cpu.reshape(-1).contiguous()
+    count = int(prev_ids_cpu.numel())
+    if count <= 0:
+        return
+
+    raw_limit = os.environ.get("KT_MESH_PREV_TOPK_PREFETCH_LIMIT")
+    if raw_limit is None:
+        max_to_submit = min(count, max(1, int(self.num_experts_per_tok)))
+    else:
+        max_to_submit = self._env_int("KT_MESH_PREV_TOPK_PREFETCH_LIMIT", 0)
+        if max_to_submit < 0:
+            return
+
+    # Keep the tensor backing the C++ task pointer alive even if a later
+    # deferred-prefetch submission updates _mesh_prefetch_ids_keepalive.
+    keepalive_ring = getattr(self, "_mesh_prev_topk_prefetch_keepalive_ring", None)
+    if keepalive_ring is None:
+        keepalive_ring = []
+        self._mesh_prev_topk_prefetch_keepalive_ring = keepalive_ring
+    keepalive_ring.append(prev_ids_cpu)
+    if len(keepalive_ring) > 8:
+        del keepalive_ring[:-8]
+    self._submit_iouring_prefetch(
+        prev_ids_cpu,
+        count,
+        max_to_submit=max_to_submit,
+        cuda_stream=cuda_stream,
+    )
 
 
 def _mesh_select_forward_experts(
@@ -1029,7 +1080,20 @@ def _mesh_after_sync_forward(
         self._flush_pending_full_gate_batch(cuda_stream)
 
     if topk_ids is not None:
-        BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = topk_ids.detach().cpu().numpy()
+        prev_ids_cpu = topk_ids.detach()
+        if prev_ids_cpu.device.type != "cpu":
+            prev_ids_cpu = prev_ids_cpu.cpu()
+        if prev_ids_cpu.dtype != torch.long:
+            prev_ids_cpu = prev_ids_cpu.to(torch.long)
+        provider = getattr(self, "_provider", None)
+        if provider is not None:
+            record_activations = getattr(provider, "record_activations", None)
+            if record_activations is not None:
+                record_activations(self.layer_idx, prev_ids_cpu.numpy())
+        if int(flat_hidden_states.shape[0]) == 1:
+            BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = prev_ids_cpu.contiguous()
+        else:
+            BaseMoEWrapper._prev_topk_ids_by_layer.pop(self.layer_idx, None)
 
 
 def _mesh_submit_forward_impl(
@@ -1060,7 +1124,7 @@ def _mesh_submit_forward_impl(
     bsz_slot_tensor[0] = qlen
 
     topk_ids_long = topk_ids.to(torch.long)
-    self._mesh_prefetch_previous_topk()
+    self._mesh_prefetch_previous_topk(qlen, cuda_stream)
     is_decode_token = qlen == 1 and BaseMoEWrapper._mesh_decode_transition_done
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
