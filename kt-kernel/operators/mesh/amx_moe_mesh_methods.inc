@@ -683,7 +683,22 @@
     return static_cast<int>(value);
   }
 
+  bool mesh_env_flag(const char* name, bool fallback) const {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') return fallback;
+    return !(raw[0] == '0' ||
+             std::strcmp(raw, "false") == 0 ||
+             std::strcmp(raw, "False") == 0 ||
+             std::strcmp(raw, "FALSE") == 0 ||
+             std::strcmp(raw, "no") == 0 ||
+             std::strcmp(raw, "No") == 0 ||
+             std::strcmp(raw, "NO") == 0);
+  }
+
   void maybe_transition_decode_cache_for_forward(int qlen) {
+    if (!mesh_env_flag("KT_MESH_DECODE_TRANSITION_IN_FORWARD", false)) {
+      return;
+    }
     if (qlen != 1 || !config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() ||
         mesh_slot_mode_ != MESH_SLOT_PREFILL_LAYER) {
       return;

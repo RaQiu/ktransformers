@@ -93,7 +93,7 @@ class TP_MOE_Common : public MoE_Interface {
       int current_offset = 0;
       for (auto i = 0; i < tp_count; i++) {
         tps.push_back(nullptr);
-        GeneralMOEConfig tp_config = config;
+        GeneralMOEConfig tp_config = this->config;
 
         // First extra_blocks TPs get one more block
         int num_blocks_for_this_tp = base_blocks + (i < extra_blocks ? 1 : 0);
@@ -119,7 +119,7 @@ class TP_MOE_Common : public MoE_Interface {
 
       for (auto i = 0; i < tp_count; i++) {
         tps.push_back(nullptr);
-        GeneralMOEConfig tp_config = config;
+        GeneralMOEConfig tp_config = this->config;
         tp_config.intermediate_size /= tp_count;
         if (this->config.io_backend == IOBackend::IOURING) {
           mesh::assign_tp_async_reader(this->config, tp_config, i);

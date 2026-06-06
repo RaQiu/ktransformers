@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -192,6 +193,14 @@ struct ExpertCacheStats {
         dump_every = static_cast<uint64_t>(parsed);
       }
     }
+    if (layer == 0) {
+      std::fprintf(stderr,
+                   "[KTCacheStats] configured layer=%d experts=%d path=%s dump_every=%llu\n",
+                   layer,
+                   n,
+                   dump_path.empty() ? "<none>" : dump_path.c_str(),
+                   static_cast<unsigned long long>(dump_every));
+    }
     expert_access_count = std::make_unique<std::atomic<uint64_t>[]>(n);
     expert_hit_count = std::make_unique<std::atomic<uint64_t>[]>(n);
     expert_miss_count = std::make_unique<std::atomic<uint64_t>[]>(n);
@@ -296,7 +305,13 @@ struct ExpertCacheStats {
     static std::mutex dump_mu;
     std::lock_guard<std::mutex> dump_guard(dump_mu);
     std::ofstream out(dump_path, std::ios::app);
-    if (!out.good()) return;
+    if (!out.good()) {
+      static std::atomic<bool> warned_open_failure{false};
+      if (!warned_open_failure.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[KTCacheStats] failed to open stats path: %s\n", dump_path.c_str());
+      }
+      return;
+    }
 
     auto append_counter_array = [&](const char* name, const std::unique_ptr<std::atomic<uint64_t>[]>& counters) {
       out << ",\"" << name << "\":[";
