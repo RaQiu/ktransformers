@@ -196,6 +196,9 @@
                                                        up_weight_bytes_,
                                                        down_full_bytes,
                                                        &read_batch);
+    for (auto& request : read_batch) {
+      request.priority = ktransformers::AsyncExpertReader::ReadPriority::Demand;
+    }
 
     record_iouring_read_stats(read_batch);
     std::vector<uint64_t> request_ids = config_.async_reader->submit_reads(read_batch);

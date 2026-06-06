@@ -81,7 +81,9 @@ void log_read_status(const char* tag,
 }  // namespace
 
 AsyncExpertReader::AsyncExpertReader(int queue_depth)
-    : queue_depth_(queue_depth), next_user_data_(1), max_read_retries_(configured_max_read_retries()) {
+    : queue_depth_(queue_depth),
+      next_user_data_(1),
+      max_read_retries_(configured_max_read_retries()) {
 #ifdef HAVE_LIBURING
     int ret = io_uring_queue_init(queue_depth_, &ring_, 0);
     if (ret < 0) {
@@ -104,7 +106,12 @@ AsyncExpertReader::~AsyncExpertReader() {
 #endif
 }
 
-uint64_t AsyncExpertReader::submit_read(int fd, void* buf, size_t size, off_t offset, int expert_id) {
+uint64_t AsyncExpertReader::submit_read(int fd,
+                                        void* buf,
+                                        size_t size,
+                                        off_t offset,
+                                        int expert_id,
+                                        ReadPriority priority) {
 #ifdef HAVE_LIBURING
     uint64_t user_data = next_user_data_.fetch_add(1, std::memory_order_acq_rel);
 
@@ -122,7 +129,8 @@ uint64_t AsyncExpertReader::submit_read(int fd, void* buf, size_t size, off_t of
     }
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-        pending_jobs_.push_back(ReadJob{user_data, request});
+        const uint64_t sequence = next_queue_sequence_.fetch_add(1, std::memory_order_acq_rel);
+        pending_jobs_.push(ReadJob{user_data, request, priority, sequence});
     }
     queue_cv_.notify_one();
 
@@ -167,7 +175,7 @@ std::vector<uint64_t> AsyncExpertReader::submit_reads(const std::vector<ReadRequ
             request->result.store(0, std::memory_order_release);
             requests_[user_data] = request;
             request_ids.push_back(user_data);
-            jobs.push_back(ReadJob{user_data, std::move(request)});
+            jobs.push_back(ReadJob{user_data, std::move(request), req.priority, 0});
         }
     }
     const auto bookkeeping_end = std::chrono::steady_clock::now();
@@ -182,7 +190,10 @@ std::vector<uint64_t> AsyncExpertReader::submit_reads(const std::vector<ReadRequ
         if (stats != nullptr) {
             stats->lock_wait_us += elapsed_us(lock_start, lock_end);
         }
-        pending_jobs_.insert(pending_jobs_.end(), jobs.begin(), jobs.end());
+        for (auto& job : jobs) {
+            job.sequence = next_queue_sequence_.fetch_add(1, std::memory_order_acq_rel);
+            pending_jobs_.push(std::move(job));
+        }
     }
     queue_cv_.notify_one();
     if (stats != nullptr) {
@@ -696,10 +707,13 @@ unsigned AsyncExpertReader::process_completions_batch(unsigned max_count) {
 }
 
 void AsyncExpertReader::fail_queued_jobs() {
-    std::deque<ReadJob> jobs;
+    std::vector<ReadJob> jobs;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        jobs.swap(pending_jobs_);
+        while (!pending_jobs_.empty()) {
+            jobs.push_back(pending_jobs_.top());
+            pending_jobs_.pop();
+        }
     }
     for (auto& job : jobs) {
         complete_request(job.request_id, job.request, false, -ECANCELED);
@@ -708,7 +722,7 @@ void AsyncExpertReader::fail_queued_jobs() {
 
 void AsyncExpertReader::io_thread_main() {
     while (true) {
-        std::deque<ReadJob> jobs;
+        std::vector<ReadJob> jobs;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             if (pending_jobs_.empty() && inflight_count_.load(std::memory_order_acquire) == 0 &&
@@ -717,7 +731,12 @@ void AsyncExpertReader::io_thread_main() {
                     return stop_requested_.load(std::memory_order_acquire) || !pending_jobs_.empty();
                 });
             }
-            jobs.swap(pending_jobs_);
+            constexpr size_t kMaxJobsPerQueueDrain = 32;
+            jobs.reserve(kMaxJobsPerQueueDrain);
+            while (!pending_jobs_.empty() && jobs.size() < kMaxJobsPerQueueDrain) {
+                jobs.push_back(pending_jobs_.top());
+                pending_jobs_.pop();
+            }
         }
 
         if (!jobs.empty()) {
@@ -729,7 +748,7 @@ void AsyncExpertReader::io_thread_main() {
                     complete_request(job.request_id, job.request, false, -EBUSY);
                     submit_ok = false;
                     continue;
-                }
+            }
                 submitted_jobs.push_back(job);
             }
             if (!flush_submissions()) {

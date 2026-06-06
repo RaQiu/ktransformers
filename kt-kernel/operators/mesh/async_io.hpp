@@ -16,6 +16,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <sys/types.h>
 #include <thread>
@@ -40,6 +41,11 @@ namespace ktransformers {
  */
 class AsyncExpertReader {
 public:
+    enum class ReadPriority : int {
+        Prefetch = 1,
+        Demand = 10,
+    };
+
     struct ReadRequest {
         int expert_id;
         int fd;
@@ -47,6 +53,7 @@ public:
         size_t size;
         off_t offset;
         uint64_t user_data;  // For completion matching
+        ReadPriority priority = ReadPriority::Prefetch;
     };
 
     struct SubmitStats {
@@ -80,7 +87,12 @@ public:
      * @param expert_id Expert ID for tracking
      * @return Request ID for later querying
      */
-    uint64_t submit_read(int fd, void* buf, size_t size, off_t offset, int expert_id);
+    uint64_t submit_read(int fd,
+                         void* buf,
+                         size_t size,
+                         off_t offset,
+                         int expert_id,
+                         ReadPriority priority = ReadPriority::Prefetch);
 
     /**
      * @brief Submit multiple async read requests with one batched ring flush.
@@ -178,6 +190,19 @@ private:
     struct ReadJob {
         uint64_t request_id = 0;
         std::shared_ptr<RequestInfo> request;
+        ReadPriority priority = ReadPriority::Prefetch;
+        uint64_t sequence = 0;
+    };
+
+    struct ReadJobCompare {
+        bool operator()(const ReadJob& lhs, const ReadJob& rhs) const {
+            const int lhs_priority = static_cast<int>(lhs.priority);
+            const int rhs_priority = static_cast<int>(rhs.priority);
+            if (lhs_priority != rhs_priority) {
+                return lhs_priority < rhs_priority;
+            }
+            return lhs.sequence > rhs.sequence;
+        }
     };
 
     struct CompletionEvent {
@@ -194,7 +219,7 @@ private:
     std::unordered_set<int> completed_experts_;  // Track completed expert IDs
     mutable std::mutex request_map_mutex_;
 
-    std::deque<ReadJob> pending_jobs_;
+    std::priority_queue<ReadJob, std::vector<ReadJob>, ReadJobCompare> pending_jobs_;
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
 
@@ -211,6 +236,7 @@ private:
     std::thread io_thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<int> inflight_count_{0};
+    std::atomic<uint64_t> next_queue_sequence_{0};
 
     std::shared_ptr<RequestInfo> get_request(uint64_t request_id) const;
     void io_thread_main();

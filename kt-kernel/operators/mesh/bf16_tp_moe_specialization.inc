@@ -131,7 +131,8 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE_Common<AMX_BF16_MOE_TP<K>> {
           static_cast<char*>(blob_raw) + cursor,
           read_bytes,
           layout.offset + static_cast<off_t>(cursor),
-          0});
+          0,
+          ktransformers::AsyncExpertReader::ReadPriority::Demand});
       cursor += read_bytes;
     }
   }

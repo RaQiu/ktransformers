@@ -968,7 +968,13 @@
     mesh::record_iouring_read_stats(config_.cache_stats, config_.enable_cache_stats, read_batch);
   }
 
-  std::vector<uint64_t> submit_iouring_reads_for_expert(int expert_id, void* gate_owner, void* up_owner, void* down_owner) {
+  std::vector<uint64_t> submit_iouring_reads_for_expert(
+      int expert_id,
+      void* gate_owner,
+      void* up_owner,
+      void* down_owner,
+      ktransformers::AsyncExpertReader::ReadPriority priority =
+          ktransformers::AsyncExpertReader::ReadPriority::Demand) {
     if (config_.async_reader == nullptr) {
       return {};
     }
@@ -976,6 +982,9 @@
     std::vector<ktransformers::AsyncExpertReader::ReadRequest> read_batch;
     read_batch.reserve(scale_cache_loaded_ ? 6 : 9);
     append_iouring_read_requests_for_expert(expert_id, gate_owner, up_owner, down_owner, &read_batch);
+    for (auto& request : read_batch) {
+      request.priority = priority;
+    }
     std::vector<uint64_t> read_requests = config_.async_reader->submit_reads(read_batch);
     record_iouring_read_stats(read_batch);
     return read_requests;
@@ -2227,7 +2236,12 @@
     void* down_owner = slot_down_owner_[slot];
 
     try {
-      std::vector<uint64_t> requests = submit_iouring_reads_for_expert(expert_id, gate_owner, up_owner, down_owner);
+      std::vector<uint64_t> requests = submit_iouring_reads_for_expert(
+          expert_id,
+          gate_owner,
+          up_owner,
+          down_owner,
+          ktransformers::AsyncExpertReader::ReadPriority::Prefetch);
       if (requests.empty()) {
         (void)unbind_slot(slot, true, false);
         release_empty_slot_buffers_if_any(slot);
