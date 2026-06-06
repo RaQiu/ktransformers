@@ -949,31 +949,30 @@ def _mesh_before_submit_forward(self, qlen: int) -> None:
     self._maybe_mesh_transition_to_decode_cache(qlen)
 
 
-def _mesh_prefetch_previous_topk(self, qlen: int, cuda_stream=None) -> None:
-    prev_topk_ids = BaseMoEWrapper._prev_topk_ids_by_layer.get(self.layer_idx)
-    if prev_topk_ids is None:
+def _mesh_prefetch_previous_topk(self, topk_ids, qlen: int, cuda_stream=None) -> None:
+    if topk_ids is None or qlen != 1:
         return
 
     provider = getattr(self, "_provider", None)
     if provider is not None:
-        provider_topk_ids = prev_topk_ids
+        provider_topk_ids = topk_ids
         if torch.is_tensor(provider_topk_ids):
             provider_topk_ids = provider_topk_ids.detach().cpu().numpy()
         provider.prefetch_layer(self.layer_idx, provider_topk_ids)
 
-    if self.io_backend != "IOURING" or qlen != 1:
+    if self.io_backend != "IOURING":
         return
     if not self._env_flag("KT_MESH_PREV_TOPK_PREFETCH", True):
         return
 
-    if torch.is_tensor(prev_topk_ids):
-        prev_ids_cpu = prev_topk_ids.detach()
+    if torch.is_tensor(topk_ids):
+        prev_ids_cpu = topk_ids.detach()
         if prev_ids_cpu.device.type != "cpu":
             prev_ids_cpu = prev_ids_cpu.cpu()
         if prev_ids_cpu.dtype != torch.long:
             prev_ids_cpu = prev_ids_cpu.to(torch.long)
     else:
-        prev_ids_cpu = torch.as_tensor(prev_topk_ids, dtype=torch.long, device="cpu")
+        prev_ids_cpu = torch.as_tensor(topk_ids, dtype=torch.long, device="cpu")
     prev_ids_cpu = prev_ids_cpu.reshape(-1).contiguous()
     count = int(prev_ids_cpu.numel())
     if count <= 0:
@@ -1002,6 +1001,39 @@ def _mesh_prefetch_previous_topk(self, qlen: int, cuda_stream=None) -> None:
         max_to_submit=max_to_submit,
         cuda_stream=cuda_stream,
     )
+
+
+def _mesh_next_registered_layer_idx(self) -> Optional[int]:
+    wrappers = getattr(BaseMoEWrapper, "_wrappers_by_layer", {})
+    if not wrappers:
+        return None
+    current = int(self.layer_idx)
+    layer_indices = sorted(
+        int(layer_idx)
+        for layer_idx, wrapper in wrappers.items()
+        if wrapper is not None and getattr(wrapper, "moe", None) is not None
+    )
+    if not layer_indices:
+        return None
+    for layer_idx in layer_indices:
+        if layer_idx > current:
+            return layer_idx
+    return layer_indices[0]
+
+
+def _mesh_prefetch_next_layer_previous_topk(self, qlen: int, cuda_stream=None) -> None:
+    if qlen != 1:
+        return
+    next_layer_idx = self._mesh_next_registered_layer_idx()
+    if next_layer_idx is None:
+        return
+    next_wrapper = BaseMoEWrapper._wrappers_by_layer.get(next_layer_idx)
+    if next_wrapper is None or getattr(next_wrapper, "moe", None) is None:
+        return
+    prev_topk_ids = BaseMoEWrapper._prev_topk_ids_by_layer.get(next_layer_idx)
+    if prev_topk_ids is None:
+        return
+    next_wrapper._mesh_prefetch_previous_topk(prev_topk_ids, qlen, cuda_stream)
 
 
 def _mesh_select_forward_experts(
@@ -1091,7 +1123,9 @@ def _mesh_after_sync_forward(
             if record_activations is not None:
                 record_activations(self.layer_idx, prev_ids_cpu.numpy())
         if int(flat_hidden_states.shape[0]) == 1:
-            BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = prev_ids_cpu.contiguous()
+            prev_ids_cpu = prev_ids_cpu.contiguous()
+            BaseMoEWrapper._prev_topk_ids_by_layer[self.layer_idx] = prev_ids_cpu
+            self._mesh_prefetch_next_layer_previous_topk(int(flat_hidden_states.shape[0]), cuda_stream)
         else:
             BaseMoEWrapper._prev_topk_ids_by_layer.pop(self.layer_idx, None)
 
@@ -1124,7 +1158,6 @@ def _mesh_submit_forward_impl(
     bsz_slot_tensor[0] = qlen
 
     topk_ids_long = topk_ids.to(torch.long)
-    self._mesh_prefetch_previous_topk(qlen, cuda_stream)
     is_decode_token = qlen == 1 and BaseMoEWrapper._mesh_decode_transition_done
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
@@ -1576,6 +1609,8 @@ _INSTANCE_METHODS = (
     "_submit_mesh_noarg_task",
     "_mesh_before_submit_forward",
     "_mesh_prefetch_previous_topk",
+    "_mesh_next_registered_layer_idx",
+    "_mesh_prefetch_next_layer_previous_topk",
     "_mesh_select_forward_experts",
     "_mesh_prefetch_deferred_ids",
     "_mesh_after_sync_forward",
