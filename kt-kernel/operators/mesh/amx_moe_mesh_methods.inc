@@ -151,14 +151,7 @@
       pending_prefetches_[expert_id].task_id = 0;
       free_packed_expert(expert_id);
     }
-    {
-      std::lock_guard<std::mutex> guard(expert_load_mu_);
-      expert_load_tasks_.clear();
-      active_task_by_expert_.assign(config_.expert_num, 0);
-      expert_load_queue_ = decltype(expert_load_queue_){};
-      queued_warmfill_tasks_.clear();
-      coldstart_warmfill_submitted_ = false;
-    }
+    expert_load_scheduler_.clear_keep_capacity(config_.expert_num);
     (void)release_resident_slot_pool(false);
     release_iouring_scale_cache();
   }
@@ -173,14 +166,7 @@
     packed_up_owner_.assign(en, nullptr);
     packed_down_owner_.assign(en, nullptr);
     pending_prefetches_.assign(en, PendingPrefetch{});
-    expert_load_tasks_.clear();
-    active_task_by_expert_.assign(en, 0);
-    expert_load_queue_ = decltype(expert_load_queue_){};
-    queued_warmfill_tasks_.clear();
-    next_expert_load_task_id_ = 1;
-    next_expert_load_sequence_ = 1;
-    coldstart_warmfill_epoch_ = 0;
-    coldstart_warmfill_submitted_ = false;
+    expert_load_scheduler_.reset(en);
     expert_states_ = std::make_unique<std::atomic<uint8_t>[]>(en);
     active_readers_ = std::make_unique<std::atomic<uint32_t>[]>(en);
     resident_expert_count_.store(0, std::memory_order_relaxed);
@@ -1008,7 +994,7 @@
   }
 
   static constexpr int64_t background_schedule_key() {
-    return std::numeric_limits<int64_t>::max();
+    return mesh::ExpertLoadScheduler::background_schedule_key();
   }
 
   int background_slot_limit() const {
@@ -1054,94 +1040,34 @@
                                     ExpertLoadSource source,
                                     const std::vector<uint8_t>* protected_mask,
                                     uint64_t warmfill_epoch = 0) {
-    std::lock_guard<std::mutex> guard(expert_load_mu_);
-    if (expert_id < 0 || expert_id >= static_cast<int>(active_task_by_expert_.size())) return 0;
-    const uint64_t existing_id = active_task_by_expert_[expert_id];
-    if (existing_id != 0) {
-      auto it = expert_load_tasks_.find(existing_id);
-      if (it != expert_load_tasks_.end()) {
-        ExpertLoadTask& task = it->second;
-        if (task.state == ExpertLoadState::Queued) {
-          if (schedule_key < task.schedule_key || task.source == ExpertLoadSource::ColdStartWarmFill) {
-            if (task.source == ExpertLoadSource::ColdStartWarmFill && source == ExpertLoadSource::DeferredTopK) {
-              if (auto* stats = mesh::enabled_cache_stats(config_)) {
-                stats->defer_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
-              }
-            }
-            task.schedule_key = schedule_key;
-            task.source = source;
-            task.warmfill_epoch = warmfill_epoch;
-            task.queue_generation += 1;
-            if (protected_mask != nullptr) {
-              task.protected_mask = *protected_mask;
-            }
-            expert_load_queue_.push(ExpertLoadQueueEntry{
-                task.schedule_key, task.sequence, task.queue_generation, task.task_id});
-          }
-          return existing_id;
-        }
-        if (task.state == ExpertLoadState::Submitting || task.state == ExpertLoadState::Submitted) {
-          return existing_id;
-        }
+    const mesh::ExpertTaskEnqueueResult result =
+        expert_load_scheduler_.enqueue(expert_id, schedule_key, source, protected_mask, warmfill_epoch);
+    if (result.joined_warmfill_as_deferred) {
+      if (auto* stats = mesh::enabled_cache_stats(config_)) {
+        stats->defer_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
       }
-      active_task_by_expert_[expert_id] = 0;
     }
-
-    const uint64_t task_id = next_expert_load_task_id_++;
-    ExpertLoadTask task;
-    task.task_id = task_id;
-    task.expert_id = expert_id;
-    task.schedule_key = schedule_key;
-    task.source = source;
-    task.state = ExpertLoadState::Queued;
-    task.queue_generation = 1;
-    task.sequence = next_expert_load_sequence_++;
-    task.warmfill_epoch = warmfill_epoch;
-    if (protected_mask != nullptr) {
-      task.protected_mask = *protected_mask;
+    if (result.created) {
+      record_task_source_queued(source);
     }
-    expert_load_tasks_[task_id] = std::move(task);
-    active_task_by_expert_[expert_id] = task_id;
-    expert_load_queue_.push(ExpertLoadQueueEntry{schedule_key, expert_load_tasks_[task_id].sequence, 1, task_id});
-    if (source == ExpertLoadSource::ColdStartWarmFill) {
-      queued_warmfill_tasks_.push_back(task_id);
-    }
-    record_task_source_queued(source);
-    return task_id;
+    return result.task_id;
   }
 
   void cancel_queued_warmfill_epoch(uint64_t epoch) {
-    std::lock_guard<std::mutex> guard(expert_load_mu_);
-    uint64_t canceled = 0;
-    for (uint64_t task_id : queued_warmfill_tasks_) {
-      auto it = expert_load_tasks_.find(task_id);
-      if (it == expert_load_tasks_.end()) continue;
-      ExpertLoadTask& task = it->second;
-      if (task.source != ExpertLoadSource::ColdStartWarmFill ||
-          task.warmfill_epoch != epoch ||
-          task.state != ExpertLoadState::Queued) {
-        continue;
+    const mesh::ExpertTaskCancelResult result = expert_load_scheduler_.cancel_queued_warmfill_epoch(epoch);
+    for (int expert_id : result.expert_ids) {
+      if (expert_id >= 0 && expert_id < static_cast<int>(pending_prefetches_.size())) {
+        pending_prefetches_[expert_id].task_id = 0;
+        pending_prefetches_[expert_id].slot_index = -1;
+        pending_prefetches_[expert_id].requests.clear();
       }
-      task.state = ExpertLoadState::Canceled;
-      task.queue_generation += 1;
-      if (task.expert_id >= 0 && task.expert_id < static_cast<int>(active_task_by_expert_.size()) &&
-          active_task_by_expert_[task.expert_id] == task_id) {
-        active_task_by_expert_[task.expert_id] = 0;
+      if (expert_id >= 0 && expert_id < config_.expert_num) {
+        expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
       }
-      if (task.expert_id >= 0 && task.expert_id < static_cast<int>(pending_prefetches_.size()) &&
-          pending_prefetches_[task.expert_id].task_id == task_id) {
-        pending_prefetches_[task.expert_id].task_id = 0;
-        pending_prefetches_[task.expert_id].slot_index = -1;
-        pending_prefetches_[task.expert_id].requests.clear();
-      }
-      if (task.expert_id >= 0 && task.expert_id < config_.expert_num) {
-        expert_states_[task.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
-      }
-      canceled += 1;
     }
-    if (canceled > 0) {
+    if (result.canceled > 0) {
       if (auto* stats = mesh::enabled_cache_stats(config_)) {
-        stats->coldstart_warmfill_cancel_count.fetch_add(canceled, std::memory_order_relaxed);
+        stats->coldstart_warmfill_cancel_count.fetch_add(result.canceled, std::memory_order_relaxed);
       }
     }
   }
@@ -1150,69 +1076,34 @@
     if (expert_id < 0 || expert_id >= static_cast<int>(pending_prefetches_.size())) return;
     const uint64_t task_id = pending_prefetches_[expert_id].task_id;
     if (task_id == 0) return;
-    std::lock_guard<std::mutex> guard(expert_load_mu_);
-    auto it = expert_load_tasks_.find(task_id);
-    if (it == expert_load_tasks_.end()) return;
-    ExpertLoadTask& task = it->second;
-    if (task.state != ExpertLoadState::Queued) return;
-    if (task.source == ExpertLoadSource::ColdStartWarmFill) {
+    const mesh::ExpertTaskPromoteResult result = expert_load_scheduler_.promote_pending_for_demand(task_id);
+    if (result.joined_warmfill) {
       if (auto* stats = mesh::enabled_cache_stats(config_)) {
         stats->demand_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    task.schedule_key = 0;
-    task.source = ExpertLoadSource::Demand;
-    task.queue_generation += 1;
-    expert_load_queue_.push(ExpertLoadQueueEntry{task.schedule_key, task.sequence, task.queue_generation, task.task_id});
   }
 
   bool promote_queued_task_for_deferred(int expert_id,
                                         int64_t schedule_key,
                                         const std::vector<uint8_t>* protected_mask) {
-    if (expert_id < 0 || expert_id >= static_cast<int>(active_task_by_expert_.size())) return false;
-    std::lock_guard<std::mutex> guard(expert_load_mu_);
-    const uint64_t task_id = active_task_by_expert_[expert_id];
-    if (task_id == 0) return false;
-    auto it = expert_load_tasks_.find(task_id);
-    if (it == expert_load_tasks_.end()) return false;
-    ExpertLoadTask& task = it->second;
-    if (task.state != ExpertLoadState::Queued) return false;
-    if (schedule_key >= task.schedule_key && task.source != ExpertLoadSource::ColdStartWarmFill) {
-      return true;
-    }
-    const bool was_warmfill = task.source == ExpertLoadSource::ColdStartWarmFill;
-    if (was_warmfill) {
+    const mesh::ExpertTaskPromoteResult result =
+        expert_load_scheduler_.promote_queued_for_deferred(expert_id, schedule_key, protected_mask);
+    if (result.joined_warmfill) {
       if (auto* stats = mesh::enabled_cache_stats(config_)) {
         stats->defer_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    task.schedule_key = schedule_key;
-    task.source = ExpertLoadSource::DeferredTopK;
-    task.warmfill_epoch = 0;
-    task.queue_generation += 1;
-    if (protected_mask != nullptr) {
-      task.protected_mask = *protected_mask;
-    }
-    expert_load_queue_.push(ExpertLoadQueueEntry{task.schedule_key, task.sequence, task.queue_generation, task.task_id});
-    if (was_warmfill) {
+    if (result.counted_deferred_cold) {
       if (auto* stats = mesh::enabled_cache_stats(config_)) {
         stats->defer_cold_load_count.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    return true;
+    return result.promoted;
   }
 
   void fail_expert_load_task(uint64_t task_id, int expert_id, ExpertLoadState state) {
-    std::lock_guard<std::mutex> guard(expert_load_mu_);
-    auto it = expert_load_tasks_.find(task_id);
-    if (it != expert_load_tasks_.end()) {
-      it->second.state = state;
-      it->second.queue_generation += 1;
-    }
-    if (expert_id >= 0 && expert_id < static_cast<int>(active_task_by_expert_.size()) &&
-        active_task_by_expert_[expert_id] == task_id) {
-      active_task_by_expert_[expert_id] = 0;
-    }
+    expert_load_scheduler_.fail_task(task_id, expert_id, state);
     if (expert_id >= 0 && expert_id < static_cast<int>(pending_prefetches_.size()) &&
         pending_prefetches_[expert_id].task_id == task_id) {
       pending_prefetches_[expert_id].task_id = 0;
@@ -1222,42 +1113,12 @@
   }
 
   uint64_t pop_next_expert_load_task(bool allow_background) {
-    std::lock_guard<std::mutex> guard(expert_load_mu_);
-    while (!expert_load_queue_.empty()) {
-      const ExpertLoadQueueEntry entry = expert_load_queue_.top();
-      auto it = expert_load_tasks_.find(entry.task_id);
-      if (it == expert_load_tasks_.end()) {
-        expert_load_queue_.pop();
-        continue;
-      }
-      ExpertLoadTask& task = it->second;
-      if (task.state != ExpertLoadState::Queued ||
-          task.queue_generation != entry.queue_generation ||
-          task.schedule_key != entry.schedule_key) {
-        expert_load_queue_.pop();
-        continue;
-      }
-      if (task.schedule_key == background_schedule_key()) {
-        if (!allow_background) return 0;
-        if (background_capacity_reached()) {
-          return 0;
-        }
-      }
-      expert_load_queue_.pop();
-      task.state = ExpertLoadState::Submitting;
-      return task.task_id;
-    }
-    return 0;
+    return expert_load_scheduler_.pop_next(allow_background, background_capacity_reached());
   }
 
   bool submit_expert_load_task(uint64_t task_id) {
     ExpertLoadTask task_snapshot;
-    {
-      std::lock_guard<std::mutex> guard(expert_load_mu_);
-      auto it = expert_load_tasks_.find(task_id);
-      if (it == expert_load_tasks_.end()) return false;
-      task_snapshot = it->second;
-    }
+    if (!expert_load_scheduler_.snapshot(task_id, &task_snapshot)) return false;
     if (task_snapshot.expert_id < 0 || task_snapshot.expert_id >= config_.expert_num) return false;
     int slot = -1;
     const std::vector<uint8_t>* protected_mask =
@@ -1304,19 +1165,7 @@
         expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
         return false;
       }
-      {
-        std::lock_guard<std::mutex> guard(expert_load_mu_);
-        auto it = expert_load_tasks_.find(task_id);
-        if (it != expert_load_tasks_.end()) {
-          ExpertLoadTask& task = it->second;
-          task.slot = slot;
-          task.gate_owner = gate_owner;
-          task.up_owner = up_owner;
-          task.down_owner = down_owner;
-          task.request_ids = requests;
-          task.state = ExpertLoadState::Submitted;
-        }
-      }
+      expert_load_scheduler_.mark_submitted(task_id, slot, gate_owner, up_owner, down_owner, requests);
       auto& pending = pending_prefetches_[task_snapshot.expert_id];
       pending.slot_index = slot;
       pending.task_id = task_id;
@@ -1343,20 +1192,17 @@
     for (;;) {
       if (!allow_background && submitted >= kMaxFiniteTasksPerDrain) return;
       if (allow_background && background_capacity_reached()) {
-        cancel_queued_warmfill_epoch(coldstart_warmfill_epoch_);
+        cancel_queued_warmfill_epoch(expert_load_scheduler_.current_coldstart_warmfill_epoch());
         return;
       }
       const uint64_t task_id = pop_next_expert_load_task(allow_background);
       if (task_id == 0) return;
       ExpertLoadSource source = ExpertLoadSource::Explicit;
       uint64_t epoch = 0;
-      {
-        std::lock_guard<std::mutex> guard(expert_load_mu_);
-        auto it = expert_load_tasks_.find(task_id);
-        if (it != expert_load_tasks_.end()) {
-          source = it->second.source;
-          epoch = it->second.warmfill_epoch;
-        }
+      ExpertLoadTask task_snapshot;
+      if (expert_load_scheduler_.snapshot(task_id, &task_snapshot)) {
+        source = task_snapshot.source;
+        epoch = task_snapshot.warmfill_epoch;
       }
       if (!submit_expert_load_task(task_id) && source == ExpertLoadSource::ColdStartWarmFill) {
         cancel_queued_warmfill_epoch(epoch);
@@ -2483,19 +2329,8 @@
     pending.task_id = 0;
     pending.requests.clear();
     if (task_id != 0) {
-      std::lock_guard<std::mutex> guard(expert_load_mu_);
-      auto it = expert_load_tasks_.find(task_id);
-      if (it != expert_load_tasks_.end() &&
-          (it->second.state == ExpertLoadState::Queued ||
-           it->second.state == ExpertLoadState::Submitting ||
-           it->second.state == ExpertLoadState::Submitted)) {
-        it->second.state = ExpertLoadState::Canceled;
-        it->second.queue_generation += 1;
-      }
-      if (expert_id >= 0 && expert_id < static_cast<int>(active_task_by_expert_.size()) &&
-          active_task_by_expert_[expert_id] == task_id) {
-        active_task_by_expert_[expert_id] = 0;
-      }
+      expert_load_scheduler_.mark_task_canceled_if_active(task_id);
+      (void)expert_load_scheduler_.clear_active_if_matches(expert_id, task_id);
     }
   }
 
@@ -2516,15 +2351,7 @@
     pending.requests.clear();
     finalize_expert_buffers(expert_id, gate_owner, up_owner, down_owner, pin_after_wait);
     if (task_id != 0) {
-      std::lock_guard<std::mutex> guard(expert_load_mu_);
-      auto it = expert_load_tasks_.find(task_id);
-      if (it != expert_load_tasks_.end()) {
-        it->second.state = ExpertLoadState::Completed;
-      }
-      if (expert_id >= 0 && expert_id < static_cast<int>(active_task_by_expert_.size()) &&
-          active_task_by_expert_[expert_id] == task_id) {
-        active_task_by_expert_[expert_id] = 0;
-      }
+      expert_load_scheduler_.mark_completed(task_id, expert_id);
     }
     return true;
   }
@@ -2716,14 +2543,13 @@
         is_bootstrap_prefetch ? ExpertLoadSource::ColdStartWarmFill : ExpertLoadSource::DeferredTopK;
     uint64_t warmfill_epoch = 0;
     if (is_bootstrap_prefetch) {
-      if (coldstart_warmfill_submitted_) {
+      if (expert_load_scheduler_.coldstart_warmfill_submitted()) {
         if (auto* stats = mesh::enabled_cache_stats(config_)) {
           stats->speculative_prefetch_blocked_count.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
         }
         return 0;
       }
-      coldstart_warmfill_submitted_ = true;
-      warmfill_epoch = ++coldstart_warmfill_epoch_;
+      warmfill_epoch = expert_load_scheduler_.begin_coldstart_warmfill_epoch();
       schedule_key = background_schedule_key();
     }
     uint64_t bootstrap_candidate_count = 0;

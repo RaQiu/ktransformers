@@ -70,6 +70,12 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE_Common<AMX_BF16_MOE_TP<K>> {
     }
 
     layout->bytes = layout->gate_full_bytes + layout->up_full_bytes + layout->down_full_bytes;
+    if (this->config.iouring_direct_io) {
+      const size_t alignment = mesh::direct_io_alignment_bytes();
+      if ((layout->offset % static_cast<off_t>(alignment)) != 0 || (layout->bytes % alignment) != 0) {
+        return false;
+      }
+    }
     return layout->bytes > 0;
   }
 

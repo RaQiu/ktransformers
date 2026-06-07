@@ -319,9 +319,11 @@ inline void validate_bf16_iouring_config(const GeneralMOEConfig& config,
   if (config.async_reader == nullptr) {
     throw std::runtime_error("BF16 io_uring requires a non-null AsyncExpertReader");
   }
-  validate_file_slot_matrix(config, tp_part_idx, "gate.weight", config.gate_file_slots, gate_weight_bytes, true);
-  validate_file_slot_matrix(config, tp_part_idx, "up.weight", config.up_file_slots, up_weight_bytes, true);
-  validate_file_slot_matrix(config, tp_part_idx, "down.weight", config.down_file_slots, down_full_weight_bytes, true);
+  validate_file_slot_matrix(
+      config, tp_part_idx, "gate.weight", config.gate_file_slots, gate_weight_bytes, true, true);
+  validate_file_slot_matrix(config, tp_part_idx, "up.weight", config.up_file_slots, up_weight_bytes, true, true);
+  validate_file_slot_matrix(
+      config, tp_part_idx, "down.weight", config.down_file_slots, down_full_weight_bytes, true, true);
   log_bf16_iouring_config(
       config, tp_part_idx, cache_capacity, gate_weight_bytes, up_weight_bytes, down_full_weight_bytes,
       down_local_weight_bytes);
@@ -699,6 +701,56 @@ inline void log_batch_ensure_trace(const GeneralMOEConfig& config,
                pending_prefetch,
                static_cast<unsigned long long>(wait_us),
                static_cast<unsigned long long>(total_us),
+               static_cast<unsigned long long>(read_req_delta),
+               static_cast<unsigned long long>(read_bytes_delta),
+               static_cast<unsigned long long>(expected_cold_read_bytes),
+               resident,
+               capacity);
+}
+
+inline bool bf16_prefill_trace_enabled() {
+  const char* trace = std::getenv("KT_MESH_BF16_PREFILL_TRACE");
+  return trace != nullptr && trace[0] != '\0' && trace[0] != '0';
+}
+
+inline void log_bf16_prefill_trace(const GeneralMOEConfig& config,
+                                   int tp_part_idx,
+                                   const char* mode,
+                                   int qlen,
+                                   int k,
+                                   size_t active_total,
+                                   size_t wave_begin,
+                                   size_t wave_end,
+                                   int hits,
+                                   int cold,
+                                   int inflight,
+                                   uint64_t ensure_us,
+                                   uint64_t forward_us,
+                                   uint64_t read_req_delta,
+                                   uint64_t read_bytes_delta,
+                                   uint64_t expected_cold_read_bytes,
+                                   int resident,
+                                   int capacity) {
+  std::fprintf(stderr,
+               "[BF16_PREFILL_TRACE] layer=%d tp=%d mode=%s qlen=%d topk=%d active_total=%zu "
+               "wave_begin=%zu wave_end=%zu wave_size=%zu hits=%d cold=%d inflight=%d "
+               "ensure_us=%llu forward_us=%llu total_us=%llu read_req_delta=%llu read_bytes_delta=%llu "
+               "expected_cold_read_bytes=%llu resident=%d capacity=%d\n",
+               config.layer_idx,
+               tp_part_idx,
+               mode == nullptr ? "unknown" : mode,
+               qlen,
+               k,
+               active_total,
+               wave_begin,
+               wave_end,
+               wave_end >= wave_begin ? wave_end - wave_begin : 0,
+               hits,
+               cold,
+               inflight,
+               static_cast<unsigned long long>(ensure_us),
+               static_cast<unsigned long long>(forward_us),
+               static_cast<unsigned long long>(ensure_us + forward_us),
                static_cast<unsigned long long>(read_req_delta),
                static_cast<unsigned long long>(read_bytes_delta),
                static_cast<unsigned long long>(expected_cold_read_bytes),

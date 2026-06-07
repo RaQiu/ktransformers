@@ -28,6 +28,7 @@
 #include "la/amx_raw_kernels.hpp"
 #include "la/amx_utils.hpp"  // For transpose_16x16_32bit
 #include "moe_base.hpp"
+#include "../mesh/expert_load_scheduler.hpp"
 #include "../mesh/expert_residency.hpp"
 #include "../mesh/prefill_policy.hpp"
 #include "../mesh/runtime_utils.hpp"

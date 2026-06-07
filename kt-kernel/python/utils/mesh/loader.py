@@ -683,7 +683,6 @@ def _bf16_packed_original_slots(loader, layout: dict, use_direct_io: bool) -> di
     down_bytes_per_expert = hidden_size * intermediate_size * bytes_per_elem
 
     direct_io = bool(use_direct_io)
-    slots_to_validate = []
     gate_fd = get_file_fd(loader, gate_up_info["file_path"], use_direct_io=direct_io)
     down_fd = get_file_fd(loader, down_info["file_path"], use_direct_io=direct_io)
 
@@ -701,17 +700,6 @@ def _bf16_packed_original_slots(loader, layout: dict, use_direct_io: bool) -> di
             gate_slots[tp_idx].append(gate_slot)
             up_slots[tp_idx].append(up_slot)
             down_slots[tp_idx].append(down_slot)
-            slots_to_validate.extend((gate_slot, up_slot, down_slot))
-
-    if direct_io:
-        for fd, offset, size in slots_to_validate:
-            if int(offset) % 512 != 0 or int(size) % 512 != 0:
-                raise RuntimeError(
-                    "BF16 io_uring direct I/O requires 512-byte aligned original safetensors entries; "
-                    f"fd={fd} offset={offset} size={size} is misaligned. "
-                    "Enable KT_MESH_BF16_EXPERT_CACHE=1 to read from normalized expert cache, "
-                    "or set KT_IOURING_DIRECT=0 for buffered io_uring."
-                )
 
     empty_scales = [[] for _ in range(tp_count)]
     return {

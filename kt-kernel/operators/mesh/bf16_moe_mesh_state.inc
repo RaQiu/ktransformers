@@ -12,8 +12,11 @@
 
   std::unique_ptr<std::atomic<uint8_t>[]> expert_states_;
   std::unique_ptr<std::atomic<uint32_t>[]> active_readers_;
+  std::vector<PendingPrefetch> pending_prefetches_;
+  mesh::ExpertLoadScheduler expert_load_scheduler_;
 
   std::atomic<int> resident_expert_count_{0};
+  std::atomic<int> active_load_count_{0};
   std::atomic<int> eviction_cursor_{0};
   int numa_node_ = 0;
   int cache_capacity_ = 0;

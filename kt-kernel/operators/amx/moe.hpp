@@ -32,6 +32,7 @@
 #include "../mesh/resident_slot_pool.hpp"
 #include "../mesh/runtime_utils.hpp"
 #include "../mesh/global_scratch_pool.hpp"
+#include "../mesh/expert_load_scheduler.hpp"
 
 template <class T>
 class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {

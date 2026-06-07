@@ -7,6 +7,34 @@
     std::vector<int> expert_counts;
     if (lazy_weight_enabled()) {
       mesh::collect_unique_cpu_experts(config_, expert_ids, qlen * k, active_experts, &expert_counts);
+      complete_ready_prefetches();
+      const bool trace_bf16_prefill = mesh::bf16_prefill_trace_enabled();
+      auto count_states = [&](int begin, int end, int* hits, int* cold, int* inflight) {
+        *hits = 0;
+        *cold = 0;
+        *inflight = 0;
+        for (int idx = begin; idx < end; ++idx) {
+          const int expert_id = active_experts[idx];
+          const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+          if (state == EXPERT_CACHED || state == EXPERT_PINNED) {
+            ++(*hits);
+          } else if (state == EXPERT_BASELINE) {
+            ++(*cold);
+          } else if (state == EXPERT_PACKING || state == EXPERT_PREFETCHING || state == EXPERT_DEMOTING) {
+            ++(*inflight);
+          }
+        }
+      };
+      auto read_request_count = [&]() -> uint64_t {
+        return config_.cache_stats == nullptr
+                   ? 0
+                   : config_.cache_stats->iouring_read_request_count.load(std::memory_order_relaxed);
+      };
+      auto read_bytes = [&]() -> uint64_t {
+        return config_.cache_stats == nullptr ? 0 : config_.cache_stats->iouring_read_bytes.load(std::memory_order_relaxed);
+      };
+      const uint64_t bytes_per_cold_expert =
+          static_cast<uint64_t>(gate_weight_bytes_ + up_weight_bytes_ + full_down_weight_bytes());
 
       const bool enable_wave_mode = mesh::bf16_wave_resident_enabled();
       const int wave_capacity = cache_capacity_ > 0 ? cache_capacity_ : (int)active_experts.size();
@@ -62,6 +90,14 @@
 
         for (int wave_begin = 0; wave_begin < (int)active_experts.size(); wave_begin += wave_capacity) {
           const int wave_end = std::min<int>(wave_begin + wave_capacity, (int)active_experts.size());
+          int trace_hits = 0;
+          int trace_cold = 0;
+          int trace_inflight = 0;
+          if (trace_bf16_prefill) {
+            count_states(wave_begin, wave_end, &trace_hits, &trace_cold, &trace_inflight);
+          }
+          const uint64_t read_req_before = trace_bf16_prefill ? read_request_count() : 0;
+          const uint64_t read_bytes_before = trace_bf16_prefill ? read_bytes() : 0;
           std::fill(in_wave.begin(), in_wave.end(), 0);
           for (int idx = wave_begin; idx < wave_end; ++idx) {
             in_wave[active_experts[idx]] = 1;
@@ -76,15 +112,41 @@
           }
 
           auto expert_read_scope = std::make_unique<ExpertReadScope>(this, wave_end - wave_begin);
+          const auto ensure_start = std::chrono::steady_clock::now();
           for (int idx = wave_begin; idx < wave_end; ++idx) {
             const int expert_id = active_experts[idx];
             note_expert_access(expert_id);
             ensure_expert_ready(expert_id, false);
             expert_read_scope->add_expert(expert_id);
           }
+          const uint64_t ensure_us = mesh::runtime_elapsed_us(ensure_start, std::chrono::steady_clock::now());
 
           std::fill(wave_output, wave_output + output_elems, 0.0f);
+          const auto forward_start = std::chrono::steady_clock::now();
           Base::forward(qlen, k, wave_expert_ids.data(), weights, input, wave_output);
+          const uint64_t forward_us = mesh::runtime_elapsed_us(forward_start, std::chrono::steady_clock::now());
+          if (trace_bf16_prefill) {
+            const uint64_t read_req_after = read_request_count();
+            const uint64_t read_bytes_after = read_bytes();
+            mesh::log_bf16_prefill_trace(config_,
+                                          tp_part_idx,
+                                          "wave",
+                                          qlen,
+                                          k,
+                                          active_experts.size(),
+                                          static_cast<size_t>(wave_begin),
+                                          static_cast<size_t>(wave_end),
+                                          trace_hits,
+                                          trace_cold,
+                                          trace_inflight,
+                                          ensure_us,
+                                          forward_us,
+                                          read_req_after - read_req_before,
+                                          read_bytes_after - read_bytes_before,
+                                          bytes_per_cold_expert * static_cast<uint64_t>(trace_cold),
+                                          resident_expert_count_.load(std::memory_order_acquire),
+                                          cache_capacity_);
+          }
           for (size_t i = 0; i < output_elems; ++i) {
             accum_output[i] += wave_output[i];
           }
@@ -105,14 +167,48 @@
         return;
       }
 
+      int trace_hits = 0;
+      int trace_cold = 0;
+      int trace_inflight = 0;
+      if (trace_bf16_prefill) {
+        count_states(0, static_cast<int>(active_experts.size()), &trace_hits, &trace_cold, &trace_inflight);
+      }
+      const uint64_t read_req_before = trace_bf16_prefill ? read_request_count() : 0;
+      const uint64_t read_bytes_before = trace_bf16_prefill ? read_bytes() : 0;
       auto expert_read_scope = std::make_unique<ExpertReadScope>(this, active_experts.size());
+      const auto ensure_start = std::chrono::steady_clock::now();
       for (int expert_id : active_experts) {
         note_expert_access(expert_id);
         ensure_expert_ready(expert_id, false);
         expert_read_scope->add_expert(expert_id);
       }
+      const uint64_t ensure_us = mesh::runtime_elapsed_us(ensure_start, std::chrono::steady_clock::now());
 
+      const auto forward_start = std::chrono::steady_clock::now();
       Base::forward(qlen, k, expert_ids, weights, input, output);
+      const uint64_t forward_us = mesh::runtime_elapsed_us(forward_start, std::chrono::steady_clock::now());
+      if (trace_bf16_prefill) {
+        const uint64_t read_req_after = read_request_count();
+        const uint64_t read_bytes_after = read_bytes();
+        mesh::log_bf16_prefill_trace(config_,
+                                      tp_part_idx,
+                                      "single",
+                                      qlen,
+                                      k,
+                                      active_experts.size(),
+                                      0,
+                                      active_experts.size(),
+                                      trace_hits,
+                                      trace_cold,
+                                      trace_inflight,
+                                      ensure_us,
+                                      forward_us,
+                                      read_req_after - read_req_before,
+                                      read_bytes_after - read_bytes_before,
+                                      bytes_per_cold_expert * static_cast<uint64_t>(trace_cold),
+                                      resident_expert_count_.load(std::memory_order_acquire),
+                                      cache_capacity_);
+      }
       const bool has_resident_cache_budget =
           config_.max_tier0_experts > 0 ||
           config_.max_resident_experts > 0 ||
@@ -149,7 +245,7 @@
       if (state == EXPERT_BASELINE) {
         return;
       }
-      if (state == EXPERT_PACKING) {
+      if (state == EXPERT_PACKING || state == EXPERT_PREFETCHING) {
         std::this_thread::yield();
         continue;
       }
@@ -183,6 +279,40 @@
     if (!lazy_weight_enabled()) return false;
     if (expert_id < 0 || expert_id >= config_.expert_num) return false;
     return expert_states_[expert_id].load(std::memory_order_acquire) == EXPERT_PINNED;
+#else
+    (void)expert_id;
+    return false;
+#endif
+  }
+
+  int expert_state_code(int expert_id) const {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return static_cast<int>(EXPERT_BASELINE);
+    if (!lazy_weight_enabled() || expert_states_ == nullptr) return static_cast<int>(EXPERT_CACHED);
+    return static_cast<int>(expert_states_[expert_id].load(std::memory_order_acquire));
+#else
+    (void)expert_id;
+    return 0;
+#endif
+  }
+
+  bool is_expert_ready_resident(int expert_id) const {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    if (!lazy_weight_enabled() || expert_states_ == nullptr) return true;
+    const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+    return state == EXPERT_CACHED || state == EXPERT_PINNED;
+#else
+    (void)expert_id;
+    return false;
+#endif
+  }
+
+  bool is_expert_cold_baseline(int expert_id) const {
+#ifndef _WIN32
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    if (!lazy_weight_enabled() || expert_states_ == nullptr) return false;
+    return expert_states_[expert_id].load(std::memory_order_acquire) == EXPERT_BASELINE;
 #else
     (void)expert_id;
     return false;

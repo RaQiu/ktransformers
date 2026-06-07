@@ -16,17 +16,7 @@
   std::unique_ptr<std::atomic<uint8_t>[]> slot_states_;
   std::unique_ptr<std::atomic<uint32_t>[]> slot_active_readers_;
   std::vector<PendingPrefetch> pending_prefetches_;
-  std::unordered_map<uint64_t, ExpertLoadTask> expert_load_tasks_;
-  std::vector<uint64_t> active_task_by_expert_;
-  std::priority_queue<ExpertLoadQueueEntry,
-                      std::vector<ExpertLoadQueueEntry>,
-                      ExpertLoadQueueEntryCompare> expert_load_queue_;
-  std::vector<uint64_t> queued_warmfill_tasks_;
-  std::mutex expert_load_mu_;
-  uint64_t next_expert_load_task_id_ = 1;
-  uint64_t next_expert_load_sequence_ = 1;
-  uint64_t coldstart_warmfill_epoch_ = 0;
-  bool coldstart_warmfill_submitted_ = false;
+  mesh::ExpertLoadScheduler expert_load_scheduler_;
 
   std::atomic<int> resident_expert_count_{0};
   std::atomic<int> eviction_cursor_{0};

@@ -2,6 +2,7 @@
 #define CPUINFER_OPERATOR_MESH_EXPERT_RESIDENCY_HPP
 
 #include <atomic>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -12,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
 
 #include "async_io.hpp"
 #include "../common.hpp"
@@ -156,6 +158,56 @@ inline bool lazy_weight_enabled(const GeneralMOEConfig& config) {
   return iouring_enabled(config);
 }
 
+inline size_t direct_io_alignment_bytes() {
+  const char* raw = std::getenv("KT_IOURING_DIRECT_ALIGNMENT");
+  if (raw != nullptr && raw[0] != '\0') {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 10);
+    if (end != raw && parsed >= 512) {
+      return static_cast<size_t>(parsed);
+    }
+  }
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size < 512) {
+    page_size = 512;
+  }
+  return static_cast<size_t>(page_size);
+}
+
+inline size_t align_up_size(size_t value, size_t alignment) {
+  if (alignment == 0) return value;
+  const size_t rem = value % alignment;
+  return rem == 0 ? value : value + (alignment - rem);
+}
+
+struct DirectReadSpan {
+  off_t offset = 0;
+  size_t size = 0;
+  size_t payload_shift = 0;
+  size_t payload_size = 0;
+  size_t min_success_size = 0;
+};
+
+inline DirectReadSpan make_direct_read_span(const GeneralMOEConfig& config, const ExpertFileSlot& slot) {
+  DirectReadSpan span;
+  span.payload_size = slot.size;
+  if (!config.iouring_direct_io) {
+    span.offset = slot.offset;
+    span.size = slot.size;
+    span.payload_shift = 0;
+    span.min_success_size = slot.size;
+    return span;
+  }
+
+  const size_t alignment = direct_io_alignment_bytes();
+  const off_t aligned_offset = slot.offset - static_cast<off_t>(slot.offset % static_cast<off_t>(alignment));
+  span.offset = aligned_offset;
+  span.payload_shift = static_cast<size_t>(slot.offset - aligned_offset);
+  span.size = align_up_size(span.payload_shift + slot.size, alignment);
+  span.min_success_size = span.payload_shift + slot.size;
+  return span;
+}
+
 inline int logical_expert_id_for_slot(const GeneralMOEConfig& config, int tp_part_idx, int expert_id) {
   if (expert_id < 0 || expert_id >= config.expert_num) {
     throw std::runtime_error("Invalid expert id for io_uring slot lookup");
@@ -201,7 +253,8 @@ inline void validate_file_slot(const GeneralMOEConfig& config,
                                int tp_part_idx,
                                const char* name,
                                const ExpertFileSlot& slot,
-                               size_t expected_size) {
+                               size_t expected_size,
+                               bool allow_direct_overread = false) {
   if (slot.fd < 0 || slot.size == 0) {
     std::ostringstream oss;
     oss << "Invalid io_uring slot for " << name << " layer=" << config.layer_idx << " tp=" << tp_part_idx
@@ -214,7 +267,7 @@ inline void validate_file_slot(const GeneralMOEConfig& config,
         << " expected=" << expected_size << " actual=" << slot.size << " offset=" << slot.offset;
     throw std::runtime_error(oss.str());
   }
-  if (config.iouring_direct_io && ((slot.offset % 512) != 0 || (slot.size % 512) != 0)) {
+  if (config.iouring_direct_io && !allow_direct_overread && ((slot.offset % 512) != 0 || (slot.size % 512) != 0)) {
     std::ostringstream oss;
     oss << "io_uring O_DIRECT slot for " << name << " is not 512-byte aligned layer=" << config.layer_idx
         << " tp=" << tp_part_idx << " offset=" << slot.offset << " size=" << slot.size;
@@ -227,7 +280,8 @@ inline void validate_file_slot_matrix(const GeneralMOEConfig& config,
                                       const char* name,
                                       const std::vector<std::vector<ExpertFileSlot>>& slots,
                                       size_t expected_size,
-                                      bool apply_physical_to_logical_map = false) {
+                                      bool apply_physical_to_logical_map = false,
+                                      bool allow_direct_overread = false) {
   if (tp_part_idx < 0 || tp_part_idx >= static_cast<int>(slots.size())) {
     std::ostringstream oss;
     oss << "io_uring backend requires " << name << " slots for tp=" << tp_part_idx
@@ -243,7 +297,7 @@ inline void validate_file_slot_matrix(const GeneralMOEConfig& config,
   }
   for (int expert_id = 0; expert_id < config.expert_num; ++expert_id) {
     const auto& slot = file_slot_at(config, tp_part_idx, slots, name, expert_id, apply_physical_to_logical_map);
-    validate_file_slot(config, tp_part_idx, name, slot, expected_size);
+    validate_file_slot(config, tp_part_idx, name, slot, expected_size, allow_direct_overread);
   }
 }
 
@@ -451,29 +505,6 @@ inline void append_amx_iouring_read_requests_for_expert(
                  reinterpret_cast<char*>(down_owner) + down_weight_bytes + down_scale_bytes);
     }
   }
-}
-
-inline void append_bf16_iouring_read_requests_for_expert(
-    const GeneralMOEConfig& config,
-    int tp_part_idx,
-    int expert_id,
-    void* gate_raw,
-    void* up_raw,
-    void* down_full_raw,
-    size_t gate_weight_bytes,
-    size_t up_weight_bytes,
-    size_t down_full_bytes,
-    std::vector<ktransformers::AsyncExpertReader::ReadRequest>* read_batch) {
-  if (read_batch == nullptr) return;
-  const auto& gate_slot = file_slot_at(config, tp_part_idx, config.gate_file_slots, "gate.weight", expert_id, true);
-  const auto& up_slot = file_slot_at(config, tp_part_idx, config.up_file_slots, "up.weight", expert_id, true);
-  const auto& down_slot = file_slot_at(config, tp_part_idx, config.down_file_slots, "down.weight", expert_id, true);
-  read_batch->push_back(ktransformers::AsyncExpertReader::ReadRequest{
-      expert_id, gate_slot.fd, gate_raw, gate_weight_bytes, gate_slot.offset, 0});
-  read_batch->push_back(ktransformers::AsyncExpertReader::ReadRequest{
-      expert_id, up_slot.fd, up_raw, up_weight_bytes, up_slot.offset, 0});
-  read_batch->push_back(ktransformers::AsyncExpertReader::ReadRequest{
-      expert_id, down_slot.fd, down_full_raw, down_full_bytes, down_slot.offset, 0});
 }
 
 inline std::string amx_iouring_promotion_failure_message(

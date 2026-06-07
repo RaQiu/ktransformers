@@ -54,6 +54,10 @@ public:
         off_t offset;
         uint64_t user_data;  // For completion matching
         ReadPriority priority = ReadPriority::Prefetch;
+        // When non-zero, a short read is considered successful if it covers at
+        // least this many bytes. This is used for O_DIRECT over-reads that may
+        // legally reach EOF after the logical payload has already been read.
+        size_t min_success_size = 0;
     };
 
     struct SubmitStats {
@@ -179,6 +183,7 @@ private:
         int fd = -1;
         void* buffer = nullptr;
         size_t expected_size = 0;
+        size_t min_success_size = 0;
         off_t offset = 0;
         std::atomic<RequestState> state{RequestState::Inflight};
         std::atomic<int> result{0};  // errno or byte count

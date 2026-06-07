@@ -120,6 +120,7 @@ uint64_t AsyncExpertReader::submit_read(int fd,
     request->fd = fd;
     request->buffer = buf;
     request->expected_size = size;
+    request->min_success_size = size;
     request->offset = offset;
     request->state.store(RequestState::Inflight, std::memory_order_release);
     request->result.store(0, std::memory_order_release);
@@ -170,6 +171,7 @@ std::vector<uint64_t> AsyncExpertReader::submit_reads(const std::vector<ReadRequ
             request->fd = req.fd;
             request->buffer = req.buffer;
             request->expected_size = req.size;
+            request->min_success_size = req.min_success_size == 0 ? req.size : req.min_success_size;
             request->offset = req.offset;
             request->state.store(RequestState::Inflight, std::memory_order_release);
             request->result.store(0, std::memory_order_release);
@@ -452,6 +454,9 @@ std::string AsyncExpertReader::describe_requests(const std::vector<uint64_t>& re
             }
             oss << "/res=" << result;
             oss << "/expected=" << request->expected_size;
+            if (request->min_success_size != request->expected_size) {
+                oss << "/min=" << request->min_success_size;
+            }
             oss << "/retry=" << request->retry_count.load(std::memory_order_acquire) << "/" << max_read_retries_;
             if (result < 0) {
                 oss << "(" << std::strerror(-result) << ")";
@@ -607,7 +612,8 @@ bool AsyncExpertReader::process_one_completion(int timeout_ms) {
         return true;
     }
 
-    const bool ok = result >= 0 && static_cast<size_t>(result) == request->expected_size;
+    const bool ok = result >= 0 && static_cast<size_t>(result) >= request->min_success_size &&
+                    static_cast<size_t>(result) <= request->expected_size;
     if (ok) {
         inflight_count_.fetch_sub(1, std::memory_order_acq_rel);
         complete_request(request_id, request, true, result);
@@ -681,7 +687,8 @@ unsigned AsyncExpertReader::process_completions_batch(unsigned max_count) {
             inflight_count_.fetch_sub(1, std::memory_order_acq_rel);
             continue;
         }
-        const bool ok = result >= 0 && static_cast<size_t>(result) == request->expected_size;
+        const bool ok = result >= 0 && static_cast<size_t>(result) >= request->min_success_size &&
+                        static_cast<size_t>(result) <= request->expected_size;
         inflight_count_.fetch_sub(1, std::memory_order_acq_rel);
         if (ok) {
             complete_request(request_id, request, true, result);
