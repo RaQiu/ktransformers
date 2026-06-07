@@ -32,6 +32,7 @@
   ResidentCachePolicyState resident_policy_;
   const std::vector<uint8_t>* eviction_protected_mask_ = nullptr;
   bool prefill_streaming_active_ = false;
+  int64_t current_forward_schedule_key_ = 0;
   std::vector<uint8_t> prefill_static_expert_mask_;
   std::vector<int> prefill_static_slot_for_expert_;
   std::vector<int> prefill_static_experts_;

@@ -175,6 +175,7 @@
     mesh_slot_mode_ = MESH_SLOT_DECODE_CACHE;
     prefill_static_capacity_ = 0;
     prefill_static_slot_count_ = 0;
+    current_forward_schedule_key_ = 0;
     prefill_static_expert_mask_.assign(en, 0);
     prefill_static_slot_for_expert_.assign(en, -1);
     prefill_static_experts_.clear();
@@ -977,7 +978,8 @@
       void* up_owner,
       void* down_owner,
       ktransformers::AsyncExpertReader::ReadPriority priority =
-          ktransformers::AsyncExpertReader::ReadPriority::Demand) {
+          ktransformers::AsyncExpertReader::ReadPriority::Demand,
+      int64_t schedule_key = 0) {
     if (config_.async_reader == nullptr) {
       return {};
     }
@@ -987,6 +989,7 @@
     append_iouring_read_requests_for_expert(expert_id, gate_owner, up_owner, down_owner, &read_batch);
     for (auto& request : read_batch) {
       request.priority = priority;
+      request.schedule_key = schedule_key;
     }
     std::vector<uint64_t> read_requests = config_.async_reader->submit_reads(read_batch);
     record_iouring_read_stats(read_batch);
@@ -995,6 +998,10 @@
 
   static constexpr int64_t background_schedule_key() {
     return mesh::ExpertLoadScheduler::background_schedule_key();
+  }
+
+  void set_forward_schedule_key(int64_t schedule_key) {
+    current_forward_schedule_key_ = schedule_key;
   }
 
   int background_slot_limit() const {
@@ -1072,11 +1079,12 @@
     }
   }
 
-  void promote_pending_task_for_demand(int expert_id) {
+  void promote_pending_task_for_demand(int expert_id, int64_t schedule_key = 0) {
     if (expert_id < 0 || expert_id >= static_cast<int>(pending_prefetches_.size())) return;
     const uint64_t task_id = pending_prefetches_[expert_id].task_id;
     if (task_id == 0) return;
-    const mesh::ExpertTaskPromoteResult result = expert_load_scheduler_.promote_pending_for_demand(task_id);
+    const mesh::ExpertTaskPromoteResult result =
+        expert_load_scheduler_.promote_pending_for_demand(task_id, schedule_key);
     if (result.joined_warmfill) {
       if (auto* stats = mesh::enabled_cache_stats(config_)) {
         stats->demand_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
@@ -1157,7 +1165,8 @@
                                           gate_owner,
                                           up_owner,
                                           down_owner,
-                                          read_priority_for_task(task_snapshot.source));
+                                          read_priority_for_task(task_snapshot.source),
+                                          task_snapshot.schedule_key);
       if (requests.empty()) {
         (void)unbind_slot(slot, true, false);
         release_empty_slot_buffers_if_any(slot);
@@ -2042,6 +2051,10 @@
                                                 promotion.up_owner,
                                                 promotion.down_owner,
                                                 read_batch);
+        for (size_t req_idx = request_begin; req_idx < read_batch->size(); ++req_idx) {
+          (*read_batch)[req_idx].priority = ktransformers::AsyncExpertReader::ReadPriority::Demand;
+          (*read_batch)[req_idx].schedule_key = current_forward_schedule_key_;
+        }
       } catch (...) {
         if (timing != nullptr) {
           timing->request_build_us += elapsed_us(request_build_start, std::chrono::steady_clock::now());
@@ -2121,7 +2134,7 @@
     }
   }
 
-  int ensure_prefill_static_residents() {
+  int ensure_prefill_static_residents(const std::vector<int>* active_static_experts = nullptr) {
     last_prefill_static_timing_ = PrefillPromotionTiming{};
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || !iouring_enabled() ||
         cache_capacity_ <= 0) {
@@ -2133,12 +2146,20 @@
       rebuild_prefill_static_expert_set();
     }
 
+    const std::vector<int>& experts_to_load =
+        active_static_experts != nullptr ? *active_static_experts : prefill_static_experts_;
     std::vector<BatchPromotion> promotions;
     std::vector<ktransformers::AsyncExpertReader::ReadRequest> read_batch;
     std::vector<uint64_t> all_requests;
-    promotions.reserve(prefill_static_experts_.size());
-    read_batch.reserve(prefill_static_experts_.size() * 9);
-    for (int expert_id : prefill_static_experts_) {
+    promotions.reserve(experts_to_load.size());
+    read_batch.reserve(experts_to_load.size() * 9);
+    for (int expert_id : experts_to_load) {
+      if (expert_id < 0 || expert_id >= config_.expert_num) continue;
+      if (active_static_experts != nullptr &&
+          (expert_id >= static_cast<int>(prefill_static_expert_mask_.size()) ||
+           prefill_static_expert_mask_[expert_id] == 0)) {
+        continue;
+      }
       const int slot = prefill_static_slot_for_expert(expert_id);
       if (!submit_prefill_promotion_to_slot(
               expert_id, slot, &promotions, &read_batch, &last_prefill_static_timing_)) {
@@ -2159,7 +2180,7 @@
       throw;
     }
     wait_and_finalize_prefill_promotions(&promotions, all_requests, "static");
-    return static_cast<int>(prefill_static_experts_.size());
+    return static_cast<int>(experts_to_load.size());
   }
 
   void release_empty_slot_buffers_to_limit(int allocated_limit) {
@@ -2239,13 +2260,15 @@
                             background_schedule_key());
   }
 
-  int prepare_prefill_layer_window() {
+  int prepare_prefill_layer_window(int64_t schedule_key = 0) {
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || cache_capacity_ <= 0) return 0;
+    current_forward_schedule_key_ = schedule_key;
     if (expert_frequency_total_ == 0) return 0;
     if (prefill_static_capacity_ > 0) {
       rebuild_prefill_static_expert_set_by_frequency(prefill_static_capacity_);
     }
-    return ensure_prefill_static_residents();
+    mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
+    return 0;
   }
 
   bool release_prefill_layer_window() {
@@ -2361,7 +2384,7 @@
     if (expert_id < 0 || expert_id >= config_.expert_num) return false;
     auto& pending = pending_prefetches_[expert_id];
     if (pending.requests.empty() && pending.task_id != 0) {
-      promote_pending_task_for_demand(expert_id);
+      promote_pending_task_for_demand(expert_id, current_forward_schedule_key_);
       drain_expert_load_queue(false);
     }
     const auto& requests = pending_prefetches_[expert_id].requests;
@@ -2538,11 +2561,15 @@
       return 0;
     }
     complete_ready_prefetches();
-    const bool is_bootstrap_prefetch = prefetch_kind == 1;
-    const ExpertLoadSource source =
-        is_bootstrap_prefetch ? ExpertLoadSource::ColdStartWarmFill : ExpertLoadSource::DeferredTopK;
+    const bool is_background_warmfill = prefetch_kind == 1;
+    const bool is_prefill_active = prefetch_kind == 2;
+    const bool is_bootstrap_prefetch = is_background_warmfill;
+    const ExpertLoadSource source = is_background_warmfill
+                                        ? ExpertLoadSource::ColdStartWarmFill
+                                        : (is_prefill_active ? ExpertLoadSource::PrefillActive
+                                                             : ExpertLoadSource::DeferredTopK);
     uint64_t warmfill_epoch = 0;
-    if (is_bootstrap_prefetch) {
+    if (is_background_warmfill) {
       if (expert_load_scheduler_.coldstart_warmfill_submitted()) {
         if (auto* stats = mesh::enabled_cache_stats(config_)) {
           stats->speculative_prefetch_blocked_count.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
@@ -2579,7 +2606,7 @@
 
       const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
       if (state != EXPERT_BASELINE) {
-        if (!is_bootstrap_prefetch && state == EXPERT_PREFETCHING &&
+        if (!is_background_warmfill && state == EXPERT_PREFETCHING &&
             promote_queued_task_for_deferred(expert_id, schedule_key, &protected_mask)) {
           submitted += 1;
         }
@@ -2592,7 +2619,7 @@
         submitted += 1;
       }
     }
-    if (is_bootstrap_prefetch) {
+    if (is_background_warmfill) {
       mesh::record_cache_prefetch_submit(config_, static_cast<uint64_t>(submitted));
       drain_expert_load_queue(true);
     } else {

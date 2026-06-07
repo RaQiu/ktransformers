@@ -3,8 +3,15 @@
 
   void forward_binding_with_scores(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
                                    intptr_t output, bool incremental, intptr_t router_scores, int score_rows,
-                                   int score_cols, int score_transform) {
+                                   int score_cols, int score_transform, int64_t schedule_key = 0) {
     observe_router_scores_binding(router_scores, score_rows, score_cols, score_transform);
+#ifndef _WIN32
+    if constexpr (requires { this->set_forward_schedule_key(schedule_key); }) {
+      this->set_forward_schedule_key(schedule_key);
+    }
+#else
+    (void)schedule_key;
+#endif
     forward((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
             incremental);
   }

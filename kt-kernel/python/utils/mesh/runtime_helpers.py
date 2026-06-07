@@ -11,6 +11,10 @@ BaseMoEWrapper = None
 KExpertsCPUBuffer = None
 _PIN_MEMORY = False
 
+_MESH_PREFETCH_KIND_DEFERRED = 0
+_MESH_PREFETCH_KIND_DECODE_WARMFILL = 1
+_MESH_PREFETCH_KIND_PREFILL_ACTIVE = 2
+
 
 def _mesh_log_once(key, message: str) -> None:
     logged = getattr(BaseMoEWrapper, "_mesh_runtime_config_logged", None)
@@ -573,7 +577,7 @@ def _maybe_submit_mesh_bootstrap_from_full_gate_batch(
             protect_count=protect_count,
             max_to_submit=candidate_count,
             cuda_stream=cuda_stream,
-            prefetch_kind=1,
+            prefetch_kind=_MESH_PREFETCH_KIND_DECODE_WARMFILL,
             schedule_key=(1 << 63) - 1,
         ):
             submitted_layers += 1
@@ -947,18 +951,18 @@ def _submit_iouring_prefetch(
     return True
 
 
-def _submit_mesh_noarg_task(self, task_name: str) -> bool:
+def _submit_mesh_noarg_task(self, task_name: str, *args) -> bool:
     if self.io_backend != "IOURING" or self.moe is None:
         return False
     task_factory = getattr(self.moe, task_name, None)
     if task_factory is None:
         return False
-    self._submit_cpuinfer_task(task_factory(), None)
+    self._submit_cpuinfer_task(task_factory(*args), None)
     return True
 
 
-def _mesh_before_submit_forward(self, qlen: int) -> None:
-    self._maybe_mesh_prepare_prefill_layer_window(qlen)
+def _mesh_before_submit_forward(self, qlen: int, schedule_key: int = 0) -> None:
+    self._maybe_mesh_prepare_prefill_layer_window(qlen, schedule_key)
     self._maybe_mesh_transition_to_decode_cache(qlen)
 
 
@@ -1064,7 +1068,23 @@ def _mesh_submit_forward_impl(
 ) -> None:
     flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     qlen = int(flat_hidden_states.shape[0])
-    self._mesh_before_submit_forward(qlen)
+    total_moe_layers = max(self._mesh_total_moe_layers(), self.layer_idx + 1)
+    is_prefill_chunk = qlen > 1
+    current_schedule_key = int(BaseMoEWrapper._mesh_current_timeline_step) * int(total_moe_layers) + int(self.layer_idx)
+    if is_prefill_chunk:
+        if self.layer_idx == 0 and not BaseMoEWrapper._mesh_prefill_session_seen:
+            BaseMoEWrapper._mesh_timeline_seq = 0
+            BaseMoEWrapper._mesh_current_timeline_step = 0
+            BaseMoEWrapper._mesh_prefill_chunk_seq = 0
+            BaseMoEWrapper._mesh_decode_token_seq = 0
+        if self.layer_idx == 0:
+            BaseMoEWrapper._mesh_current_timeline_step = int(BaseMoEWrapper._mesh_timeline_seq)
+            BaseMoEWrapper._mesh_timeline_seq += 1
+            BaseMoEWrapper._mesh_prefill_chunk_seq += 1
+        current_schedule_key = (
+            int(BaseMoEWrapper._mesh_current_timeline_step) * int(total_moe_layers) + int(self.layer_idx)
+        )
+    self._mesh_before_submit_forward(qlen, current_schedule_key)
 
     (
         input_tensor_cpu,
@@ -1085,9 +1105,12 @@ def _mesh_submit_forward_impl(
     self._mesh_prefetch_previous_topk()
     is_decode_token = qlen == 1 and BaseMoEWrapper._mesh_decode_transition_done
     if is_decode_token and self.layer_idx == 0:
+        BaseMoEWrapper._mesh_current_timeline_step = int(BaseMoEWrapper._mesh_timeline_seq)
+        BaseMoEWrapper._mesh_timeline_seq += 1
         BaseMoEWrapper._mesh_decode_token_seq += 1
-    total_moe_layers = max(self._mesh_total_moe_layers(), self.layer_idx + 1)
-    current_schedule_key = int(BaseMoEWrapper._mesh_decode_token_seq) * int(total_moe_layers) + int(self.layer_idx)
+    current_schedule_key = (
+        int(BaseMoEWrapper._mesh_current_timeline_step) * int(total_moe_layers) + int(self.layer_idx)
+    )
     defer_schedule_key = current_schedule_key + 1
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
@@ -1121,7 +1144,7 @@ def _mesh_submit_forward_impl(
     )
 
     incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
-    immediate_task = self.moe.forward_task(
+    forward_args = (
         bsz_slot_tensor.data_ptr(),
         immediate_experts_ids_cpu[current_slot].size(-1),
         immediate_experts_ids_cpu[current_slot].data_ptr(),
@@ -1134,6 +1157,10 @@ def _mesh_submit_forward_impl(
         score_cols,
         score_transform,
     )
+    try:
+        immediate_task = self.moe.forward_task(*forward_args, int(current_schedule_key))
+    except TypeError:
+        immediate_task = self.moe.forward_task(*forward_args)
     self._submit_cpuinfer_task(immediate_task, cuda_stream)
 
     BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
@@ -1200,7 +1227,7 @@ def _mesh_forward_impl(
     return self._mesh_sync_forward_impl(hidden_states, topk_ids, cuda_stream)
 
 
-def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int) -> None:
+def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int, schedule_key: int = 0) -> None:
     if qlen <= 1 or not self._mesh_prefill_layer_mode_enabled():
         return
     window = self._mesh_prefill_full_layer_count()
@@ -1240,7 +1267,7 @@ def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int) -> None:
             BaseMoEWrapper._mesh_prefill_window_layers.discard(release_layer)
 
     if self.layer_idx not in BaseMoEWrapper._mesh_prefill_window_layers:
-        if self._submit_mesh_noarg_task("mesh_prepare_prefill_layer_task"):
+        if self._submit_mesh_noarg_task("mesh_prepare_prefill_layer_task", int(schedule_key)):
             BaseMoEWrapper._mesh_prefill_window_layers.add(int(self.layer_idx))
 
     if not BaseMoEWrapper._mesh_prefill_window_logged:
@@ -1454,6 +1481,9 @@ def reset_runtime_state(force: bool = False):
     BaseMoEWrapper._mesh_bootstrap_done = False
     BaseMoEWrapper._mesh_bootstrap_log_count = 0
     BaseMoEWrapper._mesh_decode_token_seq = 0
+    BaseMoEWrapper._mesh_timeline_seq = 0
+    BaseMoEWrapper._mesh_current_timeline_step = 0
+    BaseMoEWrapper._mesh_prefill_chunk_seq = 0
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
     BaseMoEWrapper._mesh_prefill_session_seen = False
     BaseMoEWrapper._mesh_decode_transition_done = False
@@ -1584,6 +1614,9 @@ def install_base_moe_helpers(wrapper_cls, buffer_cls, pin_memory: bool) -> None:
     wrapper_cls._mesh_bootstrap_done = False
     wrapper_cls._mesh_bootstrap_log_count = 0
     wrapper_cls._mesh_decode_token_seq = 0
+    wrapper_cls._mesh_timeline_seq = 0
+    wrapper_cls._mesh_current_timeline_step = 0
+    wrapper_cls._mesh_prefill_chunk_seq = 0
     wrapper_cls._mesh_early_capacity_logged = set()
     wrapper_cls._mesh_prefill_window_layers = set()
     wrapper_cls._mesh_prefill_session_seen = False

@@ -9,7 +9,9 @@
       maybe_transition_decode_cache_for_forward(qlen);
       complete_ready_prefetches();
       refresh_lookahead_heat();
-      if (qlen > 1 && forward_prefill_streaming_slots(qlen, k, expert_ids, weights, input, output)) {
+      if (qlen > 1 &&
+          forward_prefill_streaming_slots(qlen, k, expert_ids, weights, input, output,
+                                          current_forward_schedule_key_)) {
         return;
       }
       mesh::collect_unique_cpu_experts(config_, expert_ids, qlen * k, active_experts);

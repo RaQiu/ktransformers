@@ -2,7 +2,7 @@
 // Keep declarations free of namespace wrappers and include guards.
 
   bool forward_prefill_streaming_slots(int qlen, int k, const int64_t* expert_ids, const float* weights,
-                                       const void* input, void* output) {
+                                       const void* input, void* output, int64_t schedule_key) {
 #ifndef _WIN32
     if (!resident_io_enabled() || !slot_pool_enabled() || qlen <= 1) return false;
 
@@ -129,7 +129,12 @@
     if (config_.mesh_prefill_layer_mode_enabled && expert_frequency_total_ > 0 && prefill_static_capacity_ > 0) {
       rebuild_prefill_static_expert_set_by_frequency(prefill_static_capacity_);
     }
-    ensure_prefill_static_residents();
+
+    std::vector<int> static_active_experts;
+    std::vector<int> scratch_active_experts;
+    mesh::split_prefill_static_and_scratch_experts(
+        active_experts, prefill_static_expert_mask_, static_active_experts, scratch_active_experts);
+    ensure_prefill_static_residents(&static_active_experts);
     // The qlen==1 path can submit async prefetches into scratch slots before a
     // later qlen>1 prefill chunk enters this streaming path. Drain them before
     // scratch scheduling, otherwise release_prefill_scratch_slots observes
@@ -145,11 +150,6 @@
           << " capacity=" << cache_capacity_ << resident_debug_summary();
       throw std::runtime_error(oss.str());
     }
-
-    std::vector<int> static_active_experts;
-    std::vector<int> scratch_active_experts;
-    mesh::split_prefill_static_and_scratch_experts(
-        active_experts, prefill_static_expert_mask_, static_active_experts, scratch_active_experts);
 
     std::vector<uint8_t> protected_mask = mesh::build_protected_mask(config_, active_experts);
     eviction_protected_mask_ = &protected_mask;
@@ -405,6 +405,7 @@
     if (stream_trace) {
       mesh::PrefillStaticScratchTraceData trace_data;
       trace_data.qlen = qlen;
+      trace_data.schedule_key = schedule_key;
       trace_data.active = activated_expert;
       trace_data.static_active = static_active_experts.size();
       trace_data.scratch_active = scratch_active_experts.size();

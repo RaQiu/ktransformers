@@ -51,6 +51,7 @@ enum class ExpertLoadSource : uint8_t {
   DeferredTopK = 1,
   ColdStartWarmFill = 2,
   Explicit = 3,
+  PrefillActive = 4,
 };
 
 enum class ExpertLoadState : uint8_t {

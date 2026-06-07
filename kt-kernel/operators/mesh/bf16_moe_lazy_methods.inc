@@ -538,11 +538,12 @@
     }
   }
 
-  void promote_pending_task_for_demand(int expert_id) {
+  void promote_pending_task_for_demand(int expert_id, int64_t schedule_key = 0) {
     if (expert_id < 0 || expert_id >= static_cast<int>(pending_prefetches_.size())) return;
     const uint64_t task_id = pending_prefetches_[expert_id].task_id;
     if (task_id == 0) return;
-    const mesh::ExpertTaskPromoteResult result = expert_load_scheduler_.promote_pending_for_demand(task_id);
+    const mesh::ExpertTaskPromoteResult result =
+        expert_load_scheduler_.promote_pending_for_demand(task_id, schedule_key);
     if (result.joined_warmfill) {
       if (auto* stats = mesh::enabled_cache_stats(config_)) {
         stats->demand_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
@@ -599,6 +600,9 @@
                                                    down_full_io,
                                                    read_priority_for_task(task_snapshot.source),
                                                    &read_batch);
+      for (auto& request : read_batch) {
+        request.schedule_key = task_snapshot.schedule_key;
+      }
       std::vector<uint64_t> request_ids = config_.async_reader->submit_reads(read_batch);
       record_iouring_read_stats(read_batch);
       if (request_ids.empty()) {
@@ -810,11 +814,15 @@
       return 0;
     }
     complete_ready_prefetches();
-    const bool is_bootstrap_prefetch = prefetch_kind == 1;
-    const ExpertLoadSource source =
-        is_bootstrap_prefetch ? ExpertLoadSource::ColdStartWarmFill : ExpertLoadSource::DeferredTopK;
+    const bool is_background_warmfill = prefetch_kind == 1;
+    const bool is_prefill_active = prefetch_kind == 2;
+    const bool is_bootstrap_prefetch = is_background_warmfill;
+    const ExpertLoadSource source = is_background_warmfill
+                                        ? ExpertLoadSource::ColdStartWarmFill
+                                        : (is_prefill_active ? ExpertLoadSource::PrefillActive
+                                                             : ExpertLoadSource::DeferredTopK);
     uint64_t warmfill_epoch = 0;
-    if (is_bootstrap_prefetch) {
+    if (is_background_warmfill) {
       if (expert_load_scheduler_.coldstart_warmfill_submitted()) {
         if (auto* stats = mesh::enabled_cache_stats(config_)) {
           stats->speculative_prefetch_blocked_count.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
@@ -846,7 +854,7 @@
 
       const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
       if (state != EXPERT_BASELINE) {
-        if (!is_bootstrap_prefetch && state == EXPERT_PREFETCHING &&
+        if (!is_background_warmfill && state == EXPERT_PREFETCHING &&
             promote_queued_task_for_deferred(expert_id, schedule_key, &protected_mask)) {
           submitted += 1;
         }
@@ -857,7 +865,7 @@
         submitted += 1;
       }
     }
-    if (is_bootstrap_prefetch) {
+    if (is_background_warmfill) {
       mesh::record_cache_prefetch_submit(config_, static_cast<uint64_t>(submitted));
       drain_expert_load_queue(true);
     } else {
@@ -889,7 +897,8 @@
                      schedule_key);
   }
 
-  int prepare_prefill_layer_window() {
+  int prepare_prefill_layer_window(int64_t schedule_key = 0) {
+    (void)schedule_key;
     complete_ready_prefetches();
     return 0;
   }

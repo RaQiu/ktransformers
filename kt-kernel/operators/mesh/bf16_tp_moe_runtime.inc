@@ -169,14 +169,14 @@
         });
   }
 
-  void mesh_prepare_prefill_layer_binding() {
+  void mesh_prepare_prefill_layer_binding(int64_t schedule_key = 0) {
     if (!this->weights_loaded) return;
     if (this->tp_count <= 1) {
-      this->tps[0]->prepare_prefill_layer_window();
+      this->tps[0]->prepare_prefill_layer_window(schedule_key);
       return;
     }
     this->config.pool->dispense_backend()->do_numa_job(
-        [this](int tp_id) { this->tps[tp_id]->prepare_prefill_layer_window(); });
+        [this, schedule_key](int tp_id) { this->tps[tp_id]->prepare_prefill_layer_window(schedule_key); });
   }
 
   void mesh_release_prefill_layer_binding() {

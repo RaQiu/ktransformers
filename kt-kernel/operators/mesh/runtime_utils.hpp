@@ -537,6 +537,7 @@ inline PrefillScratchStateCounts count_prefill_scratch_states(const GeneralMOECo
 
 struct PrefillStaticScratchTraceData {
   int qlen = 0;
+  int64_t schedule_key = 0;
   int active = 0;
   size_t static_active = 0;
   size_t scratch_active = 0;
@@ -560,7 +561,8 @@ inline void log_prefill_static_scratch_trace(const GeneralMOEConfig& config,
                                              int tp_part_idx,
                                              const PrefillStaticScratchTraceData& data) {
   std::fprintf(stderr,
-               "[MESH_PREFILL_STATIC_SCRATCH_TRACE] layer=%d tp=%d qlen=%d active=%d static_active=%zu "
+               "[MESH_PREFILL_STATIC_SCRATCH_TRACE] layer=%d tp=%d qlen=%d schedule_key=%lld "
+               "active=%d static_active=%zu "
                "scratch_active=%zu scratch_hit_before=%d scratch_cold_before=%d "
                "scratch_inflight_before=%d scratch_other_before=%d static_slots=%d scratch_slots=%d "
                "scratch_submit_us=%llu scratch_wait_us=%llu static_compute_us=%llu scratch_compute_us=%llu "
@@ -583,6 +585,7 @@ inline void log_prefill_static_scratch_trace(const GeneralMOEConfig& config,
                config.layer_idx,
                tp_part_idx,
                data.qlen,
+               static_cast<long long>(data.schedule_key),
                data.active,
                data.static_active,
                data.scratch_active,

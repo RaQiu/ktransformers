@@ -469,7 +469,9 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE_Common<AMX_BF16_MOE_TP<K>> {
                                    intptr_t router_scores,
                                    int score_rows,
                                    int score_cols,
-                                   int score_transform) {
+                                   int score_transform,
+                                   int64_t schedule_key = 0) {
+    (void)schedule_key;
     this->observe_router_scores_binding(router_scores, score_rows, score_cols, score_transform);
     forward((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
             incremental);

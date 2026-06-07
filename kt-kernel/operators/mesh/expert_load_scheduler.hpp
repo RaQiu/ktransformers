@@ -166,7 +166,7 @@ class ExpertLoadScheduler {
     return result;
   }
 
-  ExpertTaskPromoteResult promote_pending_for_demand(uint64_t task_id) {
+  ExpertTaskPromoteResult promote_pending_for_demand(uint64_t task_id, int64_t schedule_key = 0) {
     std::lock_guard<std::mutex> guard(mu_);
     ExpertTaskPromoteResult result;
     if (task_id == 0) return result;
@@ -175,7 +175,7 @@ class ExpertLoadScheduler {
     ExpertLoadTask& task = it->second;
     if (task.state != ExpertLoadState::Queued) return result;
     result.joined_warmfill = task.source == ExpertLoadSource::ColdStartWarmFill;
-    task.schedule_key = 0;
+    task.schedule_key = schedule_key;
     task.source = ExpertLoadSource::Demand;
     task.queue_generation += 1;
     queue_.push(ExpertLoadQueueEntry{task.schedule_key, task.sequence, task.queue_generation, task.task_id});

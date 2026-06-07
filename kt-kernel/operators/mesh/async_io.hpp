@@ -54,6 +54,7 @@ public:
         off_t offset;
         uint64_t user_data;  // For completion matching
         ReadPriority priority = ReadPriority::Prefetch;
+        int64_t schedule_key = 0;
         // When non-zero, a short read is considered successful if it covers at
         // least this many bytes. This is used for O_DIRECT over-reads that may
         // legally reach EOF after the logical payload has already been read.
@@ -96,7 +97,8 @@ public:
                          size_t size,
                          off_t offset,
                          int expert_id,
-                         ReadPriority priority = ReadPriority::Prefetch);
+                         ReadPriority priority = ReadPriority::Prefetch,
+                         int64_t schedule_key = 0);
 
     /**
      * @brief Submit multiple async read requests with one batched ring flush.
@@ -196,11 +198,15 @@ private:
         uint64_t request_id = 0;
         std::shared_ptr<RequestInfo> request;
         ReadPriority priority = ReadPriority::Prefetch;
+        int64_t schedule_key = 0;
         uint64_t sequence = 0;
     };
 
     struct ReadJobCompare {
         bool operator()(const ReadJob& lhs, const ReadJob& rhs) const {
+            if (lhs.schedule_key != rhs.schedule_key) {
+                return lhs.schedule_key > rhs.schedule_key;
+            }
             const int lhs_priority = static_cast<int>(lhs.priority);
             const int rhs_priority = static_cast<int>(rhs.priority);
             if (lhs_priority != rhs_priority) {

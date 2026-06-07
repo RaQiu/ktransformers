@@ -111,7 +111,8 @@ uint64_t AsyncExpertReader::submit_read(int fd,
                                         size_t size,
                                         off_t offset,
                                         int expert_id,
-                                        ReadPriority priority) {
+                                        ReadPriority priority,
+                                        int64_t schedule_key) {
 #ifdef HAVE_LIBURING
     uint64_t user_data = next_user_data_.fetch_add(1, std::memory_order_acq_rel);
 
@@ -131,7 +132,7 @@ uint64_t AsyncExpertReader::submit_read(int fd,
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex_);
         const uint64_t sequence = next_queue_sequence_.fetch_add(1, std::memory_order_acq_rel);
-        pending_jobs_.push(ReadJob{user_data, request, priority, sequence});
+        pending_jobs_.push(ReadJob{user_data, request, priority, schedule_key, sequence});
     }
     queue_cv_.notify_one();
 
@@ -177,7 +178,7 @@ std::vector<uint64_t> AsyncExpertReader::submit_reads(const std::vector<ReadRequ
             request->result.store(0, std::memory_order_release);
             requests_[user_data] = request;
             request_ids.push_back(user_data);
-            jobs.push_back(ReadJob{user_data, std::move(request), req.priority, 0});
+            jobs.push_back(ReadJob{user_data, std::move(request), req.priority, req.schedule_key, 0});
         }
     }
     const auto bookkeeping_end = std::chrono::steady_clock::now();

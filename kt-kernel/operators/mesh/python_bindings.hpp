@@ -55,6 +55,7 @@ class ForwardWithScoresBindings {
     int score_rows;
     int score_cols;
     int score_transform;
+    int64_t schedule_key;
   };
 
   static void inner(void* args) {
@@ -71,7 +72,8 @@ class ForwardWithScoresBindings {
                              args_->router_scores,
                              args_->score_rows,
                              args_->score_cols,
-                             args_->score_transform);
+                             args_->score_transform,
+                             args_->schedule_key);
   }
 
   static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe,
@@ -85,7 +87,8 @@ class ForwardWithScoresBindings {
                                                           intptr_t router_scores,
                                                           int score_rows,
                                                           int score_cols,
-                                                          int score_transform) {
+                                                          int score_transform,
+                                                          int64_t schedule_key = 0) {
     Args* args = new Args{nullptr,
                           moe.get(),
                           qlen,
@@ -98,7 +101,8 @@ class ForwardWithScoresBindings {
                           router_scores,
                           score_rows,
                           score_cols,
-                          score_transform};
+                          score_transform,
+                          schedule_key};
     return std::make_pair(reinterpret_cast<intptr_t>(&inner), reinterpret_cast<intptr_t>(args));
   }
 };
@@ -265,15 +269,17 @@ class PreparePrefillLayerBindings {
   struct Args {
     CPUInfer* cpuinfer;
     MoeClass* moe;
+    int64_t schedule_key;
   };
 
   static void inner(void* args) {
     Args* args_ = static_cast<Args*>(args);
-    args_->cpuinfer->enqueue(&MoeClass::mesh_prepare_prefill_layer_binding, args_->moe);
+    args_->cpuinfer->enqueue(&MoeClass::mesh_prepare_prefill_layer_binding, args_->moe, args_->schedule_key);
   }
 
-  static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe) {
-    Args* args = new Args{nullptr, moe.get()};
+  static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe,
+                                                          int64_t schedule_key = 0) {
+    Args* args = new Args{nullptr, moe.get(), schedule_key};
     return std::make_pair(reinterpret_cast<intptr_t>(&inner), reinterpret_cast<intptr_t>(args));
   }
 };
@@ -327,7 +333,7 @@ template <class MoeClass, class PyClass>
 void bind_moe_runtime_methods(PyClass& moe_cls) {
   if constexpr (requires(MoeClass moe, intptr_t qlen, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
                          intptr_t output, bool incremental, intptr_t router_scores, int score_rows, int score_cols,
-                         int score_transform) {
+                         int score_transform, int64_t schedule_key) {
                   moe.forward_binding_with_scores(qlen,
                                                   k,
                                                   expert_ids,
@@ -338,7 +344,8 @@ void bind_moe_runtime_methods(PyClass& moe_cls) {
                                                   router_scores,
                                                   score_rows,
                                                   score_cols,
-                                                  score_transform);
+                                                  score_transform,
+                                                  schedule_key);
                 }) {
     moe_cls.def("forward_task",
                 &ForwardWithScoresBindings<MoeClass>::cpuinfer_interface,
@@ -352,7 +359,8 @@ void bind_moe_runtime_methods(PyClass& moe_cls) {
                 pybind11::arg("router_scores"),
                 pybind11::arg("score_rows"),
                 pybind11::arg("score_cols"),
-                pybind11::arg("score_transform"));
+                pybind11::arg("score_transform"),
+                pybind11::arg("schedule_key") = 0);
   }
 
   if constexpr (requires(MoeClass moe, intptr_t scores, int rows, int cols, int score_transform) {
@@ -485,13 +493,14 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
                 "Split top-k experts by current CPU residency state and prefetch deferred cold misses");
   }
 
-  if constexpr (requires(MoeClass moe) {
-                  moe.mesh_prepare_prefill_layer_binding();
+  if constexpr (requires(MoeClass moe, int64_t schedule_key) {
+                  moe.mesh_prepare_prefill_layer_binding(schedule_key);
                   moe.mesh_release_prefill_layer_binding();
                   moe.mesh_transition_decode_cache_binding(0, 0);
                 }) {
     moe_cls.def("mesh_prepare_prefill_layer_task",
                 &PreparePrefillLayerBindings<MoeClass>::cpuinfer_interface,
+                pybind11::arg("schedule_key") = 0,
                 "Prepare MESH prefill static CPU expert slots for this layer");
     moe_cls.def("mesh_release_prefill_layer_task",
                 &ReleasePrefillLayerBindings<MoeClass>::cpuinfer_interface,
@@ -503,6 +512,7 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
                 "Trim this layer to decode hot-cache capacity and submit Heat-based refill prefetches");
     moe_cls.def("mesh_prepare_prefill_layer",
                 &MoeClass::mesh_prepare_prefill_layer_binding,
+                pybind11::arg("schedule_key") = 0,
                 "Prepare MESH prefill static CPU expert slots for this layer");
     moe_cls.def("mesh_release_prefill_layer",
                 &MoeClass::mesh_release_prefill_layer_binding,
