@@ -1915,7 +1915,7 @@
       expert_to_slot_[expert_id] = next_slot;
       slot_states_[next_slot].store(SLOT_READY, std::memory_order_release);
 
-      // Wire AMX kernel pointer chain (matches what submit_prefill_promotion_to_slot
+      // Wire AMX kernel pointer chain (matches what submit_fixed_queue_promotion_to_slot
       // does after a successful io_uring read).
       packed_gate_owner_[expert_id] = slot_gate_owner_[next_slot];
       packed_up_owner_[expert_id] = slot_up_owner_[next_slot];
@@ -1957,12 +1957,13 @@
     return ok;
   }
 
-  bool submit_prefill_promotion_to_slot(int expert_id,
-                                        int slot,
-                                        std::vector<BatchPromotion>* promotions,
-                                        std::vector<ktransformers::AsyncExpertReader::ReadRequest>* read_batch,
-                                        PrefillPromotionTiming* timing = nullptr) {
-    if (promotions == nullptr || read_batch == nullptr) return false;
+  bool submit_fixed_queue_promotion_to_slot(int expert_id,
+                                            int slot,
+                                            mesh::FixedExpertQueueBatch* batch) {
+    if (batch == nullptr) return false;
+    std::vector<BatchPromotion>* promotions = &batch->promotions;
+    std::vector<ktransformers::AsyncExpertReader::ReadRequest>* read_batch = &batch->read_batch;
+    PrefillPromotionTiming* timing = &batch->timing;
     if (!iouring_enabled() || config_.async_reader == nullptr || !slot_pool_enabled()) return false;
     if (expert_id < 0 || expert_id >= config_.expert_num || config_.should_skip_expert(expert_id)) return true;
     if (slot < 0 || slot >= cache_capacity_) return false;
@@ -2065,8 +2066,8 @@
                                                 promotion.down_owner,
                                                 read_batch);
         for (size_t req_idx = request_begin; req_idx < read_batch->size(); ++req_idx) {
-          (*read_batch)[req_idx].priority = ktransformers::AsyncExpertReader::ReadPriority::Demand;
-          (*read_batch)[req_idx].schedule_key = current_forward_schedule_key_;
+          (*read_batch)[req_idx].priority = read_priority_for_task(batch->request.source);
+          (*read_batch)[req_idx].schedule_key = batch->request.schedule_key;
         }
       } catch (...) {
         if (timing != nullptr) {
@@ -2093,9 +2094,9 @@
 #endif
   }
 
-  void rollback_prefill_promotions(std::vector<BatchPromotion>* promotions) {
-    if (promotions == nullptr) return;
-    for (auto& promotion : *promotions) {
+  void rollback_fixed_queue_promotions(mesh::FixedExpertQueueBatch* batch) {
+    if (batch == nullptr) return;
+    for (auto& promotion : batch->promotions) {
       if (promotion.slot >= 0) {
         (void)unbind_slot(promotion.slot, true, false);
         release_empty_slot_buffers_if_any(promotion.slot);
@@ -2106,38 +2107,38 @@
     }
   }
 
-  void submit_prefill_promotion_reads(std::vector<BatchPromotion>* promotions,
-                                      const std::vector<ktransformers::AsyncExpertReader::ReadRequest>& read_batch,
-                                      std::vector<uint64_t>* all_requests,
-                                      PrefillPromotionTiming* timing = nullptr) {
+  void submit_fixed_queue_reads(mesh::FixedExpertQueueBatch* batch) {
 #ifndef HAVE_LIBURING
-    (void)promotions;
-    (void)read_batch;
-    (void)all_requests;
-    (void)timing;
+    (void)batch;
     return;
 #else
-    mesh::submit_prefill_promotion_reads(config_, tp_part_idx, promotions, read_batch, all_requests, timing);
+    if (batch == nullptr) return;
+    mesh::submit_prefill_promotion_reads(config_,
+                                         tp_part_idx,
+                                         &batch->promotions,
+                                         batch->read_batch,
+                                         &batch->request_ids,
+                                         &batch->timing);
 #endif
   }
 
-  void wait_and_finalize_prefill_promotions(std::vector<BatchPromotion>* promotions,
-                                            const std::vector<uint64_t>& all_requests,
-                                            const char* label) {
-    if (promotions == nullptr || all_requests.empty()) return;
+  void wait_and_finalize_fixed_queue(mesh::FixedExpertQueueBatch* batch, const char* label) {
+    if (batch == nullptr || batch->request_ids.empty()) return;
     const int timeout_ms = 60000;
-    if (!config_.async_reader->wait_for_requests(all_requests, timeout_ms)) {
+    if (!config_.async_reader->wait_for_requests(batch->request_ids, timeout_ms)) {
       std::ostringstream oss;
       oss << "AMX io_uring prefill promotion failed layer=" << config_.layer_idx << " tp=" << tp_part_idx
-          << " label=" << (label != nullptr ? label : "unknown") << " experts=" << promotions->size()
-          << " requests=" << all_requests.size() << " inflight=" << config_.async_reader->get_inflight_count()
+          << " label=" << (label != nullptr ? label : mesh::fixed_expert_queue_region_name(batch->request.region))
+          << " region=" << mesh::fixed_expert_queue_region_name(batch->request.region)
+          << " experts=" << batch->promotions.size()
+          << " requests=" << batch->request_ids.size() << " inflight=" << config_.async_reader->get_inflight_count()
           << " timeout_ms=" << timeout_ms << " detail="
-          << config_.async_reader->describe_requests(all_requests);
-      rollback_prefill_promotions(promotions);
+          << config_.async_reader->describe_requests(batch->request_ids);
+      rollback_fixed_queue_promotions(batch);
       throw std::runtime_error(oss.str());
     }
 
-    for (auto& promotion : *promotions) {
+    for (auto& promotion : batch->promotions) {
       finalize_expert_buffers(promotion.expert_id,
                               promotion.gate_owner,
                               promotion.up_owner,
@@ -2161,11 +2162,16 @@
 
     const std::vector<int>& experts_to_load =
         active_static_experts != nullptr ? *active_static_experts : prefill_static_experts_;
-    std::vector<BatchPromotion> promotions;
-    std::vector<ktransformers::AsyncExpertReader::ReadRequest> read_batch;
-    std::vector<uint64_t> all_requests;
-    promotions.reserve(experts_to_load.size());
-    read_batch.reserve(experts_to_load.size() * 9);
+    mesh::FixedExpertQueueRequest queue_request;
+    queue_request.region = mesh::FixedExpertQueueRegion::PrefillStatic;
+    queue_request.source = ExpertLoadSource::PrefillActive;
+    queue_request.schedule_key = current_forward_schedule_key_;
+    queue_request.slot_begin = 0;
+    queue_request.slot_end = prefill_static_slot_count_;
+    queue_request.max_to_submit = static_cast<int>(experts_to_load.size());
+    queue_request.wait_mode = mesh::FixedExpertQueueWaitMode::Blocking;
+    mesh::FixedExpertQueueBatch queue_batch(queue_request);
+    queue_batch.reserve_experts(experts_to_load.size());
     for (int expert_id : experts_to_load) {
       if (expert_id < 0 || expert_id >= config_.expert_num) continue;
       if (active_static_experts != nullptr &&
@@ -2174,8 +2180,7 @@
         continue;
       }
       const int slot = prefill_static_slot_for_expert(expert_id);
-      if (!submit_prefill_promotion_to_slot(
-              expert_id, slot, &promotions, &read_batch, &last_prefill_static_timing_)) {
+      if (!submit_fixed_queue_promotion_to_slot(expert_id, slot, &queue_batch)) {
         std::ostringstream oss;
         oss << "AMX prefill static promotion could not reserve slot layer=" << config_.layer_idx
             << " tp=" << tp_part_idx << " expert=" << expert_id << " slot=" << slot
@@ -2187,12 +2192,13 @@
       }
     }
     try {
-      submit_prefill_promotion_reads(&promotions, read_batch, &all_requests, &last_prefill_static_timing_);
+      submit_fixed_queue_reads(&queue_batch);
     } catch (...) {
-      rollback_prefill_promotions(&promotions);
+      rollback_fixed_queue_promotions(&queue_batch);
       throw;
     }
-    wait_and_finalize_prefill_promotions(&promotions, all_requests, "static");
+    wait_and_finalize_fixed_queue(&queue_batch, "static");
+    last_prefill_static_timing_ = queue_batch.timing;
     return static_cast<int>(experts_to_load.size());
   }
 
