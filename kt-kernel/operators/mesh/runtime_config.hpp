@@ -167,6 +167,14 @@ struct ExpertCacheStats {
   std::atomic<uint64_t> state_defer_deferred_count{0};   // Non-ready entries absorbed by defer window
   std::atomic<uint64_t> state_defer_overflow_immediate_count{0}; // Non-ready entries left immediate
   std::atomic<uint64_t> state_defer_overflow_token_count{0};     // Rows with any immediate overflow
+  std::atomic<uint64_t> demand_cold_load_count{0};        // Current demand cold expert loads
+  std::atomic<uint64_t> defer_cold_load_count{0};         // Deferred top-k cold expert loads
+  std::atomic<uint64_t> coldstart_warmfill_queued_count{0};    // Decode-entry warm-fill tasks queued
+  std::atomic<uint64_t> coldstart_warmfill_submitted_count{0}; // Decode-entry warm-fill tasks submitted
+  std::atomic<uint64_t> coldstart_warmfill_cancel_count{0};    // Queued warm-fill tasks canceled
+  std::atomic<uint64_t> speculative_prefetch_blocked_count{0}; // Runtime speculative prefetches blocked
+  std::atomic<uint64_t> demand_join_warmfill_count{0};    // Demand joined/upgraded warm-fill task
+  std::atomic<uint64_t> defer_join_warmfill_count{0};     // Defer joined/upgraded warm-fill task
 
   double hit_rate() const {
     uint64_t total = hit_count.load() + miss_count.load();
@@ -284,6 +292,14 @@ struct ExpertCacheStats {
     state_defer_deferred_count.store(0);
     state_defer_overflow_immediate_count.store(0);
     state_defer_overflow_token_count.store(0);
+    demand_cold_load_count.store(0);
+    defer_cold_load_count.store(0);
+    coldstart_warmfill_queued_count.store(0);
+    coldstart_warmfill_submitted_count.store(0);
+    coldstart_warmfill_cancel_count.store(0);
+    speculative_prefetch_blocked_count.store(0);
+    demand_join_warmfill_count.store(0);
+    defer_join_warmfill_count.store(0);
     dump_tick.store(0);
     std::lock_guard<std::mutex> guard(expert_mu);
     for (int i = 0; i < expert_num; ++i) {
@@ -357,7 +373,19 @@ struct ExpertCacheStats {
         << ",\"state_defer_overflow_immediate_count\":"
         << state_defer_overflow_immediate_count.load(std::memory_order_relaxed)
         << ",\"state_defer_overflow_token_count\":"
-        << state_defer_overflow_token_count.load(std::memory_order_relaxed);
+        << state_defer_overflow_token_count.load(std::memory_order_relaxed)
+        << ",\"demand_cold_load_count\":" << demand_cold_load_count.load(std::memory_order_relaxed)
+        << ",\"defer_cold_load_count\":" << defer_cold_load_count.load(std::memory_order_relaxed)
+        << ",\"coldstart_warmfill_queued_count\":"
+        << coldstart_warmfill_queued_count.load(std::memory_order_relaxed)
+        << ",\"coldstart_warmfill_submitted_count\":"
+        << coldstart_warmfill_submitted_count.load(std::memory_order_relaxed)
+        << ",\"coldstart_warmfill_cancel_count\":"
+        << coldstart_warmfill_cancel_count.load(std::memory_order_relaxed)
+        << ",\"speculative_prefetch_blocked_count\":"
+        << speculative_prefetch_blocked_count.load(std::memory_order_relaxed)
+        << ",\"demand_join_warmfill_count\":" << demand_join_warmfill_count.load(std::memory_order_relaxed)
+        << ",\"defer_join_warmfill_count\":" << defer_join_warmfill_count.load(std::memory_order_relaxed);
     append_counter_array("expert_access", expert_access_count);
     append_counter_array("expert_hit", expert_hit_count);
     append_counter_array("expert_miss", expert_miss_count);

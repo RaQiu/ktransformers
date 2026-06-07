@@ -186,6 +186,7 @@ class PrefetchExpertsBindings {
     int protect_count;
     int max_to_submit;
     int prefetch_kind;
+    int64_t schedule_key;
   };
 
   static void inner(void* args) {
@@ -197,7 +198,8 @@ class PrefetchExpertsBindings {
                              args_->protect_ids,
                              args_->protect_count,
                              args_->max_to_submit,
-                             args_->prefetch_kind);
+                             args_->prefetch_kind,
+                             args_->schedule_key);
   }
 
   static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe,
@@ -206,9 +208,10 @@ class PrefetchExpertsBindings {
                                                           intptr_t protect_ids = 0,
                                                           int protect_count = 0,
                                                           int max_to_submit = 0,
-                                                          int prefetch_kind = 0) {
+                                                          int prefetch_kind = 0,
+                                                          int64_t schedule_key = 0) {
     Args* args = new Args{nullptr, moe.get(), expert_ids, count, protect_ids, protect_count, max_to_submit,
-                          prefetch_kind};
+                          prefetch_kind, schedule_key};
     return std::make_pair(reinterpret_cast<intptr_t>(&inner), reinterpret_cast<intptr_t>(args));
   }
 };
@@ -225,6 +228,7 @@ class SplitDeferredExpertsBindings {
     int count;
     int k;
     int max_deferred_per_token;
+    int64_t defer_schedule_key;
   };
 
   static void inner(void* args) {
@@ -236,7 +240,8 @@ class SplitDeferredExpertsBindings {
                              args_->deferred_ids,
                              args_->count,
                              args_->k,
-                             args_->max_deferred_per_token);
+                             args_->max_deferred_per_token,
+                             args_->defer_schedule_key);
   }
 
   static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe,
@@ -245,9 +250,11 @@ class SplitDeferredExpertsBindings {
                                                           intptr_t deferred_ids,
                                                           int count,
                                                           int k,
-                                                          int max_deferred_per_token) {
+                                                          int max_deferred_per_token,
+                                                          int64_t defer_schedule_key = 0) {
     Args* args =
-        new Args{nullptr, moe.get(), source_ids, immediate_ids, deferred_ids, count, k, max_deferred_per_token};
+        new Args{nullptr, moe.get(), source_ids, immediate_ids, deferred_ids, count, k, max_deferred_per_token,
+                 defer_schedule_key};
     return std::make_pair(reinterpret_cast<intptr_t>(&inner), reinterpret_cast<intptr_t>(args));
   }
 };
@@ -420,9 +427,9 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
   }
 
   if constexpr (requires(MoeClass moe, intptr_t expert_ids, int count, intptr_t protect_ids, int protect_count,
-                         int max_to_submit, int prefetch_kind) {
+                         int max_to_submit, int prefetch_kind, int64_t schedule_key) {
                   moe.prefetch_experts_binding(expert_ids, count, protect_ids, protect_count, max_to_submit,
-                                               prefetch_kind);
+                                               prefetch_kind, schedule_key);
                 }) {
     moe_cls.def("prefetch_experts_task",
                 &PrefetchExpertsBindings<MoeClass>::cpuinfer_interface,
@@ -432,6 +439,7 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
                 pybind11::arg("protect_count") = 0,
                 pybind11::arg("max_to_submit") = 0,
                 pybind11::arg("prefetch_kind") = 0,
+                pybind11::arg("schedule_key") = 0,
                 "Submit non-blocking io_uring reads for selected experts without running AMX compute");
     moe_cls.def("prefetch_experts",
                 &MoeClass::prefetch_experts_binding,
@@ -441,17 +449,19 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
                 pybind11::arg("protect_count") = 0,
                 pybind11::arg("max_to_submit") = 0,
                 pybind11::arg("prefetch_kind") = 0,
+                pybind11::arg("schedule_key") = 0,
                 "Submit non-blocking io_uring reads for selected experts without running AMX compute");
   }
 
   if constexpr (requires(MoeClass moe, intptr_t source_ids, intptr_t immediate_ids, intptr_t deferred_ids, int count,
-                         int k, int max_deferred_per_token) {
+                         int k, int max_deferred_per_token, int64_t defer_schedule_key) {
                   moe.split_deferred_experts_binding(source_ids,
                                                      immediate_ids,
                                                      deferred_ids,
                                                      count,
                                                      k,
-                                                     max_deferred_per_token);
+                                                     max_deferred_per_token,
+                                                     defer_schedule_key);
                 }) {
     moe_cls.def("split_deferred_experts_task",
                 &SplitDeferredExpertsBindings<MoeClass>::cpuinfer_interface,
@@ -461,6 +471,7 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
                 pybind11::arg("count"),
                 pybind11::arg("k"),
                 pybind11::arg("max_deferred_per_token"),
+                pybind11::arg("defer_schedule_key") = 0,
                 "Split top-k experts by current CPU residency state and prefetch deferred cold misses");
     moe_cls.def("split_deferred_experts",
                 &MoeClass::split_deferred_experts_binding,
@@ -470,6 +481,7 @@ void bind_moe_residency_methods(PyClass& moe_cls) {
                 pybind11::arg("count"),
                 pybind11::arg("k"),
                 pybind11::arg("max_deferred_per_token"),
+                pybind11::arg("defer_schedule_key") = 0,
                 "Split top-k experts by current CPU residency state and prefetch deferred cold misses");
   }
 

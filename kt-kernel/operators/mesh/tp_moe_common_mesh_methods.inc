@@ -43,6 +43,14 @@
           {"state_defer_deferred_count", 0.0},
           {"state_defer_overflow_immediate_count", 0.0},
           {"state_defer_overflow_token_count", 0.0},
+          {"demand_cold_load_count", 0.0},
+          {"defer_cold_load_count", 0.0},
+          {"coldstart_warmfill_queued_count", 0.0},
+          {"coldstart_warmfill_submitted_count", 0.0},
+          {"coldstart_warmfill_cancel_count", 0.0},
+          {"speculative_prefetch_blocked_count", 0.0},
+          {"demand_join_warmfill_count", 0.0},
+          {"defer_join_warmfill_count", 0.0},
           {"hit_rate", 0.0},
       };
     }
@@ -77,6 +85,14 @@
         {"state_defer_deferred_count", static_cast<double>(stats->state_defer_deferred_count.load(std::memory_order_relaxed))},
         {"state_defer_overflow_immediate_count", static_cast<double>(stats->state_defer_overflow_immediate_count.load(std::memory_order_relaxed))},
         {"state_defer_overflow_token_count", static_cast<double>(stats->state_defer_overflow_token_count.load(std::memory_order_relaxed))},
+        {"demand_cold_load_count", static_cast<double>(stats->demand_cold_load_count.load(std::memory_order_relaxed))},
+        {"defer_cold_load_count", static_cast<double>(stats->defer_cold_load_count.load(std::memory_order_relaxed))},
+        {"coldstart_warmfill_queued_count", static_cast<double>(stats->coldstart_warmfill_queued_count.load(std::memory_order_relaxed))},
+        {"coldstart_warmfill_submitted_count", static_cast<double>(stats->coldstart_warmfill_submitted_count.load(std::memory_order_relaxed))},
+        {"coldstart_warmfill_cancel_count", static_cast<double>(stats->coldstart_warmfill_cancel_count.load(std::memory_order_relaxed))},
+        {"speculative_prefetch_blocked_count", static_cast<double>(stats->speculative_prefetch_blocked_count.load(std::memory_order_relaxed))},
+        {"demand_join_warmfill_count", static_cast<double>(stats->demand_join_warmfill_count.load(std::memory_order_relaxed))},
+        {"defer_join_warmfill_count", static_cast<double>(stats->defer_join_warmfill_count.load(std::memory_order_relaxed))},
         {"hit_rate", stats->hit_rate()},
     };
   }

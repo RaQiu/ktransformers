@@ -148,7 +148,16 @@
       }
       pending_prefetches_[expert_id].requests.clear();
       pending_prefetches_[expert_id].slot_index = -1;
+      pending_prefetches_[expert_id].task_id = 0;
       free_packed_expert(expert_id);
+    }
+    {
+      std::lock_guard<std::mutex> guard(expert_load_mu_);
+      expert_load_tasks_.clear();
+      active_task_by_expert_.assign(config_.expert_num, 0);
+      expert_load_queue_ = decltype(expert_load_queue_){};
+      queued_warmfill_tasks_.clear();
+      coldstart_warmfill_submitted_ = false;
     }
     (void)release_resident_slot_pool(false);
     release_iouring_scale_cache();
@@ -164,6 +173,14 @@
     packed_up_owner_.assign(en, nullptr);
     packed_down_owner_.assign(en, nullptr);
     pending_prefetches_.assign(en, PendingPrefetch{});
+    expert_load_tasks_.clear();
+    active_task_by_expert_.assign(en, 0);
+    expert_load_queue_ = decltype(expert_load_queue_){};
+    queued_warmfill_tasks_.clear();
+    next_expert_load_task_id_ = 1;
+    next_expert_load_sequence_ = 1;
+    coldstart_warmfill_epoch_ = 0;
+    coldstart_warmfill_submitted_ = false;
     expert_states_ = std::make_unique<std::atomic<uint8_t>[]>(en);
     active_readers_ = std::make_unique<std::atomic<uint32_t>[]>(en);
     resident_expert_count_.store(0, std::memory_order_relaxed);
@@ -989,6 +1006,369 @@
     record_iouring_read_stats(read_batch);
     return read_requests;
   }
+
+  static constexpr int64_t background_schedule_key() {
+    return std::numeric_limits<int64_t>::max();
+  }
+
+  int background_slot_limit() const {
+    return std::max(0, std::min(global_scratch_pool_begin_slot(), cache_capacity_));
+  }
+
+  bool background_capacity_reached() const {
+    const int limit = background_slot_limit();
+    return limit <= 0 || resident_expert_count_.load(std::memory_order_acquire) >= limit;
+  }
+
+  int find_empty_slot_before_limit(int slot_limit) const {
+    if (!slot_pool_enabled()) return -1;
+    const int limit = std::max(0, std::min(slot_limit, cache_capacity_));
+    for (int slot = 0; slot < limit; ++slot) {
+      if (slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
+          slot < static_cast<int>(slot_to_expert_.size()) &&
+          slot_to_expert_[slot] < 0) {
+        return slot;
+      }
+    }
+    return -1;
+  }
+
+  ktransformers::AsyncExpertReader::ReadPriority read_priority_for_task(ExpertLoadSource source) const {
+    return source == ExpertLoadSource::ColdStartWarmFill
+               ? ktransformers::AsyncExpertReader::ReadPriority::Prefetch
+               : ktransformers::AsyncExpertReader::ReadPriority::Demand;
+  }
+
+  void record_task_source_queued(ExpertLoadSource source) {
+    auto* stats = mesh::enabled_cache_stats(config_);
+    if (stats == nullptr) return;
+    if (source == ExpertLoadSource::DeferredTopK) {
+      stats->defer_cold_load_count.fetch_add(1, std::memory_order_relaxed);
+    } else if (source == ExpertLoadSource::ColdStartWarmFill) {
+      stats->coldstart_warmfill_queued_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  uint64_t enqueue_expert_load_task(int expert_id,
+                                    int64_t schedule_key,
+                                    ExpertLoadSource source,
+                                    const std::vector<uint8_t>* protected_mask,
+                                    uint64_t warmfill_epoch = 0) {
+    std::lock_guard<std::mutex> guard(expert_load_mu_);
+    if (expert_id < 0 || expert_id >= static_cast<int>(active_task_by_expert_.size())) return 0;
+    const uint64_t existing_id = active_task_by_expert_[expert_id];
+    if (existing_id != 0) {
+      auto it = expert_load_tasks_.find(existing_id);
+      if (it != expert_load_tasks_.end()) {
+        ExpertLoadTask& task = it->second;
+        if (task.state == ExpertLoadState::Queued) {
+          if (schedule_key < task.schedule_key || task.source == ExpertLoadSource::ColdStartWarmFill) {
+            if (task.source == ExpertLoadSource::ColdStartWarmFill && source == ExpertLoadSource::DeferredTopK) {
+              if (auto* stats = mesh::enabled_cache_stats(config_)) {
+                stats->defer_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
+              }
+            }
+            task.schedule_key = schedule_key;
+            task.source = source;
+            task.warmfill_epoch = warmfill_epoch;
+            task.queue_generation += 1;
+            if (protected_mask != nullptr) {
+              task.protected_mask = *protected_mask;
+            }
+            expert_load_queue_.push(ExpertLoadQueueEntry{
+                task.schedule_key, task.sequence, task.queue_generation, task.task_id});
+          }
+          return existing_id;
+        }
+        if (task.state == ExpertLoadState::Submitting || task.state == ExpertLoadState::Submitted) {
+          return existing_id;
+        }
+      }
+      active_task_by_expert_[expert_id] = 0;
+    }
+
+    const uint64_t task_id = next_expert_load_task_id_++;
+    ExpertLoadTask task;
+    task.task_id = task_id;
+    task.expert_id = expert_id;
+    task.schedule_key = schedule_key;
+    task.source = source;
+    task.state = ExpertLoadState::Queued;
+    task.queue_generation = 1;
+    task.sequence = next_expert_load_sequence_++;
+    task.warmfill_epoch = warmfill_epoch;
+    if (protected_mask != nullptr) {
+      task.protected_mask = *protected_mask;
+    }
+    expert_load_tasks_[task_id] = std::move(task);
+    active_task_by_expert_[expert_id] = task_id;
+    expert_load_queue_.push(ExpertLoadQueueEntry{schedule_key, expert_load_tasks_[task_id].sequence, 1, task_id});
+    if (source == ExpertLoadSource::ColdStartWarmFill) {
+      queued_warmfill_tasks_.push_back(task_id);
+    }
+    record_task_source_queued(source);
+    return task_id;
+  }
+
+  void cancel_queued_warmfill_epoch(uint64_t epoch) {
+    std::lock_guard<std::mutex> guard(expert_load_mu_);
+    uint64_t canceled = 0;
+    for (uint64_t task_id : queued_warmfill_tasks_) {
+      auto it = expert_load_tasks_.find(task_id);
+      if (it == expert_load_tasks_.end()) continue;
+      ExpertLoadTask& task = it->second;
+      if (task.source != ExpertLoadSource::ColdStartWarmFill ||
+          task.warmfill_epoch != epoch ||
+          task.state != ExpertLoadState::Queued) {
+        continue;
+      }
+      task.state = ExpertLoadState::Canceled;
+      task.queue_generation += 1;
+      if (task.expert_id >= 0 && task.expert_id < static_cast<int>(active_task_by_expert_.size()) &&
+          active_task_by_expert_[task.expert_id] == task_id) {
+        active_task_by_expert_[task.expert_id] = 0;
+      }
+      if (task.expert_id >= 0 && task.expert_id < static_cast<int>(pending_prefetches_.size()) &&
+          pending_prefetches_[task.expert_id].task_id == task_id) {
+        pending_prefetches_[task.expert_id].task_id = 0;
+        pending_prefetches_[task.expert_id].slot_index = -1;
+        pending_prefetches_[task.expert_id].requests.clear();
+      }
+      if (task.expert_id >= 0 && task.expert_id < config_.expert_num) {
+        expert_states_[task.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      }
+      canceled += 1;
+    }
+    if (canceled > 0) {
+      if (auto* stats = mesh::enabled_cache_stats(config_)) {
+        stats->coldstart_warmfill_cancel_count.fetch_add(canceled, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  void promote_pending_task_for_demand(int expert_id) {
+    if (expert_id < 0 || expert_id >= static_cast<int>(pending_prefetches_.size())) return;
+    const uint64_t task_id = pending_prefetches_[expert_id].task_id;
+    if (task_id == 0) return;
+    std::lock_guard<std::mutex> guard(expert_load_mu_);
+    auto it = expert_load_tasks_.find(task_id);
+    if (it == expert_load_tasks_.end()) return;
+    ExpertLoadTask& task = it->second;
+    if (task.state != ExpertLoadState::Queued) return;
+    if (task.source == ExpertLoadSource::ColdStartWarmFill) {
+      if (auto* stats = mesh::enabled_cache_stats(config_)) {
+        stats->demand_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    task.schedule_key = 0;
+    task.source = ExpertLoadSource::Demand;
+    task.queue_generation += 1;
+    expert_load_queue_.push(ExpertLoadQueueEntry{task.schedule_key, task.sequence, task.queue_generation, task.task_id});
+  }
+
+  bool promote_queued_task_for_deferred(int expert_id,
+                                        int64_t schedule_key,
+                                        const std::vector<uint8_t>* protected_mask) {
+    if (expert_id < 0 || expert_id >= static_cast<int>(active_task_by_expert_.size())) return false;
+    std::lock_guard<std::mutex> guard(expert_load_mu_);
+    const uint64_t task_id = active_task_by_expert_[expert_id];
+    if (task_id == 0) return false;
+    auto it = expert_load_tasks_.find(task_id);
+    if (it == expert_load_tasks_.end()) return false;
+    ExpertLoadTask& task = it->second;
+    if (task.state != ExpertLoadState::Queued) return false;
+    if (schedule_key >= task.schedule_key && task.source != ExpertLoadSource::ColdStartWarmFill) {
+      return true;
+    }
+    const bool was_warmfill = task.source == ExpertLoadSource::ColdStartWarmFill;
+    if (was_warmfill) {
+      if (auto* stats = mesh::enabled_cache_stats(config_)) {
+        stats->defer_join_warmfill_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    task.schedule_key = schedule_key;
+    task.source = ExpertLoadSource::DeferredTopK;
+    task.warmfill_epoch = 0;
+    task.queue_generation += 1;
+    if (protected_mask != nullptr) {
+      task.protected_mask = *protected_mask;
+    }
+    expert_load_queue_.push(ExpertLoadQueueEntry{task.schedule_key, task.sequence, task.queue_generation, task.task_id});
+    if (was_warmfill) {
+      if (auto* stats = mesh::enabled_cache_stats(config_)) {
+        stats->defer_cold_load_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    return true;
+  }
+
+  void fail_expert_load_task(uint64_t task_id, int expert_id, ExpertLoadState state) {
+    std::lock_guard<std::mutex> guard(expert_load_mu_);
+    auto it = expert_load_tasks_.find(task_id);
+    if (it != expert_load_tasks_.end()) {
+      it->second.state = state;
+      it->second.queue_generation += 1;
+    }
+    if (expert_id >= 0 && expert_id < static_cast<int>(active_task_by_expert_.size()) &&
+        active_task_by_expert_[expert_id] == task_id) {
+      active_task_by_expert_[expert_id] = 0;
+    }
+    if (expert_id >= 0 && expert_id < static_cast<int>(pending_prefetches_.size()) &&
+        pending_prefetches_[expert_id].task_id == task_id) {
+      pending_prefetches_[expert_id].task_id = 0;
+      pending_prefetches_[expert_id].slot_index = -1;
+      pending_prefetches_[expert_id].requests.clear();
+    }
+  }
+
+  uint64_t pop_next_expert_load_task(bool allow_background) {
+    std::lock_guard<std::mutex> guard(expert_load_mu_);
+    while (!expert_load_queue_.empty()) {
+      const ExpertLoadQueueEntry entry = expert_load_queue_.top();
+      auto it = expert_load_tasks_.find(entry.task_id);
+      if (it == expert_load_tasks_.end()) {
+        expert_load_queue_.pop();
+        continue;
+      }
+      ExpertLoadTask& task = it->second;
+      if (task.state != ExpertLoadState::Queued ||
+          task.queue_generation != entry.queue_generation ||
+          task.schedule_key != entry.schedule_key) {
+        expert_load_queue_.pop();
+        continue;
+      }
+      if (task.schedule_key == background_schedule_key()) {
+        if (!allow_background) return 0;
+        if (background_capacity_reached()) {
+          return 0;
+        }
+      }
+      expert_load_queue_.pop();
+      task.state = ExpertLoadState::Submitting;
+      return task.task_id;
+    }
+    return 0;
+  }
+
+  bool submit_expert_load_task(uint64_t task_id) {
+    ExpertLoadTask task_snapshot;
+    {
+      std::lock_guard<std::mutex> guard(expert_load_mu_);
+      auto it = expert_load_tasks_.find(task_id);
+      if (it == expert_load_tasks_.end()) return false;
+      task_snapshot = it->second;
+    }
+    if (task_snapshot.expert_id < 0 || task_snapshot.expert_id >= config_.expert_num) return false;
+    int slot = -1;
+    const std::vector<uint8_t>* protected_mask =
+        task_snapshot.protected_mask.empty() ? nullptr : &task_snapshot.protected_mask;
+    if (task_snapshot.source == ExpertLoadSource::ColdStartWarmFill) {
+      if (background_capacity_reached()) {
+        fail_expert_load_task(task_id, task_snapshot.expert_id, ExpertLoadState::Canceled);
+        expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+        return false;
+      }
+      slot = find_empty_slot_before_limit(background_slot_limit());
+      if (slot < 0) {
+        fail_expert_load_task(task_id, task_snapshot.expert_id, ExpertLoadState::Canceled);
+        expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+        return false;
+      }
+    } else if (!reserve_loading_slot_for_expert(task_snapshot.expert_id, &slot, protected_mask)) {
+      fail_expert_load_task(task_id, task_snapshot.expert_id, ExpertLoadState::Canceled);
+      expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      return false;
+    }
+
+    if (task_snapshot.source == ExpertLoadSource::ColdStartWarmFill &&
+        !reserve_slot_for_loading(slot, task_snapshot.expert_id)) {
+      fail_expert_load_task(task_id, task_snapshot.expert_id, ExpertLoadState::Failed);
+      expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      return false;
+    }
+
+    void* gate_owner = slot_gate_owner_[slot];
+    void* up_owner = slot_up_owner_[slot];
+    void* down_owner = slot_down_owner_[slot];
+    try {
+      std::vector<uint64_t> requests =
+          submit_iouring_reads_for_expert(task_snapshot.expert_id,
+                                          gate_owner,
+                                          up_owner,
+                                          down_owner,
+                                          read_priority_for_task(task_snapshot.source));
+      if (requests.empty()) {
+        (void)unbind_slot(slot, true, false);
+        release_empty_slot_buffers_if_any(slot);
+        fail_expert_load_task(task_id, task_snapshot.expert_id, ExpertLoadState::Failed);
+        expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+        return false;
+      }
+      {
+        std::lock_guard<std::mutex> guard(expert_load_mu_);
+        auto it = expert_load_tasks_.find(task_id);
+        if (it != expert_load_tasks_.end()) {
+          ExpertLoadTask& task = it->second;
+          task.slot = slot;
+          task.gate_owner = gate_owner;
+          task.up_owner = up_owner;
+          task.down_owner = down_owner;
+          task.request_ids = requests;
+          task.state = ExpertLoadState::Submitted;
+        }
+      }
+      auto& pending = pending_prefetches_[task_snapshot.expert_id];
+      pending.slot_index = slot;
+      pending.task_id = task_id;
+      pending.requests = std::move(requests);
+      if (auto* stats = mesh::enabled_cache_stats(config_)) {
+        if (task_snapshot.source == ExpertLoadSource::ColdStartWarmFill) {
+          stats->coldstart_warmfill_submitted_count.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      mesh::record_cache_async_prefetch(config_);
+      return true;
+    } catch (...) {
+      (void)unbind_slot(slot, true, false);
+      release_empty_slot_buffers_if_any(slot);
+      expert_states_[task_snapshot.expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      fail_expert_load_task(task_id, task_snapshot.expert_id, ExpertLoadState::Failed);
+      throw;
+    }
+  }
+
+  void drain_expert_load_queue(bool allow_background) {
+    constexpr int kMaxFiniteTasksPerDrain = 32;
+    int submitted = 0;
+    for (;;) {
+      if (!allow_background && submitted >= kMaxFiniteTasksPerDrain) return;
+      if (allow_background && background_capacity_reached()) {
+        cancel_queued_warmfill_epoch(coldstart_warmfill_epoch_);
+        return;
+      }
+      const uint64_t task_id = pop_next_expert_load_task(allow_background);
+      if (task_id == 0) return;
+      ExpertLoadSource source = ExpertLoadSource::Explicit;
+      uint64_t epoch = 0;
+      {
+        std::lock_guard<std::mutex> guard(expert_load_mu_);
+        auto it = expert_load_tasks_.find(task_id);
+        if (it != expert_load_tasks_.end()) {
+          source = it->second.source;
+          epoch = it->second.warmfill_epoch;
+        }
+      }
+      if (!submit_expert_load_task(task_id) && source == ExpertLoadSource::ColdStartWarmFill) {
+        cancel_queued_warmfill_epoch(epoch);
+        return;
+      }
+      submitted += 1;
+      if (source == ExpertLoadSource::ColdStartWarmFill && background_capacity_reached()) {
+        cancel_queued_warmfill_epoch(epoch);
+        return;
+      }
+    }
+  }
 #endif
 
   bool allocate_and_copy_expert(int expert_id, bool pin_after_copy) {
@@ -1183,6 +1563,10 @@
             all_requests.insert(all_requests.end(),
                                 pending_prefetches_[expert_id].requests.begin(),
                                 pending_prefetches_[expert_id].requests.end());
+            break;
+          }
+          if (pending_prefetches_[expert_id].task_id != 0) {
+            wait_for_pending_prefetch(expert_id, pin);
             break;
           }
           complete_ready_prefetches();
@@ -1944,32 +2328,12 @@
   }
 
   int submit_decode_heat_prefetches(int target_capacity, int fill_limit) {
-    if (!iouring_enabled() || config_.async_reader == nullptr || target_capacity <= 0) return 0;
-    if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) return 0;
-    const int resident_now = resident_expert_count_.load(std::memory_order_acquire);
-    int remaining = std::max(0, target_capacity - resident_now);
-    if (fill_limit > 0) {
-      remaining = std::min(remaining, fill_limit);
+    (void)target_capacity;
+    (void)fill_limit;
+    if (auto* stats = mesh::enabled_cache_stats(config_)) {
+      stats->speculative_prefetch_blocked_count.fetch_add(1, std::memory_order_relaxed);
     }
-    if (remaining <= 0) return 0;
-
-    std::vector<int> ranked = cpu_managed_experts_by_heat();
-    std::vector<uint8_t> protected_mask(config_.expert_num, 0);
-    for (int i = 0; i < static_cast<int>(ranked.size()) && i < target_capacity; ++i) {
-      protected_mask[ranked[i]] = 1;
-    }
-
-    int submitted = 0;
-    for (int expert_id : ranked) {
-      if (submitted >= remaining) break;
-      const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
-      if (state != EXPERT_BASELINE) continue;
-      if (submit_async_prefetch(expert_id, &protected_mask)) {
-        submitted += 1;
-      }
-    }
-    mesh::record_cache_prefetch_submit(config_, static_cast<uint64_t>(submitted));
-    return submitted;
+    return 0;
   }
 
   int transition_to_decode_frequency_cache(int target_capacity, int fill_limit) {
@@ -1992,20 +2356,14 @@
       }
     }
 
-    std::vector<BatchPromotion> promotions;
-    std::vector<ktransformers::AsyncExpertReader::ReadRequest> read_batch;
-    std::vector<uint64_t> all_requests;
-    promotions.reserve(prefill_static_experts_.size());
-    read_batch.reserve(prefill_static_experts_.size() * 9);
+    trim_cache_to_capacity();
+    release_empty_slot_buffers_to_limit(target_capacity);
 
-    int submitted = 0;
+    std::vector<int64_t> warmfill_ids;
+    warmfill_ids.reserve(prefill_static_experts_.size());
     const int submit_limit = fill_limit > 0 ? fill_limit : std::numeric_limits<int>::max();
     for (int expert_id : prefill_static_experts_) {
       uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
-      if (state == EXPERT_PREFETCHING) {
-        wait_for_pending_prefetch(expert_id, false);
-        state = expert_states_[expert_id].load(std::memory_order_acquire);
-      }
       if (state == EXPERT_CACHED || state == EXPERT_PINNED) {
         const int slot = expert_to_slot_[expert_id];
         if (slot >= 0 && slot < main_slots) {
@@ -2019,49 +2377,20 @@
         }
       }
 
-      if (submitted >= submit_limit) break;
-      const int target_slot = find_main_slot_outside_frequency_set(desired_mask);
-      if (target_slot < 0) {
-        std::fprintf(stderr,
-                     "[MESH_DECODE_TRANSITION_WARN] layer=%d tp=%d reason=no_replaceable_main_slot "
-                     "expert=%d target_capacity=%d main_slots=%d resident=%d capacity=%d%s\n",
-                     config_.layer_idx,
-                     tp_part_idx,
-                     expert_id,
-                     target_capacity,
-                     main_slots,
-                     resident_expert_count_.load(std::memory_order_acquire),
-                     cache_capacity_,
-                     resident_debug_summary().c_str());
-        break;
+      if (state == EXPERT_BASELINE) {
+        if (static_cast<int>(warmfill_ids.size()) >= submit_limit) break;
+        warmfill_ids.push_back(static_cast<int64_t>(expert_id));
       }
-      if (!submit_prefill_promotion_to_slot(expert_id, target_slot, &promotions, &read_batch, nullptr)) {
-        std::fprintf(stderr,
-                     "[MESH_DECODE_TRANSITION_WARN] layer=%d tp=%d reason=reserve_main_slot_failed "
-                     "expert=%d slot=%d target_capacity=%d resident=%d capacity=%d%s\n",
-                     config_.layer_idx,
-                     tp_part_idx,
-                     expert_id,
-                     target_slot,
-                     target_capacity,
-                     resident_expert_count_.load(std::memory_order_acquire),
-                     cache_capacity_,
-                     resident_debug_summary().c_str());
-        break;
-      }
-      submitted += 1;
     }
 
-    try {
-      submit_prefill_promotion_reads(&promotions, read_batch, &all_requests, nullptr);
-    } catch (...) {
-      rollback_prefill_promotions(&promotions);
-      throw;
-    }
-    wait_and_finalize_prefill_promotions(&promotions, all_requests, "frequency_decode");
-    trim_cache_to_capacity();
-    release_empty_slot_buffers_to_limit(target_capacity);
-    return submitted;
+    if (warmfill_ids.empty()) return 0;
+    return prefetch_experts(static_cast<int>(warmfill_ids.size()),
+                            warmfill_ids.data(),
+                            0,
+                            nullptr,
+                            static_cast<int>(warmfill_ids.size()),
+                            1,
+                            background_schedule_key());
   }
 
   int prepare_prefill_layer_window() {
@@ -2145,12 +2474,29 @@
 
   void clear_pending_prefetch(int expert_id, bool release_buffers) {
     auto& pending = pending_prefetches_[expert_id];
+    const uint64_t task_id = pending.task_id;
     if (release_buffers && pending.slot_index >= 0) {
       (void)unbind_slot(pending.slot_index, true, false);
       release_empty_slot_buffers_if_any(pending.slot_index);
     }
     pending.slot_index = -1;
+    pending.task_id = 0;
     pending.requests.clear();
+    if (task_id != 0) {
+      std::lock_guard<std::mutex> guard(expert_load_mu_);
+      auto it = expert_load_tasks_.find(task_id);
+      if (it != expert_load_tasks_.end() &&
+          (it->second.state == ExpertLoadState::Queued ||
+           it->second.state == ExpertLoadState::Submitting ||
+           it->second.state == ExpertLoadState::Submitted)) {
+        it->second.state = ExpertLoadState::Canceled;
+        it->second.queue_generation += 1;
+      }
+      if (expert_id >= 0 && expert_id < static_cast<int>(active_task_by_expert_.size()) &&
+          active_task_by_expert_[expert_id] == task_id) {
+        active_task_by_expert_[expert_id] = 0;
+      }
+    }
   }
 
   bool finalize_pending_prefetch(int expert_id, bool pin_after_wait) {
@@ -2164,14 +2510,33 @@
     void* gate_owner = slot_gate_owner_[slot];
     void* up_owner = slot_up_owner_[slot];
     void* down_owner = slot_down_owner_[slot];
+    const uint64_t task_id = pending.task_id;
     pending.slot_index = -1;
+    pending.task_id = 0;
     pending.requests.clear();
     finalize_expert_buffers(expert_id, gate_owner, up_owner, down_owner, pin_after_wait);
+    if (task_id != 0) {
+      std::lock_guard<std::mutex> guard(expert_load_mu_);
+      auto it = expert_load_tasks_.find(task_id);
+      if (it != expert_load_tasks_.end()) {
+        it->second.state = ExpertLoadState::Completed;
+      }
+      if (expert_id >= 0 && expert_id < static_cast<int>(active_task_by_expert_.size()) &&
+          active_task_by_expert_[expert_id] == task_id) {
+        active_task_by_expert_[expert_id] = 0;
+      }
+    }
     return true;
   }
 
   bool wait_for_pending_prefetch(int expert_id, bool pin_after_wait) {
     if (!iouring_enabled() || config_.async_reader == nullptr) return false;
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    auto& pending = pending_prefetches_[expert_id];
+    if (pending.requests.empty() && pending.task_id != 0) {
+      promote_pending_task_for_demand(expert_id);
+      drain_expert_load_queue(false);
+    }
     const auto& requests = pending_prefetches_[expert_id].requests;
     if (requests.empty()) return false;
     const int timeout_ms = 60000;
@@ -2203,7 +2568,11 @@
 #endif
   }
 
-  bool submit_async_prefetch(int expert_id, const std::vector<uint8_t>* protected_mask = nullptr) {
+  bool submit_async_prefetch(int expert_id,
+                             const std::vector<uint8_t>* protected_mask = nullptr,
+                             int64_t schedule_key = 0,
+                             ExpertLoadSource source = ExpertLoadSource::DeferredTopK,
+                             uint64_t warmfill_epoch = 0) {
     if (!iouring_enabled() || config_.async_reader == nullptr) return false;
     if (cache_capacity_ > 0 && !slot_pool_enabled()) {
       if (!ensure_resident_slot_pool_allocated()) return false;
@@ -2213,52 +2582,22 @@
     return false;
 #else
     if (expert_id < 0 || expert_id >= config_.expert_num || config_.should_skip_expert(expert_id)) return false;
-    int slot = find_empty_slot();
-    while (slot < 0) {
-      if (!evict_one_cached_expert(expert_id, protected_mask)) {
-        return false;
-      }
-      slot = find_empty_slot();
-    }
-
     uint8_t expected = EXPERT_BASELINE;
     if (!expert_states_[expert_id].compare_exchange_strong(
             expected, EXPERT_PREFETCHING, std::memory_order_acq_rel, std::memory_order_acquire)) {
       return false;
     }
-
-    if (!reserve_slot_for_loading(slot, expert_id)) {
+    auto& pending = pending_prefetches_[expert_id];
+    pending.slot_index = -1;
+    pending.task_id = 0;
+    pending.requests.clear();
+    const uint64_t task_id = enqueue_expert_load_task(expert_id, schedule_key, source, protected_mask, warmfill_epoch);
+    if (task_id == 0) {
       expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
       return false;
     }
-    void* gate_owner = slot_gate_owner_[slot];
-    void* up_owner = slot_up_owner_[slot];
-    void* down_owner = slot_down_owner_[slot];
-
-    try {
-      std::vector<uint64_t> requests = submit_iouring_reads_for_expert(
-          expert_id,
-          gate_owner,
-          up_owner,
-          down_owner,
-          ktransformers::AsyncExpertReader::ReadPriority::Prefetch);
-      if (requests.empty()) {
-        (void)unbind_slot(slot, true, false);
-        release_empty_slot_buffers_if_any(slot);
-        expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
-        return false;
-      }
-      auto& pending = pending_prefetches_[expert_id];
-      pending.slot_index = slot;
-      pending.requests = std::move(requests);
-      mesh::record_cache_async_prefetch(config_);
-      return true;
-    } catch (...) {
-      (void)unbind_slot(slot, true, false);
-      release_empty_slot_buffers_if_any(slot);
-      expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
-      throw;
-    }
+    pending.task_id = task_id;
+    return true;
 #endif
   }
 
@@ -2266,7 +2605,7 @@
     if (!iouring_enabled() || config_.async_reader == nullptr) return;
     for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
       if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
-      if (!pending_prefetches_[expert_id].requests.empty()) {
+      if (!pending_prefetches_[expert_id].requests.empty() || pending_prefetches_[expert_id].task_id != 0) {
         wait_for_pending_prefetch(expert_id, pin_after_wait);
       }
     }
@@ -2362,16 +2701,31 @@
   }
 
 	  int prefetch_experts(int count,
-                       const int64_t* expert_ids,
-                       int protect_count = 0,
-                       const int64_t* protect_ids = nullptr,
-                       int max_to_submit = 0,
-                       int prefetch_kind = 0) {
+	                       const int64_t* expert_ids,
+	                       int protect_count = 0,
+	                       const int64_t* protect_ids = nullptr,
+	                       int max_to_submit = 0,
+	                       int prefetch_kind = 0,
+                         int64_t schedule_key = 0) {
     if (!resident_io_enabled() || !iouring_enabled() || expert_ids == nullptr || count <= 0 || cache_capacity_ <= 0) {
       return 0;
     }
     complete_ready_prefetches();
     const bool is_bootstrap_prefetch = prefetch_kind == 1;
+    const ExpertLoadSource source =
+        is_bootstrap_prefetch ? ExpertLoadSource::ColdStartWarmFill : ExpertLoadSource::DeferredTopK;
+    uint64_t warmfill_epoch = 0;
+    if (is_bootstrap_prefetch) {
+      if (coldstart_warmfill_submitted_) {
+        if (auto* stats = mesh::enabled_cache_stats(config_)) {
+          stats->speculative_prefetch_blocked_count.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+        }
+        return 0;
+      }
+      coldstart_warmfill_submitted_ = true;
+      warmfill_epoch = ++coldstart_warmfill_epoch_;
+      schedule_key = background_schedule_key();
+    }
     uint64_t bootstrap_candidate_count = 0;
     uint64_t bootstrap_skip_gpu_count = 0;
     uint64_t bootstrap_skip_resident_count = 0;
@@ -2399,16 +2753,25 @@
 
       const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
       if (state != EXPERT_BASELINE) {
+        if (!is_bootstrap_prefetch && state == EXPERT_PREFETCHING &&
+            promote_queued_task_for_deferred(expert_id, schedule_key, &protected_mask)) {
+          submitted += 1;
+        }
         if (is_bootstrap_prefetch && tp_part_idx == 0) {
           bootstrap_skip_resident_count += 1;
         }
         continue;
       }
-      if (submit_async_prefetch(expert_id, &protected_mask)) {
+      if (submit_async_prefetch(expert_id, &protected_mask, schedule_key, source, warmfill_epoch)) {
         submitted += 1;
       }
     }
-    mesh::record_cache_prefetch_submit(config_, static_cast<uint64_t>(submitted));
+    if (is_bootstrap_prefetch) {
+      mesh::record_cache_prefetch_submit(config_, static_cast<uint64_t>(submitted));
+      drain_expert_load_queue(true);
+    } else {
+      drain_expert_load_queue(false);
+    }
     mesh::record_bootstrap_prefetch_stats(config_,
                                           tp_part_idx,
                                           is_bootstrap_prefetch,
@@ -2424,12 +2787,14 @@
                                 intptr_t protect_ids,
                                 int protect_count,
                                 int max_to_submit,
-                                int prefetch_kind = 0) {
+                                int prefetch_kind = 0,
+                                int64_t schedule_key = 0) {
     prefetch_experts(count,
                      reinterpret_cast<const int64_t*>(expert_ids),
                      protect_count,
                      reinterpret_cast<const int64_t*>(protect_ids),
                      max_to_submit,
-                     prefetch_kind);
+                     prefetch_kind,
+                     schedule_key);
   }
 #endif

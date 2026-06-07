@@ -574,6 +574,7 @@ def _maybe_submit_mesh_bootstrap_from_full_gate_batch(
             max_to_submit=candidate_count,
             cuda_stream=cuda_stream,
             prefetch_kind=1,
+            schedule_key=(1 << 63) - 1,
         ):
             submitted_layers += 1
             candidate_total += candidate_count
@@ -889,6 +890,7 @@ def _submit_iouring_prefetch(
     max_to_submit: int = 0,
     cuda_stream=None,
     prefetch_kind: int = 0,
+    schedule_key: int = 0,
 ) -> bool:
     if self.io_backend != "IOURING" or self.moe is None or count <= 0:
         return False
@@ -921,15 +923,26 @@ def _submit_iouring_prefetch(
             int(protect_count),
             int(max_to_submit),
             int(prefetch_kind),
+            int(schedule_key),
         )
     except TypeError:
-        task = task_factory(
-            int(expert_ids_cpu.data_ptr()),
-            int(count),
-            protect_ptr,
-            int(protect_count),
-            int(max_to_submit),
-        )
+        try:
+            task = task_factory(
+                int(expert_ids_cpu.data_ptr()),
+                int(count),
+                protect_ptr,
+                int(protect_count),
+                int(max_to_submit),
+                int(prefetch_kind),
+            )
+        except TypeError:
+            task = task_factory(
+                int(expert_ids_cpu.data_ptr()),
+                int(count),
+                protect_ptr,
+                int(protect_count),
+                int(max_to_submit),
+            )
     self._submit_cpuinfer_task(task, cuda_stream)
     return True
 
@@ -968,6 +981,7 @@ def _mesh_select_forward_experts(
     cuda_stream,
     *,
     is_decode_token: bool,
+    defer_schedule_key: int = 0,
 ):
     if self.max_deferred_experts_per_token <= 0:
         return topk_ids_long, None, False
@@ -986,6 +1000,7 @@ def _mesh_select_forward_experts(
             int(immediate_experts_ids_cpu.numel()),
             int(self.num_experts_per_tok),
             int(self.max_deferred_experts_per_token),
+            int(defer_schedule_key),
         )
         self._submit_cpuinfer_task(task, cuda_stream)
         return immediate_experts_ids_cpu, deferred_experts_ids_cpu, True
@@ -1003,6 +1018,7 @@ def _mesh_prefetch_deferred_ids(
     deferred_experts_ids_cpu: torch.Tensor,
     immediate_experts_ids_cpu: torch.Tensor,
     cuda_stream,
+    defer_schedule_key: int,
 ) -> None:
     if not self._env_flag("KT_MESH_DEFER_PREFETCH", True):
         return
@@ -1017,6 +1033,7 @@ def _mesh_prefetch_deferred_ids(
         protect_count=int(immediate_experts_ids_cpu.numel()),
         max_to_submit=defer_prefetch_limit,
         cuda_stream=cuda_stream,
+        schedule_key=defer_schedule_key,
     )
 
 
@@ -1067,6 +1084,11 @@ def _mesh_submit_forward_impl(
     topk_ids_long = topk_ids.to(torch.long)
     self._mesh_prefetch_previous_topk()
     is_decode_token = qlen == 1 and BaseMoEWrapper._mesh_decode_transition_done
+    if is_decode_token and self.layer_idx == 0:
+        BaseMoEWrapper._mesh_decode_token_seq += 1
+    total_moe_layers = max(self._mesh_total_moe_layers(), self.layer_idx + 1)
+    current_schedule_key = int(BaseMoEWrapper._mesh_decode_token_seq) * int(total_moe_layers) + int(self.layer_idx)
+    defer_schedule_key = current_schedule_key + 1
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
         topk_weights,
@@ -1075,6 +1097,7 @@ def _mesh_submit_forward_impl(
         output_cpu[next_slot],
         cuda_stream,
         is_decode_token=is_decode_token,
+        defer_schedule_key=defer_schedule_key,
     )
 
     input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
@@ -1087,6 +1110,7 @@ def _mesh_submit_forward_impl(
             deferred_experts_ids_cpu[current_slot],
             immediate_experts_ids_cpu[current_slot],
             cuda_stream,
+            defer_schedule_key,
         )
 
     router_scores_ptr, score_rows, score_cols, score_transform = self._prepare_router_scores_for_forward(
@@ -1207,6 +1231,7 @@ def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int) -> None:
 
     BaseMoEWrapper._mesh_prefill_session_seen = True
     BaseMoEWrapper._mesh_decode_transition_done = False
+    BaseMoEWrapper._mesh_decode_token_seq = 0
 
     release_layer = int(self.layer_idx) - int(window)
     if release_layer in BaseMoEWrapper._mesh_prefill_window_layers:
@@ -1428,6 +1453,7 @@ def reset_runtime_state(force: bool = False):
     BaseMoEWrapper._full_gate_skip_logged.clear()
     BaseMoEWrapper._mesh_bootstrap_done = False
     BaseMoEWrapper._mesh_bootstrap_log_count = 0
+    BaseMoEWrapper._mesh_decode_token_seq = 0
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
     BaseMoEWrapper._mesh_prefill_session_seen = False
     BaseMoEWrapper._mesh_decode_transition_done = False
@@ -1557,6 +1583,7 @@ def install_base_moe_helpers(wrapper_cls, buffer_cls, pin_memory: bool) -> None:
     wrapper_cls._full_gate_skip_logged = set()
     wrapper_cls._mesh_bootstrap_done = False
     wrapper_cls._mesh_bootstrap_log_count = 0
+    wrapper_cls._mesh_decode_token_seq = 0
     wrapper_cls._mesh_early_capacity_logged = set()
     wrapper_cls._mesh_prefill_window_layers = set()
     wrapper_cls._mesh_prefill_session_seen = False

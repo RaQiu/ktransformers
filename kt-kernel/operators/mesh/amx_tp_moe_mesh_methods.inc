@@ -28,13 +28,15 @@
                                       intptr_t deferred_ids,
                                       int count,
                                       int k,
-                                      int max_deferred_per_token) {
+                                      int max_deferred_per_token,
+                                      int64_t defer_schedule_key = 0) {
     split_deferred_experts(reinterpret_cast<const int64_t*>(source_ids),
                            reinterpret_cast<int64_t*>(immediate_ids),
                            reinterpret_cast<int64_t*>(deferred_ids),
                            count,
                            k,
-                           max_deferred_per_token);
+                           max_deferred_per_token,
+                           defer_schedule_key);
   }
 
   void split_deferred_experts(const int64_t* source_ids,
@@ -42,7 +44,8 @@
                               int64_t* deferred_ids,
                               int count,
                               int k,
-                              int max_deferred_per_token) {
+                              int max_deferred_per_token,
+                              int64_t defer_schedule_key = 0) {
     if (source_ids == nullptr || immediate_ids == nullptr || deferred_ids == nullptr || count <= 0 || k <= 0) return;
 
     const int defer_limit = std::max(0, std::min(max_deferred_per_token, k));
@@ -124,7 +127,8 @@
                        static_cast<int>(protected_immediate.size()),
                        protected_immediate.empty() ? nullptr : protected_immediate.data(),
                        static_cast<int>(cold_deferred.size()),
-                       0);
+                       0,
+                       defer_schedule_key);
     }
   }
 
@@ -133,13 +137,15 @@
                                 intptr_t protect_ids,
                                 int protect_count,
                                 int max_to_submit,
-                                int prefetch_kind = 0) {
+                                int prefetch_kind = 0,
+                                int64_t schedule_key = 0) {
     prefetch_experts(count,
                      reinterpret_cast<const int64_t*>(expert_ids),
                      protect_count,
                      reinterpret_cast<const int64_t*>(protect_ids),
                      max_to_submit,
-                     prefetch_kind);
+                     prefetch_kind,
+                     schedule_key);
   }
 
   void prefetch_experts(int count,
@@ -147,16 +153,18 @@
                         int protect_count = 0,
                         const int64_t* protect_ids = nullptr,
                         int max_to_submit = 0,
-                        int prefetch_kind = 0) {
+                        int prefetch_kind = 0,
+                        int64_t schedule_key = 0) {
     if (!this->weights_loaded || expert_ids == nullptr || count <= 0) return;
     if (this->tp_count <= 1) {
-      this->tps[0]->prefetch_experts(count, expert_ids, protect_count, protect_ids, max_to_submit, prefetch_kind);
+      this->tps[0]->prefetch_experts(count, expert_ids, protect_count, protect_ids, max_to_submit, prefetch_kind,
+                                     schedule_key);
       return;
     }
     this->config.pool->dispense_backend()->do_numa_job(
-        [this, count, expert_ids, protect_count, protect_ids, max_to_submit, prefetch_kind](int tp_id) {
+        [this, count, expert_ids, protect_count, protect_ids, max_to_submit, prefetch_kind, schedule_key](int tp_id) {
           this->tps[tp_id]->prefetch_experts(count, expert_ids, protect_count, protect_ids, max_to_submit,
-                                             prefetch_kind);
+                                             prefetch_kind, schedule_key);
         });
   }
 

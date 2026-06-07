@@ -5,9 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "async_io.hpp"
@@ -37,7 +40,57 @@ enum MeshSlotMode : uint8_t {
 
 struct PendingPrefetch {
   int slot_index = -1;
+  uint64_t task_id = 0;
   std::vector<uint64_t> requests;
+};
+
+enum class ExpertLoadSource : uint8_t {
+  Demand = 0,
+  DeferredTopK = 1,
+  ColdStartWarmFill = 2,
+  Explicit = 3,
+};
+
+enum class ExpertLoadState : uint8_t {
+  Queued = 0,
+  Submitting = 1,
+  Submitted = 2,
+  Completed = 3,
+  Failed = 4,
+  Canceled = 5,
+};
+
+struct ExpertLoadTask {
+  uint64_t task_id = 0;
+  int expert_id = -1;
+  int slot = -1;
+  void* gate_owner = nullptr;
+  void* up_owner = nullptr;
+  void* down_owner = nullptr;
+  int64_t schedule_key = 0;
+  ExpertLoadSource source = ExpertLoadSource::Explicit;
+  ExpertLoadState state = ExpertLoadState::Queued;
+  uint64_t queue_generation = 0;
+  uint64_t sequence = 0;
+  uint64_t warmfill_epoch = 0;
+  std::vector<uint8_t> protected_mask;
+  std::vector<uint64_t> request_ids;
+};
+
+struct ExpertLoadQueueEntry {
+  int64_t schedule_key = 0;
+  uint64_t sequence = 0;
+  uint64_t queue_generation = 0;
+  uint64_t task_id = 0;
+};
+
+struct ExpertLoadQueueEntryCompare {
+  bool operator()(const ExpertLoadQueueEntry& lhs, const ExpertLoadQueueEntry& rhs) const {
+    if (lhs.schedule_key != rhs.schedule_key) {
+      return lhs.schedule_key > rhs.schedule_key;
+    }
+    return lhs.sequence > rhs.sequence;
+  }
 };
 
 struct BatchPromotion {
@@ -234,6 +287,7 @@ inline void record_cache_cold_miss(const GeneralMOEConfig& config, int tp_part_i
   if (stats == nullptr) return;
   stats->miss_count.fetch_add(1, std::memory_order_relaxed);
   stats->cold_miss_count.fetch_add(1, std::memory_order_relaxed);
+  stats->demand_cold_load_count.fetch_add(1, std::memory_order_relaxed);
   if (tp_part_idx == 0) {
     stats->note_expert_miss(expert_id);
     stats->note_expert_cold_miss(expert_id);
