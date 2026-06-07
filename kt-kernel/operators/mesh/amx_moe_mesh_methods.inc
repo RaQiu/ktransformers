@@ -1008,9 +1008,22 @@
     return std::max(0, std::min(global_scratch_pool_begin_slot(), cache_capacity_));
   }
 
+  int background_occupied_slot_count() const {
+    if (!slot_pool_enabled()) return 0;
+    const int limit = background_slot_limit();
+    int occupied = 0;
+    for (int slot = 0; slot < limit; ++slot) {
+      const uint8_t state = slot_states_[slot].load(std::memory_order_acquire);
+      if (state == SLOT_READY || state == SLOT_LOADING) {
+        occupied += 1;
+      }
+    }
+    return occupied;
+  }
+
   bool background_capacity_reached() const {
     const int limit = background_slot_limit();
-    return limit <= 0 || resident_expert_count_.load(std::memory_order_acquire) >= limit;
+    return limit <= 0 || background_occupied_slot_count() >= limit;
   }
 
   int find_empty_slot_before_limit(int slot_limit) const {

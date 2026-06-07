@@ -530,6 +530,8 @@ def _maybe_submit_mesh_bootstrap_from_full_gate_batch(
 ) -> None:
     if BaseMoEWrapper._mesh_bootstrap_done:
         return
+    if not getattr(BaseMoEWrapper, "_mesh_decode_bootstrap_allowed", False):
+        return
     if not state.get("decode_seen", [False])[slot]:
         return
     if not self._env_flag("KT_MESH_BOOTSTRAP_PREFETCH", True):
@@ -1287,7 +1289,8 @@ def _maybe_mesh_transition_to_decode_cache(self, qlen: int) -> None:
         return
     if self.layer_idx != 0:
         return
-    if not BaseMoEWrapper._mesh_prefill_session_seen and not self._env_flag(
+    had_prefill_session = bool(BaseMoEWrapper._mesh_prefill_session_seen)
+    if not had_prefill_session and not self._env_flag(
         "KT_MESH_DECODE_TRANSITION_ON_COLD_Q1", False
     ):
         return
@@ -1308,6 +1311,7 @@ def _maybe_mesh_transition_to_decode_cache(self, qlen: int) -> None:
 
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
     BaseMoEWrapper._mesh_decode_transition_done = True
+    BaseMoEWrapper._mesh_decode_bootstrap_allowed = had_prefill_session
     BaseMoEWrapper._mesh_prefill_session_seen = False
 
 
@@ -1487,6 +1491,7 @@ def reset_runtime_state(force: bool = False):
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
     BaseMoEWrapper._mesh_prefill_session_seen = False
     BaseMoEWrapper._mesh_decode_transition_done = False
+    BaseMoEWrapper._mesh_decode_bootstrap_allowed = False
     BaseMoEWrapper._mesh_prefill_window_logged = False
     try:
         from .async_io_manager import shutdown_async_reader
@@ -1621,6 +1626,7 @@ def install_base_moe_helpers(wrapper_cls, buffer_cls, pin_memory: bool) -> None:
     wrapper_cls._mesh_prefill_window_layers = set()
     wrapper_cls._mesh_prefill_session_seen = False
     wrapper_cls._mesh_decode_transition_done = False
+    wrapper_cls._mesh_decode_bootstrap_allowed = False
     wrapper_cls._mesh_prefill_window_logged = False
     wrapper_cls._mesh_runtime_config_logged = set()
     wrapper_cls._cpu_infer_stream_fallback_logged = False
