@@ -119,6 +119,9 @@ struct PrefillPromotionTiming {
   uint64_t ring_submit_us = 0;
   uint64_t reader_stats_us = 0;
   uint64_t request_slice_us = 0;
+  uint64_t queue_wait_us = 0;
+  uint64_t finalize_us = 0;
+  uint64_t queue_total_us = 0;
   uint64_t promote_calls = 0;
   uint64_t allocated_slots = 0;
   uint64_t reused_slots = 0;

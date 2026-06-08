@@ -236,6 +236,8 @@ def _mesh_prefill_static_resident_capacity(self) -> int:
             configured = int(str(raw).strip())
         except ValueError:
             configured = 0
+    elif self._mesh_prefill_layer_mode_enabled():
+        configured = cpu_expert_count
     if configured <= 0:
         return 0
     return min(int(configured), int(cpu_expert_count))

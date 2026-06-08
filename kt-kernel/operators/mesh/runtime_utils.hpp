@@ -573,6 +573,7 @@ inline void log_prefill_static_scratch_trace(const GeneralMOEConfig& config,
                "scratch_reader_total_us=%llu scratch_reader_lock_wait_us=%llu "
                "scratch_reader_sqe_prep_us=%llu scratch_reader_bookkeeping_us=%llu "
                "scratch_ring_submit_us=%llu scratch_reader_stats_us=%llu scratch_request_slice_us=%llu "
+               "scratch_queue_wait_us=%llu scratch_finalize_us=%llu scratch_queue_total_us=%llu "
                "scratch_promote_calls=%llu scratch_allocated_slots=%llu scratch_reused_slots=%llu "
                "scratch_read_requests=%llu scratch_ring_flushes=%llu "
                "static_state_us=%llu static_slot_us=%llu static_slot_alloc_us=%llu "
@@ -580,6 +581,7 @@ inline void log_prefill_static_scratch_trace(const GeneralMOEConfig& config,
                "static_reader_total_us=%llu static_reader_lock_wait_us=%llu "
                "static_reader_sqe_prep_us=%llu static_reader_bookkeeping_us=%llu "
                "static_ring_submit_us=%llu static_reader_stats_us=%llu static_request_slice_us=%llu "
+               "static_queue_wait_us=%llu static_finalize_us=%llu static_queue_total_us=%llu "
                "static_promote_calls=%llu static_allocated_slots=%llu static_reused_slots=%llu "
                "static_read_requests=%llu static_ring_flushes=%llu\n",
                config.layer_idx,
@@ -617,6 +619,9 @@ inline void log_prefill_static_scratch_trace(const GeneralMOEConfig& config,
                static_cast<unsigned long long>(data.scratch_timing.ring_submit_us),
                static_cast<unsigned long long>(data.scratch_timing.reader_stats_us),
                static_cast<unsigned long long>(data.scratch_timing.request_slice_us),
+               static_cast<unsigned long long>(data.scratch_timing.queue_wait_us),
+               static_cast<unsigned long long>(data.scratch_timing.finalize_us),
+               static_cast<unsigned long long>(data.scratch_timing.queue_total_us),
                static_cast<unsigned long long>(data.scratch_timing.promote_calls),
                static_cast<unsigned long long>(data.scratch_timing.allocated_slots),
                static_cast<unsigned long long>(data.scratch_timing.reused_slots),
@@ -634,6 +639,9 @@ inline void log_prefill_static_scratch_trace(const GeneralMOEConfig& config,
                static_cast<unsigned long long>(data.static_timing.ring_submit_us),
                static_cast<unsigned long long>(data.static_timing.reader_stats_us),
                static_cast<unsigned long long>(data.static_timing.request_slice_us),
+               static_cast<unsigned long long>(data.static_timing.queue_wait_us),
+               static_cast<unsigned long long>(data.static_timing.finalize_us),
+               static_cast<unsigned long long>(data.static_timing.queue_total_us),
                static_cast<unsigned long long>(data.static_timing.promote_calls),
                static_cast<unsigned long long>(data.static_timing.allocated_slots),
                static_cast<unsigned long long>(data.static_timing.reused_slots),

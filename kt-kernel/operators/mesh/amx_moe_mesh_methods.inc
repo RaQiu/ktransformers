@@ -2098,7 +2098,11 @@
   void wait_and_finalize_fixed_queue(mesh::FixedExpertQueueBatch* batch, const char* label) {
     if (batch == nullptr || batch->request_ids.empty()) return;
     const int timeout_ms = 60000;
-    if (!config_.async_reader->wait_for_requests(batch->request_ids, timeout_ms)) {
+    const auto wait_start = std::chrono::steady_clock::now();
+    const bool wait_ok = config_.async_reader->wait_for_requests(batch->request_ids, timeout_ms);
+    const auto wait_end = std::chrono::steady_clock::now();
+    batch->timing.queue_wait_us += elapsed_us(wait_start, wait_end);
+    if (!wait_ok) {
       std::ostringstream oss;
       oss << "AMX io_uring prefill promotion failed layer=" << config_.layer_idx << " tp=" << tp_part_idx
           << " label=" << (label != nullptr ? label : mesh::fixed_expert_queue_region_name(batch->request.region))
@@ -2111,6 +2115,7 @@
       throw std::runtime_error(oss.str());
     }
 
+    const auto finalize_start = std::chrono::steady_clock::now();
     for (auto& promotion : batch->promotions) {
       finalize_expert_buffers(promotion.expert_id,
                               promotion.gate_owner,
@@ -2119,9 +2124,11 @@
                               false);
       mesh::record_cache_promote(config_, tp_part_idx, promotion.expert_id);
     }
+    batch->timing.finalize_us += elapsed_us(finalize_start, std::chrono::steady_clock::now());
   }
 
   int ensure_prefill_static_residents(const std::vector<int>* active_static_experts = nullptr) {
+    const auto queue_start = std::chrono::steady_clock::now();
     last_prefill_static_timing_ = PrefillPromotionTiming{};
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || !iouring_enabled() ||
         cache_capacity_ <= 0) {
@@ -2181,6 +2188,7 @@
       throw;
     }
     wait_and_finalize_fixed_queue(&queue_batch, "static");
+    queue_batch.timing.queue_total_us += elapsed_us(queue_start, std::chrono::steady_clock::now());
     last_prefill_static_timing_ = queue_batch.timing;
     return static_cast<int>(experts_to_load.size());
   }

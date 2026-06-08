@@ -264,6 +264,9 @@
       dst->ring_submit_us += src.ring_submit_us;
       dst->reader_stats_us += src.reader_stats_us;
       dst->request_slice_us += src.request_slice_us;
+      dst->queue_wait_us += src.queue_wait_us;
+      dst->finalize_us += src.finalize_us;
+      dst->queue_total_us += src.queue_total_us;
       dst->promote_calls += src.promote_calls;
       dst->allocated_slots += src.allocated_slots;
       dst->reused_slots += src.reused_slots;
