@@ -329,24 +329,6 @@ inline int find_main_slot_outside_frequency_set(const ResidentSlotPoolConstView&
   return -1;
 }
 
-inline void split_prefill_static_and_scratch_experts(const std::vector<int>& active_experts,
-                                                     const std::vector<uint8_t>& static_expert_mask,
-                                                     std::vector<int>& static_active_experts,
-                                                     std::vector<int>& scratch_active_experts) {
-  static_active_experts.clear();
-  scratch_active_experts.clear();
-  static_active_experts.reserve(active_experts.size());
-  scratch_active_experts.reserve(active_experts.size());
-  for (int expert_id : active_experts) {
-    if (expert_id >= 0 && expert_id < static_cast<int>(static_expert_mask.size()) &&
-        static_expert_mask[expert_id] != 0) {
-      static_active_experts.push_back(expert_id);
-    } else {
-      scratch_active_experts.push_back(expert_id);
-    }
-  }
-}
-
 }  // namespace mesh
 
 #endif  // _WIN32

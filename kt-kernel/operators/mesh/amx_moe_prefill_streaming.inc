@@ -126,18 +126,15 @@
     });
     const auto copy_input_end = std::chrono::steady_clock::now();
 
-    std::vector<int> static_active_experts;
+    std::vector<int> static_active_experts = active_experts;
     std::vector<int> scratch_active_experts;
-    plan_prefill_static_work_experts(active_experts, static_active_experts, scratch_active_experts);
-    ensure_prefill_static_residents(&static_active_experts);
-    // The qlen==1 path can submit async prefetches into scratch slots before a
-    // later qlen>1 prefill chunk enters this streaming path. Drain them before
-    // scratch scheduling, otherwise release_prefill_scratch_slots observes
-    // SLOT_LOADING and correctly refuses to recycle the slot.
+    // The qlen==1 path can submit async prefetches before a later qlen>1
+    // prefill chunk enters this streaming path. Drain them before the fixed
+    // work-slot scheduler starts replacing bindings.
     wait_for_all_pending_prefetches(false);
-    // Unbind scratch slots from the previous scheduling round. Pool-backed
-    // buffers return to IDLE with metadata preserved for warm restore; fallback
-    // numa_alloc buffers are freed immediately.
+    // Prefill now uses only the fixed work-slot range. Anything outside that
+    // range belongs to an old scratch/global-pool policy and must be recycled
+    // before current active experts are scheduled.
     if (!release_prefill_scratch_slots()) {
       std::ostringstream oss;
       oss << "AMX prefill scratch slots are still busy before scheduling layer=" << config_.layer_idx
@@ -162,23 +159,6 @@
       include_mins = true;
     }
 
-    // Cross-chunk warm restore: probe the global scratch pool for any active
-    // scratch expert whose weight is still resident in a pool block (placed
-    // there by a prior layer / SGLang prefill chunk and not yet covered by a
-    // newer acquire). On hit we bind the pool block to a scratch slot and
-    // promote the expert to EXPERT_CACHED — this is what closes the
-    // "memory reused but expert content NOT reused" gap that drove the
-    // measured 3x read amplification.
-    //
-    // Must run BEFORE count_prefill_scratch_states so the stat snapshot
-    // reflects the post-restore state, and BEFORE submit_scratch_chunk so
-    // restored experts are skipped by its EXPERT_CACHED state check.
-    const int warm_restored = try_warm_restore_scratch_experts(
-        scratch_active_experts,
-        std::max(0, std::min(prefill_static_slot_count_, cache_capacity_)),
-        protected_mask);
-    (void)warm_restored;  // counter consumed via standard cache_stats path
-
     const mesh::PrefillScratchStateCounts scratch_state_before = mesh::count_prefill_scratch_states(
         config_, tp_part_idx, scratch_active_experts, expert_states_.get(), include_mins);
 
@@ -192,91 +172,17 @@
             : 0;
     const int resident_before = resident_expert_count_.load(std::memory_order_acquire);
 
-    const int scratch_begin_slot = std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
-    const int scratch_slot_capacity = cache_capacity_ - scratch_begin_slot;
-    if (!scratch_active_experts.empty() && scratch_slot_capacity <= 0) {
+    const int work_slot_capacity = prefill_static_slot_limit();
+    if (!active_experts.empty() && work_slot_capacity <= 0) {
       std::ostringstream oss;
-      oss << "AMX prefill scratch has no slot capacity layer=" << config_.layer_idx
+      oss << "AMX prefill work slots have no capacity layer=" << config_.layer_idx
           << " tp=" << tp_part_idx
           << " static_slots=" << prefill_static_slot_count_
-          << " scratch_active=" << scratch_active_experts.size()
+          << " active=" << active_experts.size()
           << " capacity=" << cache_capacity_ << resident_debug_summary();
       throw std::runtime_error(oss.str());
     }
-    mesh::FixedExpertQueueRequest scratch_queue_request;
-    scratch_queue_request.region = mesh::FixedExpertQueueRegion::PrefillScratch;
-    scratch_queue_request.source = ExpertLoadSource::PrefillActive;
-    scratch_queue_request.schedule_key = current_forward_schedule_key_;
-    scratch_queue_request.slot_begin = scratch_begin_slot;
-    scratch_queue_request.slot_end = cache_capacity_;
-    scratch_queue_request.max_to_submit = scratch_slot_capacity;
-    scratch_queue_request.wait_mode = mesh::FixedExpertQueueWaitMode::Chunked;
-    mesh::FixedExpertQueueBatch scratch_queue(scratch_queue_request);
-    scratch_queue.reserve_experts(std::min<size_t>(scratch_active_experts.size(), scratch_slot_capacity));
     uint64_t scratch_submit_us = 0;
-    auto submit_scratch_chunk = [&](size_t begin, size_t end, mesh::FixedExpertQueueBatch* queue_batch) {
-      queue_batch->clear_io();
-      int next_scratch_slot = scratch_begin_slot;
-      // Slot picker: from the current cursor, skip past slots that cannot be
-      // rebound right now: protected experts, active readers, or in-flight loads.
-      auto advance_to_rebindable_slot = [&]() {
-        while (next_scratch_slot < cache_capacity_) {
-          if (!slot_has_rebindable_expert(next_scratch_slot, &protected_mask)) {
-            next_scratch_slot += 1;
-            continue;
-          }
-          return;
-        }
-      };
-      for (size_t idx = begin; idx < end; ++idx) {
-        const int expert_id = scratch_active_experts[idx];
-        const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
-        if (state != EXPERT_CACHED && state != EXPERT_PINNED && state != EXPERT_PREFETCHING) {
-          advance_to_rebindable_slot();
-          if (next_scratch_slot >= cache_capacity_) {
-            std::ostringstream oss;
-            oss << "AMX prefill scratch has no free slot layer=" << config_.layer_idx
-                << " tp=" << tp_part_idx << " expert=" << expert_id
-                << " static_slots=" << prefill_static_slot_count_
-                << " scratch_active=" << scratch_active_experts.size()
-                << " chunk_begin=" << begin
-                << " chunk_end=" << end
-                << " capacity=" << cache_capacity_ << resident_debug_summary();
-            throw std::runtime_error(oss.str());
-          }
-          if (!submit_fixed_queue_promotion_to_slot(expert_id, next_scratch_slot, queue_batch)) {
-            std::ostringstream oss;
-            oss << "AMX prefill scratch promotion could not reserve slot layer=" << config_.layer_idx
-                << " tp=" << tp_part_idx << " expert=" << expert_id
-                << " slot=" << next_scratch_slot
-                << " static_slots=" << prefill_static_slot_count_
-                << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
-                << " capacity=" << cache_capacity_ << resident_debug_summary();
-            throw std::runtime_error(oss.str());
-          }
-          next_scratch_slot += 1;
-        }
-      }
-      try {
-        submit_fixed_queue_reads(queue_batch);
-      } catch (...) {
-        rollback_fixed_queue_promotions(queue_batch);
-        throw;
-      }
-    };
-
-    const auto scratch_submit_start = std::chrono::steady_clock::now();
-    size_t scratch_next = 0;
-    const size_t first_scratch_end =
-        std::min(scratch_active_experts.size(), static_cast<size_t>(std::max(0, scratch_slot_capacity)));
-    std::vector<int> scratch_compute_group;
-    if (first_scratch_end > 0) {
-      scratch_compute_group.assign(scratch_active_experts.begin(), scratch_active_experts.begin() + first_scratch_end);
-      submit_scratch_chunk(0, first_scratch_end, &scratch_queue);
-      scratch_next = first_scratch_end;
-    }
-    const auto scratch_submit_end = std::chrono::steady_clock::now();
-    scratch_submit_us += elapsed_us(scratch_submit_start, scratch_submit_end);
 
     auto compute_expert_group = [&](const std::vector<int>& group) -> uint64_t {
       if (group.empty()) return 0;
@@ -341,44 +247,43 @@
       return elapsed_us(compute_start, compute_end);
     };
 
-    const uint64_t static_compute_us = compute_expert_group(static_active_experts);
+    uint64_t static_compute_us = 0;
     uint64_t scratch_wait_us = 0;
     uint64_t scratch_compute_us = 0;
-    auto finish_scratch_chunk = [&](const std::vector<int>& group, mesh::FixedExpertQueueBatch* queue_batch) {
-      if (group.empty()) return;
-      const auto scratch_wait_start = std::chrono::steady_clock::now();
-      wait_and_finalize_fixed_queue(queue_batch, "scratch");
-      const auto scratch_wait_end = std::chrono::steady_clock::now();
-      scratch_wait_us += elapsed_us(scratch_wait_start, scratch_wait_end);
-      scratch_compute_us += compute_expert_group(group);
-      // Scratch slots are temporary bindings. Return pool-backed blocks to IDLE
-      // immediately after compute so a small global pool can serve later layers;
-      // the block metadata is preserved, so the next chunk can warm-restore a
-      // matching (layer, expert) without issuing another disk read.
-      if (!release_prefill_scratch_slots()) {
-        std::ostringstream oss;
-        oss << "AMX prefill scratch slots are still busy after chunk layer=" << config_.layer_idx
-            << " tp=" << tp_part_idx
-            << " group_size=" << group.size()
-            << " static_slots=" << prefill_static_slot_count_
-            << " capacity=" << cache_capacity_ << resident_debug_summary();
-        throw std::runtime_error(oss.str());
-      }
+    PrefillPromotionTiming static_timing_total;
+    auto add_prefill_timing = [](PrefillPromotionTiming* dst, const PrefillPromotionTiming& src) {
+      dst->state_us += src.state_us;
+      dst->slot_us += src.slot_us;
+      dst->slot_alloc_us += src.slot_alloc_us;
+      dst->request_build_us += src.request_build_us;
+      dst->reader_submit_us += src.reader_submit_us;
+      dst->reader_total_us += src.reader_total_us;
+      dst->reader_lock_wait_us += src.reader_lock_wait_us;
+      dst->reader_sqe_prep_us += src.reader_sqe_prep_us;
+      dst->reader_bookkeeping_us += src.reader_bookkeeping_us;
+      dst->ring_submit_us += src.ring_submit_us;
+      dst->reader_stats_us += src.reader_stats_us;
+      dst->request_slice_us += src.request_slice_us;
+      dst->promote_calls += src.promote_calls;
+      dst->allocated_slots += src.allocated_slots;
+      dst->reused_slots += src.reused_slots;
+      dst->read_requests += src.read_requests;
+      dst->ring_flushes += src.ring_flushes;
     };
 
-    finish_scratch_chunk(scratch_compute_group, &scratch_queue);
-    while (scratch_next < scratch_active_experts.size()) {
+    std::vector<int> work_compute_group;
+    size_t work_next = 0;
+    while (work_next < active_experts.size()) {
       const size_t chunk_end =
-          std::min(scratch_active_experts.size(), scratch_next + static_cast<size_t>(scratch_slot_capacity));
-      scratch_compute_group.assign(scratch_active_experts.begin() + scratch_next,
-                                   scratch_active_experts.begin() + chunk_end);
-      const auto chunk_submit_start = std::chrono::steady_clock::now();
-      submit_scratch_chunk(scratch_next, chunk_end, &scratch_queue);
-      const auto chunk_submit_end = std::chrono::steady_clock::now();
-      scratch_submit_us += elapsed_us(chunk_submit_start, chunk_submit_end);
-      finish_scratch_chunk(scratch_compute_group, &scratch_queue);
-      scratch_next = chunk_end;
+          std::min(active_experts.size(), work_next + static_cast<size_t>(work_slot_capacity));
+      work_compute_group.assign(active_experts.begin() + work_next, active_experts.begin() + chunk_end);
+      assign_prefill_work_chunk_slots(work_compute_group);
+      ensure_prefill_static_residents(&work_compute_group);
+      add_prefill_timing(&static_timing_total, last_prefill_static_timing_);
+      static_compute_us += compute_expert_group(work_compute_group);
+      work_next = chunk_end;
     }
+    last_prefill_static_timing_ = static_timing_total;
 
     const uint64_t read_reqs_after =
         config_.cache_stats != nullptr
@@ -398,7 +303,7 @@
       trace_data.scratch_active = scratch_active_experts.size();
       trace_data.scratch_state = scratch_state_before;
       trace_data.static_slots = prefill_static_slot_count_;
-      trace_data.scratch_slots = cache_capacity_ - prefill_static_slot_count_;
+      trace_data.scratch_slots = 0;
       trace_data.scratch_submit_us = scratch_submit_us;
       trace_data.scratch_wait_us = scratch_wait_us;
       trace_data.static_compute_us = static_compute_us;
@@ -408,7 +313,7 @@
       trace_data.resident_before = resident_before;
       trace_data.resident_after = resident_expert_count_.load(std::memory_order_acquire);
       trace_data.allocated_slots = allocated_slot_count();
-      trace_data.scratch_timing = scratch_queue.timing;
+      trace_data.scratch_timing = PrefillPromotionTiming{};
       trace_data.static_timing = last_prefill_static_timing_;
       mesh::log_prefill_static_scratch_trace(config_, tp_part_idx, trace_data);
     }
@@ -461,7 +366,7 @@
                                         static_active_experts.size(),
                                         scratch_active_experts.size(),
                                         prefill_static_slot_count_,
-                                        cache_capacity_ - prefill_static_slot_count_,
+                                        0,
                                         elapsed_us(copy_input_start, copy_input_end),
                                         elapsed_us(merge_start, merge_end),
                                         elapsed_us(forward_start, forward_end),

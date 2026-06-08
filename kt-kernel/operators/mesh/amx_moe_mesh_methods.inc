@@ -1605,12 +1605,6 @@
            decode_main_slot_count() > 0;
   }
 
-  bool prefill_frequency_policy_active() const {
-    return config_.mesh_prefill_layer_mode_enabled && slot_pool_enabled() &&
-           mesh_slot_mode_ == MESH_SLOT_PREFILL_LAYER && expert_frequency_total_ > 0 &&
-           prefill_static_slot_count_ > 0;
-  }
-
   uint64_t expert_frequency_score(int expert_id) const {
     return mesh::expert_frequency_score(expert_frequency_score_, expert_id);
   }
@@ -1671,30 +1665,17 @@
     return state == EXPERT_CACHED || state == EXPERT_PINNED;
   }
 
-  bool expert_is_ready_outside_static_work_slot(int expert_id, int static_slot_limit) const {
-    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
-    const int slot = expert_to_slot_[expert_id];
-    if (slot < static_slot_limit || slot >= cache_capacity_) return false;
-    const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
-    return state == EXPERT_CACHED || state == EXPERT_PINNED || state == EXPERT_PREFETCHING;
-  }
-
-  void assign_prefill_static_work_slots(std::vector<int>& static_active_experts,
-                                        std::vector<int>& scratch_active_experts,
-                                        const std::vector<int>& active_experts) {
+  void assign_prefill_work_chunk_slots(const std::vector<int>& experts) {
     clear_prefill_static_work_metadata();
     const int static_slot_limit = prefill_static_slot_limit();
-    if (static_slot_limit <= 0 || static_active_experts.empty()) {
+    if (static_slot_limit <= 0 || experts.empty()) {
       return;
     }
 
-    std::vector<uint8_t> active_mask = mesh::build_protected_mask(config_, active_experts);
     std::vector<uint8_t> assigned_expert(config_.expert_num, 0);
     std::vector<uint8_t> used_slot(static_slot_limit, 0);
-    std::vector<int> assigned;
-    assigned.reserve(static_active_experts.size());
     std::vector<int> pending;
-    pending.reserve(static_active_experts.size());
+    pending.reserve(experts.size());
 
     auto assign_slot = [&](int expert_id, int slot) {
       if (expert_id < 0 || expert_id >= config_.expert_num || slot < 0 || slot >= static_slot_limit) return;
@@ -1702,10 +1683,9 @@
       assigned_expert[expert_id] = 1;
       used_slot[slot] = 1;
       refresh_prefill_static_slot_metadata(slot, expert_id);
-      assigned.push_back(expert_id);
     };
 
-    for (int expert_id : static_active_experts) {
+    for (int expert_id : experts) {
       const int slot = (expert_id >= 0 && expert_id < config_.expert_num) ? expert_to_slot_[expert_id] : -1;
       if (expert_is_ready_in_static_work_slot(expert_id, static_slot_limit)) {
         assign_slot(expert_id, slot);
@@ -1737,67 +1717,13 @@
       int chosen_slot = -1;
       for (int slot = 0; slot < static_slot_limit; ++slot) {
         if (used_slot[slot]) continue;
-        if (slot_has_rebindable_expert(slot, &active_mask)) {
-          chosen_slot = slot;
-          break;
-        }
+        chosen_slot = slot;
+        break;
       }
       if (chosen_slot >= 0) {
         assign_slot(expert_id, chosen_slot);
-      } else {
-        scratch_active_experts.push_back(expert_id);
       }
     }
-
-    static_active_experts.swap(assigned);
-  }
-
-  void plan_prefill_static_work_experts(const std::vector<int>& active_experts,
-                                        std::vector<int>& static_active_experts,
-                                        std::vector<int>& scratch_active_experts) {
-    static_active_experts.clear();
-    scratch_active_experts.clear();
-    static_active_experts.reserve(active_experts.size());
-    scratch_active_experts.reserve(active_experts.size());
-    clear_prefill_static_work_metadata();
-
-    if (!config_.mesh_prefill_layer_mode_enabled || prefill_static_slot_limit() <= 0) {
-      scratch_active_experts = active_experts;
-      return;
-    }
-
-    const int static_slot_limit = prefill_static_slot_limit();
-    std::vector<uint8_t> selected(config_.expert_num, 0);
-    auto select_static = [&](int expert_id) -> bool {
-      if (expert_id < 0 || expert_id >= config_.expert_num || selected[expert_id]) return false;
-      if (static_cast<int>(static_active_experts.size()) >= static_slot_limit) return false;
-      selected[expert_id] = 1;
-      static_active_experts.push_back(expert_id);
-      return true;
-    };
-
-    for (int expert_id : active_experts) {
-      if (expert_is_ready_in_static_work_slot(expert_id, static_slot_limit)) {
-        (void)select_static(expert_id);
-      }
-    }
-    for (int expert_id : active_experts) {
-      if (expert_id < 0 || expert_id >= config_.expert_num || selected[expert_id]) continue;
-      if (expert_is_ready_outside_static_work_slot(expert_id, static_slot_limit)) {
-        continue;
-      }
-      const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
-      if (state == EXPERT_BASELINE) {
-        (void)select_static(expert_id);
-      }
-    }
-    for (int expert_id : active_experts) {
-      if (expert_id < 0 || expert_id >= config_.expert_num) continue;
-      if (!selected[expert_id]) {
-        scratch_active_experts.push_back(expert_id);
-      }
-    }
-    assign_prefill_static_work_slots(static_active_experts, scratch_active_experts, active_experts);
   }
 
   bool slot_has_rebindable_expert(int slot, const std::vector<uint8_t>* protected_mask) const {
@@ -1977,99 +1903,6 @@
     if (!decode_frequency_policy_active()) return false;
     return maybe_promote_scratch_expert_by_frequency_impl(
         expert_id, protected_mask, decode_main_slot_count(), false);
-  }
-
-  // Cross-chunk warm restore for scratch experts.
-  //
-  // The GlobalScratchPool keeps a (last_layer_id, last_expert_id) tag on each
-  // block even after the block is released back to IDLE. As long as that
-  // block has not been re-acquired by a different (layer, expert), its buffer
-  // still holds the previously-read weight. This function probes the pool
-  // for every active scratch expert before the io_uring submit phase and,
-  // on hit, binds the pool block to a scratch slot and marks the expert
-  // EXPERT_CACHED — so the subsequent submit_scratch_chunk's state check
-  // will skip submitting a (redundant) read for it.
-  //
-  // Returns the number of experts whose weight was restored without disk IO.
-  int try_warm_restore_scratch_experts(const std::vector<int>& scratch_active,
-                                       int scratch_begin_slot,
-                                       const std::vector<uint8_t>& protected_mask) {
-    if (!lazy_slot_buffers_enabled()) return 0;
-    auto& pool = mesh::GlobalScratchPoolRegistry::get(numa_node_);
-    if (!pool.initialized()) return 0;
-
-    int restored = 0;
-    int next_slot = scratch_begin_slot;
-
-    for (int expert_id : scratch_active) {
-      if (expert_id < 0 || expert_id >= config_.expert_num) continue;
-      // Already resident in any form — skip.
-      const uint8_t st = expert_states_[expert_id].load(std::memory_order_acquire);
-      if (st == EXPERT_CACHED || st == EXPERT_PINNED || st == EXPERT_PREFETCHING) continue;
-
-      const int block = pool.try_warm_restore(config_.layer_idx, expert_id);
-      if (block < 0) continue;  // miss — pool block was covered by a later acquire
-
-      // Advance next_slot past slots holding still-needed (protected) cached experts
-      // and past slots currently being loaded by an in-flight io_uring request.
-      while (next_slot < cache_capacity_) {
-        const int slot_expert = (next_slot < static_cast<int>(slot_to_expert_.size()))
-                                    ? slot_to_expert_[next_slot] : -1;
-        const uint8_t slot_st = slot_states_[next_slot].load(std::memory_order_acquire);
-        if (slot_st == SLOT_LOADING) { ++next_slot; continue; }
-        if (slot_expert >= 0 && slot_expert < static_cast<int>(protected_mask.size()) &&
-            protected_mask[slot_expert]) {
-          const uint8_t exp_st = expert_states_[slot_expert].load(std::memory_order_acquire);
-          if (exp_st == EXPERT_CACHED || exp_st == EXPERT_PINNED || exp_st == EXPERT_PREFETCHING) {
-            ++next_slot;
-            continue;
-          }
-        }
-        break;
-      }
-      if (next_slot >= cache_capacity_) {
-        // No more slots to host warm-restored experts. Return this block to
-        // the pool so future probes can still find it.
-        pool.release(block);
-        break;
-      }
-
-      // Unbind whatever expert is currently on this slot. This also drops the
-      // old expert's state back to EXPERT_BASELINE and resets slot to EMPTY.
-      const uint8_t cur_state = slot_states_[next_slot].load(std::memory_order_acquire);
-      if (cur_state == SLOT_READY && !unbind_slot(next_slot, true, false)) {
-        pool.release(block);
-        ++next_slot;
-        continue;
-      }
-      // Free any buffer previously attached to this slot — pool-borrowed or
-      // numa_alloc'd. For pool-borrowed buffers this returns the old block
-      // to the pool's IDLE state; for numa_alloc it numa_free's.
-      release_slot_buffers(next_slot);
-
-      // Bind the warm pool block to this slot.
-      pool.get_owners(block, &slot_gate_owner_[next_slot], &slot_up_owner_[next_slot],
-                      &slot_down_owner_[next_slot]);
-      scratch_slot_pool_block_idx_[next_slot] = block;
-      slot_to_expert_[next_slot] = expert_id;
-      expert_to_slot_[expert_id] = next_slot;
-      slot_states_[next_slot].store(SLOT_READY, std::memory_order_release);
-
-      // Wire AMX kernel pointer chain (matches what submit_fixed_queue_promotion_to_slot
-      // does after a successful io_uring read).
-      packed_gate_owner_[expert_id] = slot_gate_owner_[next_slot];
-      packed_up_owner_[expert_id] = slot_up_owner_[next_slot];
-      packed_down_owner_[expert_id] = slot_down_owner_[next_slot];
-      apply_owned_ptrs(expert_id, slot_gate_owner_[next_slot], slot_up_owner_[next_slot],
-                       slot_down_owner_[next_slot]);
-
-      expert_states_[expert_id].store(EXPERT_CACHED, std::memory_order_release);
-      resident_expert_count_.fetch_add(1, std::memory_order_acq_rel);
-
-      ++restored;
-      ++next_slot;
-    }
-    return restored;
   }
 
   bool release_prefill_scratch_slots() {
