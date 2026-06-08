@@ -126,14 +126,9 @@
     });
     const auto copy_input_end = std::chrono::steady_clock::now();
 
-    if (config_.mesh_prefill_layer_mode_enabled && expert_frequency_total_ > 0 && prefill_static_capacity_ > 0) {
-      rebuild_prefill_static_expert_set_by_frequency(prefill_static_capacity_);
-    }
-
     std::vector<int> static_active_experts;
     std::vector<int> scratch_active_experts;
-    mesh::split_prefill_static_and_scratch_experts(
-        active_experts, prefill_static_expert_mask_, static_active_experts, scratch_active_experts);
+    plan_prefill_static_work_experts(active_experts, static_active_experts, scratch_active_experts);
     ensure_prefill_static_residents(&static_active_experts);
     // The qlen==1 path can submit async prefetches into scratch slots before a
     // later qlen>1 prefill chunk enters this streaming path. Drain them before
@@ -356,9 +351,6 @@
       const auto scratch_wait_end = std::chrono::steady_clock::now();
       scratch_wait_us += elapsed_us(scratch_wait_start, scratch_wait_end);
       scratch_compute_us += compute_expert_group(group);
-      for (int expert_id : group) {
-        (void)maybe_promote_prefill_scratch_expert_by_frequency(expert_id, &protected_mask);
-      }
       // Scratch slots are temporary bindings. Return pool-backed blocks to IDLE
       // immediately after compute so a small global pool can serve later layers;
       // the block metadata is preserved, so the next chunk can warm-restore a

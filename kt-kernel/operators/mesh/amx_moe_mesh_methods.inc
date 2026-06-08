@@ -1653,6 +1653,153 @@
     return prefill_static_slot_for_expert_[expert_id];
   }
 
+  int prefill_static_slot_limit() const {
+    return std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
+  }
+
+  void clear_prefill_static_work_metadata() {
+    prefill_static_expert_mask_.assign(config_.expert_num, 0);
+    prefill_static_slot_for_expert_.assign(config_.expert_num, -1);
+    prefill_static_experts_.assign(prefill_static_slot_limit(), -1);
+  }
+
+  bool expert_is_ready_in_static_work_slot(int expert_id, int static_slot_limit) const {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    const int slot = expert_to_slot_[expert_id];
+    if (slot < 0 || slot >= static_slot_limit) return false;
+    const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+    return state == EXPERT_CACHED || state == EXPERT_PINNED;
+  }
+
+  bool expert_is_ready_outside_static_work_slot(int expert_id, int static_slot_limit) const {
+    if (expert_id < 0 || expert_id >= config_.expert_num) return false;
+    const int slot = expert_to_slot_[expert_id];
+    if (slot < static_slot_limit || slot >= cache_capacity_) return false;
+    const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+    return state == EXPERT_CACHED || state == EXPERT_PINNED || state == EXPERT_PREFETCHING;
+  }
+
+  void assign_prefill_static_work_slots(std::vector<int>& static_active_experts,
+                                        std::vector<int>& scratch_active_experts,
+                                        const std::vector<int>& active_experts) {
+    clear_prefill_static_work_metadata();
+    const int static_slot_limit = prefill_static_slot_limit();
+    if (static_slot_limit <= 0 || static_active_experts.empty()) {
+      return;
+    }
+
+    std::vector<uint8_t> active_mask = mesh::build_protected_mask(config_, active_experts);
+    std::vector<uint8_t> assigned_expert(config_.expert_num, 0);
+    std::vector<uint8_t> used_slot(static_slot_limit, 0);
+    std::vector<int> assigned;
+    assigned.reserve(static_active_experts.size());
+    std::vector<int> pending;
+    pending.reserve(static_active_experts.size());
+
+    auto assign_slot = [&](int expert_id, int slot) {
+      if (expert_id < 0 || expert_id >= config_.expert_num || slot < 0 || slot >= static_slot_limit) return;
+      if (assigned_expert[expert_id] || used_slot[slot]) return;
+      assigned_expert[expert_id] = 1;
+      used_slot[slot] = 1;
+      refresh_prefill_static_slot_metadata(slot, expert_id);
+      assigned.push_back(expert_id);
+    };
+
+    for (int expert_id : static_active_experts) {
+      const int slot = (expert_id >= 0 && expert_id < config_.expert_num) ? expert_to_slot_[expert_id] : -1;
+      if (expert_is_ready_in_static_work_slot(expert_id, static_slot_limit)) {
+        assign_slot(expert_id, slot);
+      } else {
+        pending.push_back(expert_id);
+      }
+    }
+
+    std::vector<int> still_pending;
+    still_pending.reserve(pending.size());
+    for (int expert_id : pending) {
+      int chosen_slot = -1;
+      for (int slot = 0; slot < static_slot_limit; ++slot) {
+        if (used_slot[slot]) continue;
+        if (slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
+            slot_to_expert_[slot] < 0) {
+          chosen_slot = slot;
+          break;
+        }
+      }
+      if (chosen_slot >= 0) {
+        assign_slot(expert_id, chosen_slot);
+      } else {
+        still_pending.push_back(expert_id);
+      }
+    }
+
+    for (int expert_id : still_pending) {
+      int chosen_slot = -1;
+      for (int slot = 0; slot < static_slot_limit; ++slot) {
+        if (used_slot[slot]) continue;
+        if (slot_has_rebindable_expert(slot, &active_mask)) {
+          chosen_slot = slot;
+          break;
+        }
+      }
+      if (chosen_slot >= 0) {
+        assign_slot(expert_id, chosen_slot);
+      } else {
+        scratch_active_experts.push_back(expert_id);
+      }
+    }
+
+    static_active_experts.swap(assigned);
+  }
+
+  void plan_prefill_static_work_experts(const std::vector<int>& active_experts,
+                                        std::vector<int>& static_active_experts,
+                                        std::vector<int>& scratch_active_experts) {
+    static_active_experts.clear();
+    scratch_active_experts.clear();
+    static_active_experts.reserve(active_experts.size());
+    scratch_active_experts.reserve(active_experts.size());
+    clear_prefill_static_work_metadata();
+
+    if (!config_.mesh_prefill_layer_mode_enabled || prefill_static_slot_limit() <= 0) {
+      scratch_active_experts = active_experts;
+      return;
+    }
+
+    const int static_slot_limit = prefill_static_slot_limit();
+    std::vector<uint8_t> selected(config_.expert_num, 0);
+    auto select_static = [&](int expert_id) -> bool {
+      if (expert_id < 0 || expert_id >= config_.expert_num || selected[expert_id]) return false;
+      if (static_cast<int>(static_active_experts.size()) >= static_slot_limit) return false;
+      selected[expert_id] = 1;
+      static_active_experts.push_back(expert_id);
+      return true;
+    };
+
+    for (int expert_id : active_experts) {
+      if (expert_is_ready_in_static_work_slot(expert_id, static_slot_limit)) {
+        (void)select_static(expert_id);
+      }
+    }
+    for (int expert_id : active_experts) {
+      if (expert_id < 0 || expert_id >= config_.expert_num || selected[expert_id]) continue;
+      if (expert_is_ready_outside_static_work_slot(expert_id, static_slot_limit)) {
+        continue;
+      }
+      const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+      if (state == EXPERT_BASELINE) {
+        (void)select_static(expert_id);
+      }
+    }
+    for (int expert_id : active_experts) {
+      if (expert_id < 0 || expert_id >= config_.expert_num) continue;
+      if (!selected[expert_id]) {
+        scratch_active_experts.push_back(expert_id);
+      }
+    }
+    assign_prefill_static_work_slots(static_active_experts, scratch_active_experts, active_experts);
+  }
+
   bool slot_has_rebindable_expert(int slot, const std::vector<uint8_t>* protected_mask) const {
     return mesh::slot_has_rebindable_expert(resident_slot_pool_view(), config_, slot, protected_mask);
   }
@@ -1830,13 +1977,6 @@
     if (!decode_frequency_policy_active()) return false;
     return maybe_promote_scratch_expert_by_frequency_impl(
         expert_id, protected_mask, decode_main_slot_count(), false);
-  }
-
-  bool maybe_promote_prefill_scratch_expert_by_frequency(int expert_id,
-                                                         const std::vector<uint8_t>* protected_mask) {
-    if (!prefill_frequency_policy_active()) return false;
-    return maybe_promote_scratch_expert_by_frequency_impl(
-        expert_id, protected_mask, prefill_static_slot_count_, true);
   }
 
   // Cross-chunk warm restore for scratch experts.
@@ -2156,7 +2296,7 @@
     }
     if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) return 0;
     mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
-    if (prefill_static_experts_.empty() && prefill_static_capacity_ > 0) {
+    if (active_static_experts == nullptr && prefill_static_experts_.empty() && prefill_static_capacity_ > 0) {
       rebuild_prefill_static_expert_set();
     }
 
@@ -2167,8 +2307,8 @@
     queue_request.source = ExpertLoadSource::PrefillActive;
     queue_request.schedule_key = current_forward_schedule_key_;
     queue_request.slot_begin = 0;
-    queue_request.slot_end = prefill_static_slot_count_;
-    queue_request.max_to_submit = static_cast<int>(experts_to_load.size());
+    queue_request.slot_end = prefill_static_slot_limit();
+    queue_request.max_to_submit = std::min(static_cast<int>(experts_to_load.size()), prefill_static_slot_limit());
     queue_request.wait_mode = mesh::FixedExpertQueueWaitMode::Blocking;
     mesh::FixedExpertQueueBatch queue_batch(queue_request);
     queue_batch.reserve_experts(experts_to_load.size());
@@ -2180,6 +2320,16 @@
         continue;
       }
       const int slot = prefill_static_slot_for_expert(expert_id);
+      if (slot < 0 || slot >= prefill_static_slot_limit()) {
+        std::ostringstream oss;
+        oss << "AMX prefill static work expert has no assigned slot layer=" << config_.layer_idx
+            << " tp=" << tp_part_idx << " expert=" << expert_id << " slot=" << slot
+            << " static_capacity=" << prefill_static_capacity_
+            << " static_slots=" << prefill_static_slot_count_
+            << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
+            << " capacity=" << cache_capacity_ << resident_debug_summary();
+        throw std::runtime_error(oss.str());
+      }
       if (!submit_fixed_queue_promotion_to_slot(expert_id, slot, &queue_batch)) {
         std::ostringstream oss;
         oss << "AMX prefill static promotion could not reserve slot layer=" << config_.layer_idx
@@ -2282,10 +2432,6 @@
   int prepare_prefill_layer_window(int64_t schedule_key = 0) {
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || cache_capacity_ <= 0) return 0;
     current_forward_schedule_key_ = schedule_key;
-    if (expert_frequency_total_ == 0) return 0;
-    if (prefill_static_capacity_ > 0) {
-      rebuild_prefill_static_expert_set_by_frequency(prefill_static_capacity_);
-    }
     mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
     return 0;
   }
@@ -2296,10 +2442,64 @@
     return release_prefill_scratch_slots();
   }
 
+  bool clear_prefill_work_bindings_for_decode_transition() {
+    if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || !slot_pool_enabled()) {
+      return true;
+    }
+    if (mesh_slot_mode_ != MESH_SLOT_PREFILL_LAYER) {
+      return true;
+    }
+
+    complete_ready_prefetches();
+    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+      if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
+      auto& pending = pending_prefetches_[expert_id];
+      if (pending.requests.empty()) {
+        clear_pending_prefetch(expert_id, true);
+        expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      } else {
+        wait_for_pending_prefetch(expert_id, false);
+      }
+    }
+
+    for (int slot = 0; slot < cache_capacity_; ++slot) {
+      const uint8_t state = slot_states_[slot].load(std::memory_order_acquire);
+      if (state == SLOT_LOADING) {
+        return false;
+      }
+      const int expert_id = slot < static_cast<int>(slot_to_expert_.size()) ? slot_to_expert_[slot] : -1;
+      if ((state == SLOT_READY || expert_id >= 0) && !unbind_slot(slot, true, false)) {
+        return false;
+      }
+      if (slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
+          slot_to_expert_[slot] < 0 && slot_uses_global_scratch_pool(slot)) {
+        release_empty_slot_buffers_if_any(slot);
+      }
+    }
+
+    for (auto& pending : pending_prefetches_) {
+      pending.slot_index = -1;
+      pending.task_id = 0;
+      pending.requests.clear();
+    }
+    expert_load_scheduler_.clear_keep_capacity(config_.expert_num);
+    resident_policy_.reset(config_.expert_num, config_.resident_cache_policy);
+    clear_prefill_static_work_metadata();
+    return true;
+  }
+
   int transition_to_decode_cache(int requested_decode_capacity, int fill_limit) {
     if (!resident_io_enabled() || cache_capacity_ <= 0) return 0;
     if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) return 0;
     complete_ready_prefetches();
+    if (!clear_prefill_work_bindings_for_decode_transition()) {
+      std::ostringstream oss;
+      oss << "AMX prefill work slots could not be cleared before decode transition layer=" << config_.layer_idx
+          << " tp=" << tp_part_idx
+          << " requested_decode_capacity=" << requested_decode_capacity
+          << " capacity=" << cache_capacity_ << resident_debug_summary();
+      throw std::runtime_error(oss.str());
+    }
     mesh_slot_mode_ = MESH_SLOT_DECODE_CACHE;
     if (requested_decode_capacity > 0) {
       config_.mesh_decode_resident_experts = requested_decode_capacity;
