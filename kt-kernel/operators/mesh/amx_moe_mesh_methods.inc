@@ -1651,6 +1651,44 @@
     return std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
   }
 
+  bool prefill_static_metadata_covers_all_cpu_experts() const {
+    if (!config_.mesh_prefill_layer_mode_enabled) return false;
+    const int cpu_experts = mesh::cpu_managed_expert_count(config_);
+    const int static_slot_limit = prefill_static_slot_limit();
+    if (cpu_experts <= 0 || prefill_static_capacity_ < cpu_experts ||
+        static_slot_limit < cpu_experts || prefill_static_slot_count_ < cpu_experts) {
+      return false;
+    }
+    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+      if (config_.should_skip_expert(expert_id)) continue;
+      if (expert_id >= static_cast<int>(prefill_static_slot_for_expert_.size())) return false;
+      const int slot = prefill_static_slot_for_expert_[expert_id];
+      if (slot < 0 || slot >= static_slot_limit) return false;
+      if (slot >= static_cast<int>(prefill_static_experts_.size()) ||
+          prefill_static_experts_[slot] != expert_id) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool prefill_full_layer_preload_active() const {
+    return mesh_slot_mode_ == MESH_SLOT_PREFILL_LAYER &&
+           prefill_static_metadata_covers_all_cpu_experts();
+  }
+
+  void ensure_prefill_full_layer_static_metadata() {
+    if (!config_.mesh_prefill_layer_mode_enabled) return;
+    const int cpu_experts = mesh::cpu_managed_expert_count(config_);
+    if (cpu_experts <= 0 || prefill_static_capacity_ < cpu_experts ||
+        prefill_static_slot_limit() < cpu_experts) {
+      return;
+    }
+    if (!prefill_static_metadata_covers_all_cpu_experts()) {
+      rebuild_prefill_static_expert_set();
+    }
+  }
+
   void clear_prefill_static_work_metadata() {
     prefill_static_expert_mask_.assign(config_.expert_num, 0);
     prefill_static_slot_for_expert_.assign(config_.expert_num, -1);
@@ -1930,6 +1968,37 @@
     return ok;
   }
 
+  bool release_prefill_work_slots() {
+    if (!slot_pool_enabled()) return true;
+    bool ok = true;
+    complete_ready_prefetches();
+    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+      if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
+      auto& pending = pending_prefetches_[expert_id];
+      if (pending.requests.empty()) {
+        clear_pending_prefetch(expert_id, true);
+        expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
+      } else {
+        wait_for_pending_prefetch(expert_id, false);
+      }
+    }
+    for (int slot = 0; slot < cache_capacity_; ++slot) {
+      const uint8_t state = slot_states_[slot].load(std::memory_order_acquire);
+      if (state == SLOT_LOADING) {
+        ok = false;
+        continue;
+      }
+      const int expert_id = slot < static_cast<int>(slot_to_expert_.size()) ? slot_to_expert_[slot] : -1;
+      if ((state == SLOT_READY || expert_id >= 0) && !unbind_slot(slot, true, false)) {
+        ok = false;
+        continue;
+      }
+      release_empty_slot_buffers_if_any(slot);
+    }
+    clear_prefill_static_work_metadata();
+    return ok;
+  }
+
   bool submit_fixed_queue_promotion_to_slot(int expert_id,
                                             int slot,
                                             mesh::FixedExpertQueueBatch* batch) {
@@ -1975,7 +2044,7 @@
           timing->state_us += elapsed_us(state_start, std::chrono::steady_clock::now());
         }
         wait_for_pending_prefetch(expert_id, false);
-        return true;
+        continue;
       }
       if (state == EXPERT_PACKING || state == EXPERT_DEMOTING) {
         if (timing != nullptr) {
@@ -2274,13 +2343,17 @@
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || cache_capacity_ <= 0) return 0;
     current_forward_schedule_key_ = schedule_key;
     mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
-    return 0;
+    if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) return 0;
+    wait_for_all_pending_prefetches(false);
+    if (prefill_static_capacity_ > 0) {
+      rebuild_prefill_static_expert_set();
+    }
+    return ensure_prefill_static_residents(nullptr);
   }
 
   bool release_prefill_layer_window() {
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled()) return true;
-    complete_ready_prefetches();
-    return release_prefill_scratch_slots();
+    return release_prefill_work_slots();
   }
 
   bool clear_prefill_work_bindings_for_decode_transition() {

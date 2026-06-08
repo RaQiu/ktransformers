@@ -184,6 +184,9 @@
     }
     uint64_t scratch_submit_us = 0;
 
+    ensure_prefill_full_layer_static_metadata();
+    const bool full_layer_preload = prefill_full_layer_preload_active();
+
     auto compute_expert_group = [&](const std::vector<int>& group) -> uint64_t {
       if (group.empty()) return 0;
       ExpertReadScope expert_read_scope(this, group.size());
@@ -280,7 +283,9 @@
       const size_t chunk_end =
           std::min(active_experts.size(), work_next + static_cast<size_t>(work_slot_capacity));
       work_compute_group.assign(active_experts.begin() + work_next, active_experts.begin() + chunk_end);
-      assign_prefill_work_chunk_slots(work_compute_group);
+      if (!full_layer_preload) {
+        assign_prefill_work_chunk_slots(work_compute_group);
+      }
       ensure_prefill_static_residents(&work_compute_group);
       add_prefill_timing(&static_timing_total, last_prefill_static_timing_);
       static_compute_us += compute_expert_group(work_compute_group);
