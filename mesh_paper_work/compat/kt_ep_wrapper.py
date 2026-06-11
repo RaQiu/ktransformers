@@ -443,6 +443,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 global_id: local_slot for local_slot, global_id in enumerate(selected)
             }
 
+        gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu")
+        if self.gpu_expert_global_ids is not None:
+            gpu_experts_mask[
+                torch.tensor(self.gpu_expert_global_ids, dtype=torch.long)
+            ] = True
+        elif self.num_gpu_experts > 0:
+            gpu_experts_mask[: self.num_gpu_experts] = True
+
+        # SGLang's fused-MoE weight loader reads these public fields to decide
+        # which checkpoint experts should be loaded into the GE-sized GPU
+        # buffers. They must describe true GPU residency, not the per-rank
+        # KT skip mask used below.
+        self.gpu_experts_mask = gpu_experts_mask
+        gpu_expert_indices = torch.where(gpu_experts_mask)[0]
+        self.logical_to_gpu_index = torch.full(
+            (num_experts,), -1, dtype=torch.int32, device="cpu"
+        )
+        self.logical_to_gpu_index[gpu_expert_indices] = torch.arange(
+            len(gpu_expert_indices), dtype=torch.int32, device="cpu"
+        )
+        self.gpu_index_to_logical = gpu_expert_indices.to(torch.int32)
+
         # Get required parameters from layer object
         # top_k: number of experts selected per token
         num_experts_per_tok = layer.top_k
@@ -483,14 +505,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         moe_tp_rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
         moe_tp_size = int(getattr(layer, "moe_tp_size", 1) or 1)
         self.moe_tp_rank = moe_tp_rank
-
-        gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu")
-        if self.gpu_expert_global_ids is not None:
-            gpu_experts_mask[
-                torch.tensor(self.gpu_expert_global_ids, dtype=torch.long)
-            ] = True
-        elif self.num_gpu_experts > 0:
-            gpu_experts_mask[: self.num_gpu_experts] = True
 
         cpu_expert_ids = [
             expert_id
