@@ -7,9 +7,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,6 +25,117 @@ namespace mesh {
 inline bool prefill_stream_trace_enabled() {
   const char* trace = std::getenv("KT_MESH_PREFILL_STREAM_TRACE");
   return trace != nullptr && trace[0] != '\0' && trace[0] != '0';
+}
+
+inline bool early_gate_miss_trace_enabled() {
+  const char* trace = std::getenv("KT_MESH_EARLY_GATE_MISS_TRACE");
+  return trace != nullptr && trace[0] != '\0' && trace[0] != '0';
+}
+
+inline int percentile_from_histogram(const std::vector<uint64_t>& histogram,
+                                     uint64_t total,
+                                     double percentile) {
+  if (histogram.empty() || total == 0) return 0;
+  const double clamped = std::max(0.0, std::min(1.0, percentile));
+  const uint64_t target = std::max<uint64_t>(
+      1, static_cast<uint64_t>(std::ceil(static_cast<double>(total) * clamped)));
+  uint64_t seen = 0;
+  for (size_t i = 0; i < histogram.size(); ++i) {
+    seen += histogram[i];
+    if (seen >= target) return static_cast<int>(i);
+  }
+  return static_cast<int>(histogram.size() - 1);
+}
+
+inline void maybe_log_early_gate_miss(const GeneralMOEConfig& config,
+                                      int tp_part_idx,
+                                      int qlen,
+                                      int k,
+                                      const int64_t* expert_ids,
+                                      int64_t schedule_key,
+                                      int static_slots,
+                                      const std::vector<uint8_t>& static_expert_mask) {
+  if (!early_gate_miss_trace_enabled() || tp_part_idx != 0 || config.layer_idx < 0 ||
+      config.layer_idx >= 5 || qlen <= 0 || k <= 0 || expert_ids == nullptr ||
+      config.expert_num <= 0) {
+    return;
+  }
+
+  std::vector<uint64_t> miss_hist(static_cast<size_t>(k) + 1, 0);
+  uint64_t invalid_routes = 0;
+  uint64_t gpu_skipped_routes = 0;
+  uint64_t cpu_routes = 0;
+  uint64_t miss_routes = 0;
+  int miss_max = 0;
+  uint64_t tokens_miss_gt3 = 0;
+
+  for (int i = 0; i < qlen; ++i) {
+    int token_miss = 0;
+    for (int j = 0; j < k; ++j) {
+      const int expert_id = static_cast<int>(expert_ids[i * k + j]);
+      if (expert_id < 0 || expert_id >= config.expert_num) {
+        invalid_routes += 1;
+        token_miss += 1;
+        continue;
+      }
+      if (config.should_skip_expert(expert_id)) {
+        gpu_skipped_routes += 1;
+        continue;
+      }
+      cpu_routes += 1;
+      if (expert_id >= static_cast<int>(static_expert_mask.size()) ||
+          static_expert_mask[expert_id] == 0) {
+        token_miss += 1;
+        miss_routes += 1;
+      }
+    }
+    if (token_miss > k) token_miss = k;
+    miss_hist[static_cast<size_t>(token_miss)] += 1;
+    miss_max = std::max(miss_max, token_miss);
+    if (token_miss > 3) tokens_miss_gt3 += 1;
+  }
+
+  std::ostringstream hist;
+  for (size_t i = 0; i < miss_hist.size(); ++i) {
+    if (i > 0) hist << ",";
+    hist << i << ":" << miss_hist[i];
+  }
+  const int miss_p50 = percentile_from_histogram(miss_hist, static_cast<uint64_t>(qlen), 0.50);
+  const int miss_p95 = percentile_from_histogram(miss_hist, static_cast<uint64_t>(qlen), 0.95);
+  const int miss_p99 = percentile_from_histogram(miss_hist, static_cast<uint64_t>(qlen), 0.99);
+  const double miss_mean = qlen > 0 ? static_cast<double>(miss_routes + invalid_routes) /
+                                         static_cast<double>(qlen)
+                                   : 0.0;
+  const double miss_gt3_pct =
+      qlen > 0 ? 100.0 * static_cast<double>(tokens_miss_gt3) / static_cast<double>(qlen) : 0.0;
+  const char* ratio = std::getenv("KT_MESH_EARLY_LAYER_SLOT_RATIO");
+  if (ratio == nullptr || ratio[0] == '\0') ratio = "1.0";
+
+  std::fprintf(stderr,
+               "[MESH_EARLY_GATE_MISS] layer=%d tp=%d qlen=%d top_k=%d schedule_key=%lld "
+               "static_slots=%d ratio=%s miss_max=%d miss_p50=%d miss_p95=%d miss_p99=%d "
+               "miss_mean=%.6f tokens_miss_gt3=%llu tokens_miss_gt3_pct=%.6f "
+               "cpu_routes=%llu miss_routes=%llu invalid_routes=%llu gpu_skipped_routes=%llu "
+               "miss_hist=%s\n",
+               config.layer_idx,
+               tp_part_idx,
+               qlen,
+               k,
+               static_cast<long long>(schedule_key),
+               static_slots,
+               ratio,
+               miss_max,
+               miss_p50,
+               miss_p95,
+               miss_p99,
+               miss_mean,
+               static_cast<unsigned long long>(tokens_miss_gt3),
+               miss_gt3_pct,
+               static_cast<unsigned long long>(cpu_routes),
+               static_cast<unsigned long long>(miss_routes),
+               static_cast<unsigned long long>(invalid_routes),
+               static_cast<unsigned long long>(gpu_skipped_routes),
+               hist.str().c_str());
 }
 
 inline void maybe_dump_prefill_expert_frequency(const GeneralMOEConfig& config,
@@ -197,7 +310,10 @@ inline bool memory_guard_trim_target_reached(const MemoryGuardTrimCheck& check) 
 
 inline void log_amx_iouring_config(const GeneralMOEConfig& config,
                                    int tp_part_idx,
+                                   int resident_capacity,
                                    int cache_capacity,
+                                   int decode_capacity,
+                                   int prefill_static_capacity,
                                    size_t gate_weight_bytes,
                                    size_t gate_scale_bytes,
                                    size_t up_weight_bytes,
@@ -205,7 +321,8 @@ inline void log_amx_iouring_config(const GeneralMOEConfig& config,
                                    size_t down_weight_bytes,
                                    size_t down_scale_bytes) {
   std::fprintf(stderr,
-               "[MESHIO] layer=%d tp=%d backend=iouring direct_io=%s source=file_slots capacity=%d policy=%s "
+               "[MESHIO] layer=%d tp=%d backend=iouring direct_io=%s source=file_slots "
+               "capacity=%d slot_capacity=%d policy=%s "
                "decode_capacity=%d prefill_static=%d prefill_layer_mode=%s lookahead=%s topk_fallback=%s "
                "w=%.3f gamma=%.3f beta=%.3f transition=%.3f "
                "prefetch=%d coldstart=%s coldstart_limit=%d "
@@ -214,10 +331,11 @@ inline void log_amx_iouring_config(const GeneralMOEConfig& config,
                config.layer_idx,
                tp_part_idx,
                config.iouring_direct_io ? "true" : "false",
+               resident_capacity,
                cache_capacity,
                config.resident_cache_policy.c_str(),
-               config.mesh_decode_resident_experts,
-               config.mesh_prefill_static_experts,
+               decode_capacity,
+               prefill_static_capacity,
                config.mesh_prefill_layer_mode_enabled ? "true" : "false",
                config.mesh_lookahead_enabled ? "true" : "false",
                config.mesh_topk_fallback_enabled ? "true" : "false",
@@ -243,7 +361,10 @@ inline void log_amx_iouring_config(const GeneralMOEConfig& config,
 
 inline void validate_amx_iouring_config(const GeneralMOEConfig& config,
                                         int tp_part_idx,
+                                        int resident_capacity,
                                         int cache_capacity,
+                                        int decode_capacity,
+                                        int prefill_static_capacity,
                                         size_t gate_weight_bytes,
                                         size_t gate_scale_bytes,
                                         size_t up_weight_bytes,
@@ -279,7 +400,10 @@ inline void validate_amx_iouring_config(const GeneralMOEConfig& config,
   }
   log_amx_iouring_config(config,
                          tp_part_idx,
+                         resident_capacity,
                          cache_capacity,
+                         decode_capacity,
+                         prefill_static_capacity,
                          gate_weight_bytes,
                          gate_scale_bytes,
                          up_weight_bytes,

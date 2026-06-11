@@ -114,7 +114,9 @@ def assign_amx_weight_views(wrapper, weights: dict) -> tuple[list, list, list, l
 
 def apply_mesh_moe_config(wrapper, moe_config, *, use_iouring: bool, file_slots=None) -> None:
     moe_config.max_tier0_experts = wrapper.max_tier0_experts
-    moe_config.max_resident_experts = wrapper._mesh_slot_pool_capacity()
+    moe_config.max_resident_experts = wrapper._mesh_config_resident_experts()
+    if hasattr(moe_config, "mesh_slot_capacity"):
+        moe_config.mesh_slot_capacity = wrapper._mesh_slot_pool_capacity()
     if hasattr(moe_config, "mesh_prefill_layer_mode_enabled"):
         moe_config.mesh_prefill_layer_mode_enabled = wrapper._mesh_prefill_layer_mode_enabled()
     if hasattr(moe_config, "mesh_prefill_static_experts"):
@@ -124,7 +126,9 @@ def apply_mesh_moe_config(wrapper, moe_config, *, use_iouring: bool, file_slots=
     if hasattr(moe_config, "mesh_prefill_rolling_depth"):
         moe_config.mesh_prefill_rolling_depth = wrapper._mesh_prefill_rolling_depth()
     if hasattr(moe_config, "mesh_decode_resident_experts"):
-        moe_config.mesh_decode_resident_experts = wrapper._mesh_config_resident_experts()
+        # Deprecated compatibility field. Decode capacity is derived from cap
+        # via max_resident_experts/max_tier0_experts, not this legacy knob.
+        moe_config.mesh_decode_resident_experts = 0
     moe_config.resident_cache_policy = wrapper.residency_policy
     if hasattr(moe_config, "enable_cache_stats"):
         moe_config.enable_cache_stats = wrapper.enable_cache_stats

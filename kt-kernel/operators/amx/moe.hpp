@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <thread>
 

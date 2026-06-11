@@ -126,22 +126,20 @@
     });
     const auto copy_input_end = std::chrono::steady_clock::now();
 
-    std::vector<int> static_active_experts = active_experts;
+    ensure_prefill_static_residents();
+    mesh::maybe_log_early_gate_miss(config_,
+                                    tp_part_idx,
+                                    qlen,
+                                    k,
+                                    expert_ids,
+                                    schedule_key,
+                                    prefill_static_slot_count_,
+                                    prefill_static_expert_mask_);
+
+    std::vector<int> static_active_experts;
     std::vector<int> scratch_active_experts;
-    // The qlen==1 path can submit async prefetches before a later qlen>1
-    // prefill chunk enters this streaming path. Drain them before the fixed
-    // work-slot scheduler starts replacing bindings.
-    wait_for_all_pending_prefetches(false);
-    // Prefill now uses only the fixed work-slot range. Anything outside that
-    // range belongs to an old scratch/global-pool policy and must be recycled
-    // before current active experts are scheduled.
-    if (!release_prefill_scratch_slots()) {
-      std::ostringstream oss;
-      oss << "AMX prefill scratch slots are still busy before scheduling layer=" << config_.layer_idx
-          << " tp=" << tp_part_idx << " static_slots=" << prefill_static_slot_count_
-          << " capacity=" << cache_capacity_ << resident_debug_summary();
-      throw std::runtime_error(oss.str());
-    }
+    mesh::split_prefill_static_and_scratch_experts(
+        active_experts, prefill_static_expert_mask_, static_active_experts, scratch_active_experts);
 
     std::vector<uint8_t> protected_mask = mesh::build_protected_mask(config_, active_experts);
     eviction_protected_mask_ = &protected_mask;
@@ -172,20 +170,82 @@
             : 0;
     const int resident_before = resident_expert_count_.load(std::memory_order_acquire);
 
-    const int work_slot_capacity = prefill_static_slot_limit();
-    if (!active_experts.empty() && work_slot_capacity <= 0) {
+    const int scratch_begin_slot = prefill_scratch_begin_slot();
+    const int scratch_slot_capacity = prefill_scratch_slot_capacity();
+    if (!scratch_active_experts.empty() && scratch_slot_capacity <= 0) {
       std::ostringstream oss;
-      oss << "AMX prefill work slots have no capacity layer=" << config_.layer_idx
+      oss << "AMX prefill scratch has no slot capacity layer=" << config_.layer_idx
           << " tp=" << tp_part_idx
           << " static_slots=" << prefill_static_slot_count_
-          << " active=" << active_experts.size()
+          << " scratch_active=" << scratch_active_experts.size()
           << " capacity=" << cache_capacity_ << resident_debug_summary();
       throw std::runtime_error(oss.str());
     }
+    mesh::FixedExpertQueueRequest scratch_request;
+    scratch_request.region = mesh::FixedExpertQueueRegion::PrefillScratch;
+    scratch_request.source = ExpertLoadSource::PrefillActive;
+    scratch_request.schedule_key = schedule_key;
+    scratch_request.slot_begin = scratch_begin_slot;
+    scratch_request.slot_end = cache_capacity_;
+    scratch_request.max_to_submit = scratch_slot_capacity;
+    scratch_request.wait_mode = mesh::FixedExpertQueueWaitMode::Blocking;
+    mesh::FixedExpertQueueBatch scratch_batch(scratch_request);
+    scratch_batch.reserve_experts(std::min(static_cast<size_t>(std::max(0, scratch_slot_capacity)),
+                                           scratch_active_experts.size()));
     uint64_t scratch_submit_us = 0;
 
-    ensure_prefill_full_layer_static_metadata();
-    const bool full_layer_preload = prefill_full_layer_preload_active();
+    PrefillPromotionTiming static_timing_total;
+    add_prefill_promotion_timing(&static_timing_total, last_prefill_static_timing_);
+    PrefillPromotionTiming scratch_timing_total;
+    if (prefill_scratch_preload_schedule_key_ == schedule_key) {
+      add_prefill_promotion_timing(&scratch_timing_total, last_prefill_scratch_timing_);
+    }
+
+    auto submit_scratch_group = [&](const std::vector<int>& group, mesh::FixedExpertQueueBatch* batch) {
+      if (batch == nullptr) return;
+      batch->reset();
+      try {
+        for (int expert_id : group) {
+          const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+          if (state == EXPERT_CACHED || state == EXPERT_PINNED || state == EXPERT_PREFETCHING) {
+            continue;
+          }
+          const int scratch_slot = prefill_scratch_slot_for_expert(expert_id);
+          if (scratch_slot < scratch_begin_slot || scratch_slot >= cache_capacity_) {
+            std::ostringstream oss;
+            oss << "AMX prefill scratch has no free slot layer=" << config_.layer_idx
+                << " tp=" << tp_part_idx << " expert=" << expert_id
+                << " static_slots=" << prefill_static_slot_count_
+                << " scratch_active=" << scratch_active_experts.size()
+                << " scratch_begin=" << scratch_begin_slot
+                << " scratch_slots=" << scratch_slot_capacity
+                << " capacity=" << cache_capacity_ << resident_debug_summary();
+            throw std::runtime_error(oss.str());
+          }
+          if (!submit_fixed_queue_promotion_to_slot(expert_id, scratch_slot, batch)) {
+            std::ostringstream oss;
+            oss << "AMX prefill scratch promotion could not reserve slot layer=" << config_.layer_idx
+                << " tp=" << tp_part_idx << " expert=" << expert_id
+                << " slot=" << scratch_slot
+                << " static_slots=" << prefill_static_slot_count_
+                << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
+                << " capacity=" << cache_capacity_ << resident_debug_summary();
+            throw std::runtime_error(oss.str());
+          }
+        }
+        submit_fixed_queue_reads(batch);
+      } catch (...) {
+        // Roll back earlier reservations too; a mid-batch failure must not
+        // leave experts stuck in PACKING / slots stuck in LOADING.
+        rollback_fixed_queue_promotions(batch);
+        throw;
+      }
+    };
+
+    const auto scratch_submit_start = std::chrono::steady_clock::now();
+    submit_scratch_group(scratch_active_experts, &scratch_batch);
+    const auto scratch_submit_end = std::chrono::steady_clock::now();
+    scratch_submit_us += elapsed_us(scratch_submit_start, scratch_submit_end);
 
     auto compute_expert_group = [&](const std::vector<int>& group) -> uint64_t {
       if (group.empty()) return 0;
@@ -250,48 +310,18 @@
       return elapsed_us(compute_start, compute_end);
     };
 
-    uint64_t static_compute_us = 0;
-    uint64_t scratch_wait_us = 0;
+    const uint64_t static_compute_us = compute_expert_group(static_active_experts);
+    uint64_t scratch_wait_us = wait_for_prefill_scratch_group(scratch_active_experts);
     uint64_t scratch_compute_us = 0;
-    PrefillPromotionTiming static_timing_total;
-    auto add_prefill_timing = [](PrefillPromotionTiming* dst, const PrefillPromotionTiming& src) {
-      dst->state_us += src.state_us;
-      dst->slot_us += src.slot_us;
-      dst->slot_alloc_us += src.slot_alloc_us;
-      dst->request_build_us += src.request_build_us;
-      dst->reader_submit_us += src.reader_submit_us;
-      dst->reader_total_us += src.reader_total_us;
-      dst->reader_lock_wait_us += src.reader_lock_wait_us;
-      dst->reader_sqe_prep_us += src.reader_sqe_prep_us;
-      dst->reader_bookkeeping_us += src.reader_bookkeeping_us;
-      dst->ring_submit_us += src.ring_submit_us;
-      dst->reader_stats_us += src.reader_stats_us;
-      dst->request_slice_us += src.request_slice_us;
-      dst->queue_wait_us += src.queue_wait_us;
-      dst->finalize_us += src.finalize_us;
-      dst->queue_total_us += src.queue_total_us;
-      dst->promote_calls += src.promote_calls;
-      dst->allocated_slots += src.allocated_slots;
-      dst->reused_slots += src.reused_slots;
-      dst->read_requests += src.read_requests;
-      dst->ring_flushes += src.ring_flushes;
-    };
-
-    std::vector<int> work_compute_group;
-    size_t work_next = 0;
-    while (work_next < active_experts.size()) {
-      const size_t chunk_end =
-          std::min(active_experts.size(), work_next + static_cast<size_t>(work_slot_capacity));
-      work_compute_group.assign(active_experts.begin() + work_next, active_experts.begin() + chunk_end);
-      if (!full_layer_preload) {
-        assign_prefill_work_chunk_slots(work_compute_group);
-      }
-      ensure_prefill_static_residents(&work_compute_group);
-      add_prefill_timing(&static_timing_total, last_prefill_static_timing_);
-      static_compute_us += compute_expert_group(work_compute_group);
-      work_next = chunk_end;
-    }
     last_prefill_static_timing_ = static_timing_total;
+    if (!scratch_batch.request_ids.empty()) {
+      const auto scratch_wait_start = std::chrono::steady_clock::now();
+      wait_and_finalize_fixed_queue(&scratch_batch, "scratch");
+      const auto scratch_wait_end = std::chrono::steady_clock::now();
+      scratch_wait_us += elapsed_us(scratch_wait_start, scratch_wait_end);
+      add_prefill_promotion_timing(&scratch_timing_total, scratch_batch.timing);
+    }
+    scratch_compute_us += compute_expert_group(scratch_active_experts);
 
     const uint64_t read_reqs_after =
         config_.cache_stats != nullptr
@@ -311,7 +341,7 @@
       trace_data.scratch_active = scratch_active_experts.size();
       trace_data.scratch_state = scratch_state_before;
       trace_data.static_slots = prefill_static_slot_count_;
-      trace_data.scratch_slots = 0;
+      trace_data.scratch_slots = scratch_slot_capacity;
       trace_data.scratch_submit_us = scratch_submit_us;
       trace_data.scratch_wait_us = scratch_wait_us;
       trace_data.static_compute_us = static_compute_us;
@@ -321,7 +351,7 @@
       trace_data.resident_before = resident_before;
       trace_data.resident_after = resident_expert_count_.load(std::memory_order_acquire);
       trace_data.allocated_slots = allocated_slot_count();
-      trace_data.scratch_timing = PrefillPromotionTiming{};
+      trace_data.scratch_timing = scratch_timing_total;
       trace_data.static_timing = last_prefill_static_timing_;
       mesh::log_prefill_static_scratch_trace(config_, tp_part_idx, trace_data);
     }
@@ -374,7 +404,7 @@
                                         static_active_experts.size(),
                                         scratch_active_experts.size(),
                                         prefill_static_slot_count_,
-                                        0,
+                                        scratch_slot_capacity,
                                         elapsed_us(copy_input_start, copy_input_end),
                                         elapsed_us(merge_start, merge_end),
                                         elapsed_us(forward_start, forward_end),

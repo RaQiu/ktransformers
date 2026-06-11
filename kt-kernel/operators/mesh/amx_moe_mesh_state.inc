@@ -21,6 +21,7 @@
   std::atomic<int> resident_expert_count_{0};
   std::atomic<int> eviction_cursor_{0};
   int numa_node_ = 0;
+  int resident_capacity_ = 0;
   int cache_capacity_ = 0;
   int prefill_static_capacity_ = 0;
   int prefill_static_slot_count_ = 0;
@@ -39,6 +40,14 @@
   std::vector<uint64_t> expert_frequency_score_;
   uint64_t expert_frequency_total_ = 0;
   PrefillPromotionTiming last_prefill_static_timing_;
+  PrefillPromotionTiming last_prefill_scratch_timing_;
+  int64_t prefill_scratch_preload_schedule_key_ = std::numeric_limits<int64_t>::min();
+  int prefill_scratch_preload_submitted_ = 0;
+  int prefill_scratch_preload_candidates_ = 0;
+  // Cached expert->scratch-slot mapping. Rebuilt lazily whenever the static
+  // expert mask changes; avoids an O(expert_num) rescan per lookup.
+  mutable std::vector<int> prefill_scratch_slot_map_;
+  mutable bool prefill_scratch_slot_map_valid_ = false;
   size_t gate_total_bytes_ = 0;
   size_t up_total_bytes_ = 0;
   size_t down_total_bytes_ = 0;

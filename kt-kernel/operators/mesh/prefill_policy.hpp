@@ -16,6 +16,7 @@ namespace mesh {
 struct ResidentCapacityPlan {
   int configured_resident = 0;
   int requested_decode_resident = 0;
+  int resident_capacity = 0;
   int cache_capacity = 0;
   int prefill_static_capacity = 0;
 };
@@ -28,33 +29,31 @@ inline int cpu_managed_expert_count(const GeneralMOEConfig& config) {
   return count;
 }
 
-inline int decode_cache_capacity(const GeneralMOEConfig& config, int cache_capacity) {
-  const int configured = config.mesh_decode_resident_experts > 0 ? config.mesh_decode_resident_experts : cache_capacity;
-  if (configured <= 0) return 0;
-  return std::min(cpu_managed_expert_count(config), std::min(config.expert_num, std::max(configured, 0)));
+inline int decode_cache_capacity(const GeneralMOEConfig& config, int resident_capacity) {
+  if (resident_capacity <= 0) return 0;
+  return std::min(cpu_managed_expert_count(config), std::min(config.expert_num, resident_capacity));
 }
 
 inline ResidentCapacityPlan build_resident_capacity_plan(const GeneralMOEConfig& config) {
   ResidentCapacityPlan plan;
+  const int cpu_capacity = cpu_managed_expert_count(config);
   plan.configured_resident =
       config.max_resident_experts > 0 ? config.max_resident_experts : config.max_tier0_experts;
-  plan.requested_decode_resident =
-      config.mesh_decode_resident_experts > 0 ? config.mesh_decode_resident_experts : plan.configured_resident;
-  plan.cache_capacity =
-      plan.configured_resident <= 0
-          ? 0
-          : std::min(config.expert_num, std::max(plan.configured_resident, config.num_experts_per_tok));
-  if (config.mesh_prefill_layer_mode_enabled && plan.cache_capacity > 0) {
-    const int cpu_capacity = cpu_managed_expert_count(config);
-    // Python-side config preparation resolves the default static capacity.
-    // Preserve an explicit zero here: it means "no long-lived prefill static
-    // slots; use the scratch pool for prefill-layer temporary bindings."
-    const int requested_prefill_static = config.mesh_prefill_static_experts;
+  if (plan.configured_resident > 0 && cpu_capacity > 0) {
+    plan.resident_capacity =
+        std::min(cpu_capacity, std::min(config.expert_num, std::max(plan.configured_resident, config.num_experts_per_tok)));
+  }
+  plan.requested_decode_resident = plan.resident_capacity;
+  plan.cache_capacity = plan.resident_capacity;
+  if (config.mesh_slot_capacity > 0 && plan.resident_capacity > 0) {
+    plan.cache_capacity =
+        std::min(cpu_capacity, std::min(config.expert_num, std::max(config.mesh_slot_capacity, plan.resident_capacity)));
+  }
+  if (config.mesh_prefill_layer_mode_enabled && plan.resident_capacity > 0) {
+    const int requested_static =
+        config.mesh_prefill_static_experts > 0 ? config.mesh_prefill_static_experts : plan.resident_capacity;
     plan.prefill_static_capacity =
-        requested_prefill_static <= 0
-            ? 0
-            : std::min(cpu_capacity, std::max(requested_prefill_static, config.num_experts_per_tok));
-    plan.cache_capacity = cpu_capacity;
+        std::min(cpu_capacity, std::min(plan.cache_capacity, std::max(requested_static, plan.resident_capacity)));
   }
   return plan;
 }
@@ -168,6 +167,24 @@ inline void rebuild_prefill_static_expert_set(const GeneralMOEConfig& config,
     static_slot_for_expert[expert_id] = static_slot_count;
     static_experts.push_back(expert_id);
     static_slot_count += 1;
+  }
+}
+
+inline void split_prefill_static_and_scratch_experts(const std::vector<int>& active_experts,
+                                                     const std::vector<uint8_t>& static_expert_mask,
+                                                     std::vector<int>& static_active_experts,
+                                                     std::vector<int>& scratch_active_experts) {
+  static_active_experts.clear();
+  scratch_active_experts.clear();
+  static_active_experts.reserve(active_experts.size());
+  scratch_active_experts.reserve(active_experts.size());
+  for (int expert_id : active_experts) {
+    if (expert_id >= 0 && expert_id < static_cast<int>(static_expert_mask.size()) &&
+        static_expert_mask[expert_id] != 0) {
+      static_active_experts.push_back(expert_id);
+    } else {
+      scratch_active_experts.push_back(expert_id);
+    }
   }
 }
 

@@ -17,12 +17,31 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 
 #include "hwloc.h"
 
 thread_local int WorkerPool::thread_local_id = -1;
+
+namespace {
+
+int worker_core_offset() {
+  const char* value = std::getenv("KT_WORKER_CPU_CORE_OFFSET");
+  if (value == nullptr || value[0] == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || parsed < 0) {
+    fprintf(stderr, "Invalid KT_WORKER_CPU_CORE_OFFSET=%s, using 0\n", value);
+    return 0;
+  }
+  return static_cast<int>(parsed);
+}
+
+}  // namespace
 
 InNumaPool::InNumaPool(int max_thread_num) {
   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
@@ -45,6 +64,10 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
   hwloc_bitmap_t cpuset;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
+  const int core_offset = worker_core_offset();
+  if (core_offset != 0) {
+    printf("KT_WORKER_CPU_CORE_OFFSET=%d\n", core_offset);
+  }
   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
   total_worker_count = max_thread_num;
   set_restricted_worker_count(total_worker_count);
@@ -77,9 +100,10 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
+    int core_index = core_offset + i + threads_id_start;
+    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, core_index);
     if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
+      fprintf(stderr, "Core %d inside NUMA node %d not found\n", core_index, numa_id);
       // throw std::runtime_error("Core not found inside NUMA node");
       continue;
     }
@@ -271,6 +295,10 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
   hwloc_bitmap_t cpuset;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
+  const int core_offset = worker_core_offset();
+  if (core_offset != 0) {
+    printf("KT_WORKER_CPU_CORE_OFFSET=%d\n", core_offset);
+  }
 
   this->numa_count = numa_ids.size();
   this->ready_bar = std::unique_ptr<std::barrier<>>(new std::barrier<>(numa_count + 1));
@@ -299,9 +327,10 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
       // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, start_id);
+    int core_index = core_offset + start_id;
+    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, core_index);
     if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", 0, this_numa);
+      fprintf(stderr, "Core %d inside NUMA node %d not found\n", core_index, this_numa);
       // throw std::runtime_error("Core not found inside NUMA node");
       continue;
     }

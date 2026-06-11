@@ -153,8 +153,7 @@
 
           const bool has_resident_cache_budget =
               config_.max_tier0_experts > 0 ||
-              config_.max_resident_experts > 0 ||
-              config_.mesh_decode_resident_experts > 0;
+              config_.max_resident_experts > 0;
           if (!has_resident_cache_budget) {
             expert_read_scope.reset();
             for (int idx = wave_begin; idx < wave_end; ++idx) {
@@ -211,8 +210,7 @@
       }
       const bool has_resident_cache_budget =
           config_.max_tier0_experts > 0 ||
-          config_.max_resident_experts > 0 ||
-          config_.mesh_decode_resident_experts > 0;
+          config_.max_resident_experts > 0;
       if (!has_resident_cache_budget && !active_experts.empty()) {
         // With zero resident-cache budget, keep MESH-loaded experts only for
         // the current forward pass.

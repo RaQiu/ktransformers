@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -184,6 +185,10 @@ def _mesh_prefill_layer_mode_enabled(self) -> bool:
     return self.io_backend == "IOURING" and self._env_flag("KT_MESH_PREFILL_LAYER_MODE", False)
 
 
+def _mesh_prefill_layer_min_tokens(self) -> int:
+    return max(2, self._env_int("KT_MESH_PREFILL_LAYER_MIN_TOKENS", 4096))
+
+
 def _mesh_prefill_rolling_enabled(self) -> bool:
     # Rolling Layer Prefetch (RLP): non-default opt-in. Requires IOURING because
     # the strategy depends on cross-layer async submission.
@@ -199,19 +204,9 @@ def _mesh_prefill_rolling_depth(self) -> int:
 def _mesh_prefill_full_layer_count(self) -> int:
     if not self._mesh_prefill_layer_mode_enabled():
         return 0
-    # Explicit override via KT_MESH_PREFILL_LAYER_WINDOW.
-    #   -1 (default): compute from cache config (sliding window behavior)
-    #    0:           disable sliding — keep ALL layers' prefill state across
-    #                 SGLang chunks. Memory cost = pool capacity, not 40 ×
-    #                 cap. Use when KT_MESH_GLOBAL_POOL_CAPACITY is sized
-    #                 for the full set.
-    #    N > 0:       force window = N (clamped to total_layers).
-    explicit = self._env_int("KT_MESH_PREFILL_LAYER_WINDOW", -1)
     total_layers = self._mesh_total_moe_layers()
-    if explicit == 0:
-        return max(1, int(total_layers))
-    if explicit > 0:
-        return max(1, min(int(total_layers), int(explicit)))
+    if self._env_flag("KT_MESH_LAYER_MAJOR_PREFILL", False):
+        return max(1, min(2, int(total_layers)))
     configured = self._mesh_global_resident_capacity()
     if configured <= 0 or self.num_experts <= 0 or total_layers <= 0:
         return 0
@@ -222,65 +217,78 @@ def _mesh_prefill_full_layer_count(self) -> int:
 
 
 def _mesh_slot_pool_capacity(self) -> int:
-    if self._mesh_prefill_layer_mode_enabled() and self._mesh_global_resident_capacity() > 0:
-        return int(self.num_experts)
-    return self._mesh_config_resident_experts()
+    resident_capacity = self._mesh_config_resident_experts()
+    if resident_capacity <= 0:
+        return 0
+    slot_capacity = int(resident_capacity)
+    if self._mesh_prefill_layer_mode_enabled():
+        # Layer-mode prefill uses the slots above the resident capacity as
+        # temporary work space. This must not change the decode/static cap.
+        slot_capacity = max(slot_capacity, self._mesh_current_cpu_expert_count())
+        slot_capacity = max(slot_capacity, self._mesh_early_layer_slot_capacity())
+    return int(slot_capacity)
 
 
 def _mesh_prefill_static_resident_capacity(self) -> int:
-    raw = os.environ.get("KT_MESH_PREFILL_STATIC_EXPERTS")
-    configured = self._mesh_config_resident_experts()
-    cpu_expert_count = self._mesh_current_cpu_expert_count()
-    if raw is not None and str(raw).strip():
-        try:
-            configured = int(str(raw).strip())
-        except ValueError:
-            configured = 0
-    elif self._mesh_prefill_layer_mode_enabled():
-        configured = cpu_expert_count
-    if configured <= 0:
+    if not self._mesh_prefill_layer_mode_enabled():
         return 0
-    return min(int(configured), int(cpu_expert_count))
+    configured = self._mesh_config_resident_experts()
+    if int(self.layer_idx) < 5:
+        configured = max(configured, self._mesh_early_layer_slot_capacity())
+    return configured
 
 
 def _mesh_config_resident_experts(self) -> int:
-    """Return the per-layer resident cap written into GeneralMOEConfig.
+    """Return the main resident cap written into GeneralMOEConfig.
 
-    Layer 0-4 get an independent MESH slot-pool cap. The default is all
-    CPU-managed experts in that layer, not a hard-coded model expert count.
+    Extra work slots, such as layer-major scratch or early-layer full slots,
+    are physical slot-pool capacity and must not rewrite this value.
     """
-    if self.io_backend != "IOURING" or int(self.layer_idx) >= 5:
+    configured = self._mesh_global_resident_capacity()
+    if configured <= 0:
         return int(self.max_resident_experts)
 
     cpu_expert_count = self._mesh_current_cpu_expert_count()
-    raw = os.environ.get("KT_MESH_EARLY_LAYER_EXPERTS", "full").strip().lower()
+    if cpu_expert_count <= 0:
+        return 0
+    minimum = min(int(self.num_experts_per_tok), int(cpu_expert_count))
+    return min(int(cpu_expert_count), max(int(configured), int(minimum)))
+
+
+def _mesh_early_layer_slot_capacity(self) -> int:
+    if self.io_backend != "IOURING" or int(self.layer_idx) >= 5:
+        return 0
+    cpu_expert_count = self._mesh_current_cpu_expert_count()
+    if cpu_expert_count <= 0:
+        return 0
     global_capacity = self._mesh_global_resident_capacity()
-    mode = raw or "full"
+    raw_ratio = os.environ.get("KT_MESH_EARLY_LAYER_SLOT_RATIO", "1.0").strip().lower()
+    try:
+        ratio = float(raw_ratio)
+    except ValueError:
+        ratio = 1.0
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        ratio = 1.0
+    ratio = min(1.0, max(0.0, ratio))
+    requested = int(math.ceil(float(cpu_expert_count) * ratio))
+    minimum = min(int(self.num_experts_per_tok), cpu_expert_count)
+    if global_capacity > 0:
+        minimum = max(minimum, min(int(global_capacity), cpu_expert_count))
+    capacity = min(cpu_expert_count, max(requested, minimum))
 
-    if mode in ("global", "inherit", "default"):
-        return int(self.max_resident_experts)
-    if mode in ("full", "all", "auto", "max"):
-        capacity = cpu_expert_count
-    else:
-        try:
-            requested = int(mode)
-        except ValueError:
-            requested = cpu_expert_count
-            mode = "full"
-        if requested <= 0:
-            capacity = cpu_expert_count
-            mode = "full"
-        else:
-            minimum = min(int(self.num_experts_per_tok), cpu_expert_count)
-            capacity = min(cpu_expert_count, max(requested, minimum))
-
-    log_key = (int(self.layer_idx), raw, int(cpu_expert_count), int(global_capacity), int(capacity))
+    log_key = (
+        int(self.layer_idx),
+        raw_ratio,
+        int(cpu_expert_count),
+        int(global_capacity),
+        int(capacity),
+    )
     if log_key not in BaseMoEWrapper._mesh_early_capacity_logged:
         print(
-            "[MESHEarlyLayerCapacity] "
-            f"layer={self.layer_idx} env={raw!r} mode={mode} "
+            "[MESHEarlyLayerSlots] "
+            f"layer={self.layer_idx} ratio={raw_ratio!r} "
             f"cpu_experts={cpu_expert_count} global_capacity={global_capacity} "
-            f"effective_capacity={capacity}"
+            f"slot_capacity={capacity}"
         )
         BaseMoEWrapper._mesh_early_capacity_logged.add(log_key)
     return int(capacity)
@@ -390,6 +398,13 @@ def _mesh_total_moe_layers(self) -> int:
     if registered_layers > 0:
         return max(registered_layers, self.layer_idx + 1)
     return self.layer_idx + 1
+
+
+def _mesh_is_final_prefill_chunk(self, qlen: int) -> bool:
+    if qlen <= 1:
+        return False
+    chunk_size = int(getattr(self, "chunked_prefill_size", 0) or 0)
+    return chunk_size > 0 and int(qlen) < chunk_size
 
 
 def _mesh_last_registered_layer_idx(self) -> int:
@@ -955,19 +970,33 @@ def _submit_iouring_prefetch(
     return True
 
 
-def _submit_mesh_noarg_task(self, task_name: str, *args) -> bool:
+def _submit_mesh_noarg_task(self, task_name: str, *args, cuda_stream=None) -> bool:
     if self.io_backend != "IOURING" or self.moe is None:
         return False
     task_factory = getattr(self.moe, task_name, None)
     if task_factory is None:
         return False
-    self._submit_cpuinfer_task(task_factory(*args), None)
+    self._submit_cpuinfer_task(task_factory(*args), cuda_stream)
+    return True
+
+
+def _call_mesh_direct(self, method_name: str, *args) -> bool:
+    if self.io_backend != "IOURING" or self.moe is None:
+        return False
+    method = getattr(self.moe, method_name, None)
+    if method is None:
+        return False
+    method(*args)
     return True
 
 
 def _mesh_before_submit_forward(self, qlen: int, schedule_key: int = 0) -> None:
-    self._maybe_mesh_prepare_prefill_layer_window(qlen, schedule_key)
+    self._maybe_mesh_prepare_prefill_layer_window(qlen, schedule_key, lookahead=False)
     self._maybe_mesh_transition_to_decode_cache(qlen)
+
+
+def _mesh_after_submit_forward(self, qlen: int, schedule_key: int = 0, cuda_stream=None) -> None:
+    self._maybe_mesh_prepare_prefill_layer_window(qlen, schedule_key, lookahead=True, cuda_stream=cuda_stream)
 
 
 def _mesh_prefetch_previous_topk(self) -> None:
@@ -1081,14 +1110,17 @@ def _mesh_submit_forward_impl(
             BaseMoEWrapper._mesh_current_timeline_step = 0
             BaseMoEWrapper._mesh_prefill_chunk_seq = 0
             BaseMoEWrapper._mesh_decode_token_seq = 0
+            BaseMoEWrapper._mesh_prefill_completed_layers.clear()
         if self.layer_idx == 0:
             BaseMoEWrapper._mesh_current_timeline_step = int(BaseMoEWrapper._mesh_timeline_seq)
             BaseMoEWrapper._mesh_timeline_seq += 1
             BaseMoEWrapper._mesh_prefill_chunk_seq += 1
-        current_schedule_key = (
-            int(BaseMoEWrapper._mesh_current_timeline_step) * int(total_moe_layers) + int(self.layer_idx)
-        )
+        current_schedule_key = int(self.layer_idx)
     self._mesh_before_submit_forward(qlen, current_schedule_key)
+    # Submit the next layer's prefill scratch before current-layer compute enters
+    # CPUInfer so the scratch read has the full current-layer compute interval to
+    # overlap with.
+    self._mesh_after_submit_forward(qlen, current_schedule_key, cuda_stream)
 
     (
         input_tensor_cpu,
@@ -1112,10 +1144,14 @@ def _mesh_submit_forward_impl(
         BaseMoEWrapper._mesh_current_timeline_step = int(BaseMoEWrapper._mesh_timeline_seq)
         BaseMoEWrapper._mesh_timeline_seq += 1
         BaseMoEWrapper._mesh_decode_token_seq += 1
-    current_schedule_key = (
-        int(BaseMoEWrapper._mesh_current_timeline_step) * int(total_moe_layers) + int(self.layer_idx)
-    )
-    defer_schedule_key = current_schedule_key + 1
+    if is_prefill_chunk:
+        current_schedule_key = int(self.layer_idx)
+        defer_schedule_key = current_schedule_key
+    else:
+        current_schedule_key = (
+            int(BaseMoEWrapper._mesh_current_timeline_step) * int(total_moe_layers) + int(self.layer_idx)
+        )
+        defer_schedule_key = current_schedule_key + 1
     immediate_ids, deferred_ids, state_defer_used = self._mesh_select_forward_experts(
         topk_ids_long,
         topk_weights,
@@ -1231,8 +1267,16 @@ def _mesh_forward_impl(
     return self._mesh_sync_forward_impl(hidden_states, topk_ids, cuda_stream)
 
 
-def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int, schedule_key: int = 0) -> None:
+def _maybe_mesh_prepare_prefill_layer_window(
+    self,
+    qlen: int,
+    schedule_key: int = 0,
+    lookahead: bool = False,
+    cuda_stream=None,
+) -> None:
     if qlen <= 1 or not self._mesh_prefill_layer_mode_enabled():
+        return
+    if qlen < self._mesh_prefill_layer_min_tokens():
         return
     window = self._mesh_prefill_full_layer_count()
     if window <= 0:
@@ -1263,22 +1307,52 @@ def _maybe_mesh_prepare_prefill_layer_window(self, qlen: int, schedule_key: int 
     BaseMoEWrapper._mesh_prefill_session_seen = True
     BaseMoEWrapper._mesh_decode_transition_done = False
     BaseMoEWrapper._mesh_decode_token_seq = 0
-
-    release_layer = int(self.layer_idx) - int(window)
-    if release_layer in BaseMoEWrapper._mesh_prefill_window_layers:
-        old_wrapper = BaseMoEWrapper._wrappers_by_layer.get(release_layer)
-        if old_wrapper is not None and old_wrapper._submit_mesh_noarg_task("mesh_release_prefill_layer_task"):
-            BaseMoEWrapper._mesh_prefill_window_layers.discard(release_layer)
-
-    if self.layer_idx not in BaseMoEWrapper._mesh_prefill_window_layers:
-        if self._submit_mesh_noarg_task("mesh_prepare_prefill_layer_task", int(schedule_key)):
-            BaseMoEWrapper._mesh_prefill_window_layers.add(int(self.layer_idx))
+    total_layers = self._mesh_total_moe_layers()
+    timeline_step = int(BaseMoEWrapper._mesh_current_timeline_step)
+    current_layer = int(self.layer_idx)
+    if lookahead:
+        begin_layer = current_layer + 1
+        end_layer = min(int(total_layers), begin_layer + max(0, int(window) - 1))
+    else:
+        begin_layer = current_layer
+        end_layer = min(int(total_layers), begin_layer + 1)
+    if begin_layer >= end_layer:
+        return
+    for target_layer in range(begin_layer, end_layer):
+        release_layer = int(target_layer) - int(window)
+        if release_layer in BaseMoEWrapper._mesh_prefill_window_layers:
+            old_wrapper = BaseMoEWrapper._wrappers_by_layer.get(release_layer)
+            if old_wrapper is not None:
+                released = old_wrapper._call_mesh_direct("mesh_release_prefill_layer")
+                if not released:
+                    released = old_wrapper._submit_mesh_noarg_task(
+                        "mesh_release_prefill_layer_task",
+                        cuda_stream=cuda_stream,
+                    )
+                if released:
+                    BaseMoEWrapper._mesh_prefill_window_layers.discard(release_layer)
+                    BaseMoEWrapper._mesh_prefill_completed_layers.add(release_layer)
+        if target_layer in BaseMoEWrapper._mesh_prefill_window_layers:
+            continue
+        target_wrapper = BaseMoEWrapper._wrappers_by_layer.get(target_layer)
+        if target_wrapper is None:
+            continue
+        target_schedule_key = int(target_layer)
+        prepared = target_wrapper._call_mesh_direct("mesh_prepare_prefill_layer", int(target_schedule_key))
+        if not prepared:
+            prepared = target_wrapper._submit_mesh_noarg_task(
+                "mesh_prepare_prefill_layer_task",
+                int(target_schedule_key),
+                cuda_stream=cuda_stream,
+            )
+        if prepared:
+            BaseMoEWrapper._mesh_prefill_window_layers.add(int(target_layer))
 
     if not BaseMoEWrapper._mesh_prefill_window_logged:
         configured = self._mesh_global_resident_capacity()
         print(
             "[MESHPrefillLayerMode] "
-            f"enabled window_layers={window} total_layers={self._mesh_total_moe_layers()} "
+            f"enabled lookahead_layers={window} total_layers={self._mesh_total_moe_layers()} "
             f"configured_experts={configured} num_experts={self.num_experts}"
         )
         BaseMoEWrapper._mesh_prefill_window_logged = True
@@ -1312,6 +1386,8 @@ def _maybe_mesh_transition_to_decode_cache(self, qlen: int) -> None:
         self._sync_cpuinfer()
 
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
+    BaseMoEWrapper._mesh_prefill_completed_layers.clear()
+    BaseMoEWrapper._mesh_prefill_current_chunk_is_final = False
     BaseMoEWrapper._mesh_decode_transition_done = True
     BaseMoEWrapper._mesh_decode_bootstrap_allowed = had_prefill_session
     BaseMoEWrapper._mesh_prefill_session_seen = False
@@ -1491,6 +1567,8 @@ def reset_runtime_state(force: bool = False):
     BaseMoEWrapper._mesh_current_timeline_step = 0
     BaseMoEWrapper._mesh_prefill_chunk_seq = 0
     BaseMoEWrapper._mesh_prefill_window_layers.clear()
+    BaseMoEWrapper._mesh_prefill_completed_layers.clear()
+    BaseMoEWrapper._mesh_prefill_current_chunk_is_final = False
     BaseMoEWrapper._mesh_prefill_session_seen = False
     BaseMoEWrapper._mesh_decode_transition_done = False
     BaseMoEWrapper._mesh_decode_bootstrap_allowed = False
@@ -1518,6 +1596,7 @@ def close(self):
     BaseMoEWrapper._layer_has_pending_deferred.pop(self.layer_idx, None)
     BaseMoEWrapper._prev_topk_ids_by_layer.pop(self.layer_idx, None)
     BaseMoEWrapper._mesh_prefill_window_layers.discard(self.layer_idx)
+    BaseMoEWrapper._mesh_prefill_completed_layers.discard(self.layer_idx)
     if BaseMoEWrapper._wrappers_by_layer.get(self.layer_idx) is self:
         BaseMoEWrapper._wrappers_by_layer.pop(self.layer_idx, None)
 
@@ -1550,18 +1629,21 @@ _INSTANCE_METHODS = (
     "_mesh_score_transform_id",
     "_mesh_global_resident_capacity",
     "_mesh_prefill_layer_mode_enabled",
+    "_mesh_prefill_layer_min_tokens",
     "_mesh_prefill_rolling_enabled",
     "_mesh_prefill_rolling_depth",
     "_mesh_prefill_full_layer_count",
     "_mesh_slot_pool_capacity",
     "_mesh_prefill_static_resident_capacity",
     "_mesh_config_resident_experts",
+    "_mesh_early_layer_slot_capacity",
     "_mesh_resident_capacity",
     "_mesh_current_cpu_expert_count",
     "_mesh_cpu_expert_mask",
     "_mesh_full_gate_observation_enabled",
     "_mesh_full_gate_batched_enabled",
     "_mesh_total_moe_layers",
+    "_mesh_is_final_prefill_chunk",
     "_mesh_last_registered_layer_idx",
     "_mesh_last_full_gate_layer_idx",
     "_prepare_router_score_vector",
@@ -1578,7 +1660,9 @@ _INSTANCE_METHODS = (
     "_prepare_router_scores_for_forward",
     "_submit_iouring_prefetch",
     "_submit_mesh_noarg_task",
+    "_call_mesh_direct",
     "_mesh_before_submit_forward",
+    "_mesh_after_submit_forward",
     "_mesh_prefetch_previous_topk",
     "_mesh_select_forward_experts",
     "_mesh_prefetch_deferred_ids",
@@ -1626,6 +1710,8 @@ def install_base_moe_helpers(wrapper_cls, buffer_cls, pin_memory: bool) -> None:
     wrapper_cls._mesh_prefill_chunk_seq = 0
     wrapper_cls._mesh_early_capacity_logged = set()
     wrapper_cls._mesh_prefill_window_layers = set()
+    wrapper_cls._mesh_prefill_completed_layers = set()
+    wrapper_cls._mesh_prefill_current_chunk_is_final = False
     wrapper_cls._mesh_prefill_session_seen = False
     wrapper_cls._mesh_decode_transition_done = False
     wrapper_cls._mesh_decode_bootstrap_allowed = False

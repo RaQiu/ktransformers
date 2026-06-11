@@ -135,6 +135,29 @@
     if (iouring_enabled()) {
       validate_iouring_config();
       preload_iouring_scale_cache();
+      if (config_.mesh_prefill_layer_mode_enabled && prefill_static_capacity_ > 0 && cache_capacity_ > 0) {
+        const auto static_start = std::chrono::steady_clock::now();
+        mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
+        if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) {
+          throw std::runtime_error("AMX MESH failed to allocate resident slots for prefill static preload");
+        }
+        rebuild_prefill_static_expert_set();
+        const int loaded = ensure_prefill_static_residents(nullptr, mesh::FixedExpertQueueWaitMode::Blocking);
+        if (mesh_prefill_stream_trace_enabled()) {
+          std::fprintf(stderr,
+                       "[MESH_PREFILL_STATIC_PRELOAD] layer=%d tp=%d static_count=%d "
+                       "static_slots=%d capacity=%d slot_capacity=%d wait_us=%llu read_requests=%llu%s\n",
+                       config_.layer_idx,
+                       tp_part_idx,
+                       loaded,
+                       prefill_static_slot_count_,
+                       resident_capacity_,
+                       cache_capacity_,
+                       static_cast<unsigned long long>(elapsed_us(static_start, std::chrono::steady_clock::now())),
+                       static_cast<unsigned long long>(last_prefill_static_timing_.read_requests),
+                       resident_debug_summary().c_str());
+        }
+      }
       return true;
     }
     return false;
@@ -158,6 +181,7 @@
 
   void initialize_resident_io_state() {
     if constexpr (!buffer_b_has_scale_ptr()) {
+      resident_capacity_ = 0;
       cache_capacity_ = 0;
       return;
     } else {
@@ -173,6 +197,7 @@
     eviction_cursor_.store(0, std::memory_order_relaxed);
     resident_slot_pool_allocated_ = false;
     mesh_slot_mode_ = MESH_SLOT_DECODE_CACHE;
+    resident_capacity_ = 0;
     prefill_static_capacity_ = 0;
     prefill_static_slot_count_ = 0;
     current_forward_schedule_key_ = 0;
@@ -181,6 +206,12 @@
     prefill_static_experts_.clear();
     expert_frequency_score_.assign(en, 0);
     expert_frequency_total_ = 0;
+    last_prefill_static_timing_ = PrefillPromotionTiming{};
+    last_prefill_scratch_timing_ = PrefillPromotionTiming{};
+    prefill_scratch_preload_schedule_key_ = std::numeric_limits<int64_t>::min();
+    prefill_scratch_preload_submitted_ = 0;
+    prefill_scratch_preload_candidates_ = 0;
+    prefill_scratch_slot_map_valid_ = false;
 
     gate_total_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
     up_total_bytes_ = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size);
@@ -201,6 +232,7 @@
       down_scale_bytes_ = down_total_bytes_ - down_weight_bytes_;
     }
     const mesh::ResidentCapacityPlan capacity_plan = mesh::build_resident_capacity_plan(config_);
+    resident_capacity_ = capacity_plan.resident_capacity;
     cache_capacity_ = capacity_plan.cache_capacity;
     prefill_static_capacity_ = capacity_plan.prefill_static_capacity;
     mesh::resize_resident_slot_storage(cache_capacity_,
@@ -405,7 +437,7 @@
       return std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
     }
     if (mesh_slot_mode_ == MESH_SLOT_DECODE_CACHE) {
-      return std::max(0, std::min(mesh::decode_cache_capacity(config_, cache_capacity_), cache_capacity_));
+      return std::max(0, std::min(decode_cache_capacity(), cache_capacity_));
     }
     return cache_capacity_;
   }
@@ -641,7 +673,10 @@
     }
     mesh::validate_amx_iouring_config(config_,
                                       tp_part_idx,
+                                      resident_capacity_,
                                       cache_capacity_,
+                                      decode_cache_capacity(),
+                                      prefill_static_capacity_,
                                       gate_weight_bytes_,
                                       gate_scale_bytes_,
                                       up_weight_bytes_,
@@ -707,8 +742,7 @@
         mesh_slot_mode_ != MESH_SLOT_PREFILL_LAYER) {
       return;
     }
-    const int requested =
-        config_.mesh_decode_resident_experts > 0 ? config_.mesh_decode_resident_experts : decode_cache_capacity();
+    const int requested = decode_cache_capacity();
     const int fill_limit = mesh_env_int("KT_MESH_DECODE_TRANSITION_FILL_LIMIT", requested);
     (void)transition_to_decode_cache(requested, fill_limit);
   }
@@ -1591,7 +1625,7 @@
   }
 
   int decode_cache_capacity() const {
-    return mesh::decode_cache_capacity(config_, cache_capacity_);
+    return mesh::decode_cache_capacity(config_, resident_capacity_);
   }
 
   int decode_main_slot_count() const {
@@ -1630,6 +1664,7 @@
                                             prefill_static_expert_mask_,
                                             prefill_static_slot_for_expert_,
                                             prefill_static_experts_);
+    prefill_scratch_slot_map_valid_ = false;
   }
 
   void rebuild_prefill_static_expert_set_by_frequency(int requested_capacity) {
@@ -1640,6 +1675,7 @@
                                             prefill_static_expert_mask_,
                                             prefill_static_slot_for_expert_,
                                             prefill_static_experts_);
+    prefill_scratch_slot_map_valid_ = false;
   }
 
   int prefill_static_slot_for_expert(int expert_id) const {
@@ -1693,6 +1729,7 @@
     prefill_static_expert_mask_.assign(config_.expert_num, 0);
     prefill_static_slot_for_expert_.assign(config_.expert_num, -1);
     prefill_static_experts_.assign(prefill_static_slot_limit(), -1);
+    prefill_scratch_slot_map_valid_ = false;
   }
 
   bool expert_is_ready_in_static_work_slot(int expert_id, int static_slot_limit) const {
@@ -1898,12 +1935,14 @@
       prefill_static_experts_.resize(slot + 1, -1);
     }
     prefill_static_experts_[slot] = expert_id;
+    prefill_scratch_slot_map_valid_ = false;
   }
 
   void clear_prefill_static_expert_metadata(int expert_id) {
     if (expert_id < 0 || expert_id >= config_.expert_num) return;
     prefill_static_expert_mask_[expert_id] = 0;
     prefill_static_slot_for_expert_[expert_id] = -1;
+    prefill_scratch_slot_map_valid_ = false;
   }
 
   int find_main_slot_outside_frequency_set(const std::vector<uint8_t>& desired_mask) const {
@@ -1943,7 +1982,7 @@
         expert_id, protected_mask, decode_main_slot_count(), false);
   }
 
-  bool release_prefill_scratch_slots() {
+  bool release_prefill_scratch_slots(bool release_buffers = false) {
     if (!slot_pool_enabled()) return true;
     bool ok = true;
     const int scratch_begin = std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
@@ -1957,10 +1996,10 @@
         ok = false;
         continue;
       }
-      // Always release scratch buffers. Pool-backed buffers return to IDLE
-      // with metadata preserved for warm restore; numa_alloc fallback buffers
-      // must be freed here or they leak across chunks.
-      if (slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
+      // Prefill fast path normally keeps scratch buffers allocated and only
+      // replaces mappings. Explicit layer/window cleanup may release buffers.
+      if ((release_buffers || slot_uses_global_scratch_pool(slot)) &&
+          slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
           slot_to_expert_[slot] < 0 && slot_has_buffers(slot)) {
         release_slot_buffers(slot);
       }
@@ -1972,16 +2011,6 @@
     if (!slot_pool_enabled()) return true;
     bool ok = true;
     complete_ready_prefetches();
-    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
-      if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
-      auto& pending = pending_prefetches_[expert_id];
-      if (pending.requests.empty()) {
-        clear_pending_prefetch(expert_id, true);
-        expert_states_[expert_id].store(EXPERT_BASELINE, std::memory_order_release);
-      } else {
-        wait_for_pending_prefetch(expert_id, false);
-      }
-    }
     for (int slot = 0; slot < cache_capacity_; ++slot) {
       const uint8_t state = slot_states_[slot].load(std::memory_order_acquire);
       if (state == SLOT_LOADING) {
@@ -2042,6 +2071,11 @@
       if (state == EXPERT_PREFETCHING) {
         if (timing != nullptr) {
           timing->state_us += elapsed_us(state_start, std::chrono::steady_clock::now());
+        }
+        const auto& pending = pending_prefetches_[expert_id];
+        if (batch->request.wait_mode != mesh::FixedExpertQueueWaitMode::Blocking &&
+            pending.slot_index == slot && !pending.requests.empty()) {
+          return true;
         }
         wait_for_pending_prefetch(expert_id, false);
         continue;
@@ -2164,6 +2198,23 @@
 #endif
   }
 
+  void mark_fixed_queue_pending(mesh::FixedExpertQueueBatch* batch) {
+    if (batch == nullptr || batch->promotions.empty()) return;
+    uint64_t submitted = 0;
+    for (auto& promotion : batch->promotions) {
+      if (promotion.expert_id < 0 || promotion.expert_id >= config_.expert_num) continue;
+      if (promotion.requests.empty()) continue;
+      auto& pending = pending_prefetches_[promotion.expert_id];
+      pending.slot_index = promotion.slot;
+      pending.task_id = 0;
+      pending.requests = std::move(promotion.requests);
+      expert_states_[promotion.expert_id].store(EXPERT_PREFETCHING, std::memory_order_release);
+      mesh::record_cache_async_prefetch(config_);
+      submitted += 1;
+    }
+    mesh::record_cache_prefetch_submit(config_, submitted);
+  }
+
   void wait_and_finalize_fixed_queue(mesh::FixedExpertQueueBatch* batch, const char* label) {
     if (batch == nullptr || batch->request_ids.empty()) return;
     const int timeout_ms = 60000;
@@ -2196,7 +2247,266 @@
     batch->timing.finalize_us += elapsed_us(finalize_start, std::chrono::steady_clock::now());
   }
 
-  int ensure_prefill_static_residents(const std::vector<int>* active_static_experts = nullptr) {
+  void add_prefill_promotion_timing(PrefillPromotionTiming* dst, const PrefillPromotionTiming& src) const {
+    if (dst == nullptr) return;
+    dst->state_us += src.state_us;
+    dst->slot_us += src.slot_us;
+    dst->slot_alloc_us += src.slot_alloc_us;
+    dst->request_build_us += src.request_build_us;
+    dst->reader_submit_us += src.reader_submit_us;
+    dst->reader_total_us += src.reader_total_us;
+    dst->reader_lock_wait_us += src.reader_lock_wait_us;
+    dst->reader_sqe_prep_us += src.reader_sqe_prep_us;
+    dst->reader_bookkeeping_us += src.reader_bookkeeping_us;
+    dst->ring_submit_us += src.ring_submit_us;
+    dst->reader_stats_us += src.reader_stats_us;
+    dst->request_slice_us += src.request_slice_us;
+    dst->queue_wait_us += src.queue_wait_us;
+    dst->finalize_us += src.finalize_us;
+    dst->queue_total_us += src.queue_total_us;
+    dst->promote_calls += src.promote_calls;
+    dst->allocated_slots += src.allocated_slots;
+    dst->reused_slots += src.reused_slots;
+    dst->read_requests += src.read_requests;
+    dst->ring_flushes += src.ring_flushes;
+  }
+
+  int prefill_scratch_begin_slot() const {
+    return std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
+  }
+
+  int prefill_scratch_slot_capacity() const {
+    return std::max(0, cache_capacity_ - prefill_scratch_begin_slot());
+  }
+
+  std::vector<int> prefill_scratch_experts_all() const {
+    std::vector<int> scratch_experts;
+    scratch_experts.reserve(std::max(0, config_.expert_num - prefill_static_slot_count_));
+    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+      if (config_.should_skip_expert(expert_id)) continue;
+      if (expert_id < static_cast<int>(prefill_static_expert_mask_.size()) &&
+          prefill_static_expert_mask_[expert_id] != 0) {
+        continue;
+      }
+      scratch_experts.push_back(expert_id);
+    }
+    return scratch_experts;
+  }
+
+  void rebuild_prefill_scratch_slot_map() const {
+    prefill_scratch_slot_map_.assign(config_.expert_num, -1);
+    const int begin = prefill_scratch_begin_slot();
+    int scratch_rank = 0;
+    for (int candidate = 0; candidate < config_.expert_num; ++candidate) {
+      if (config_.should_skip_expert(candidate)) continue;
+      if (candidate < static_cast<int>(prefill_static_expert_mask_.size()) &&
+          prefill_static_expert_mask_[candidate] != 0) {
+        continue;
+      }
+      const int slot = begin + scratch_rank;
+      prefill_scratch_slot_map_[candidate] = slot < cache_capacity_ ? slot : -1;
+      scratch_rank += 1;
+    }
+    prefill_scratch_slot_map_valid_ = true;
+  }
+
+  int prefill_scratch_slot_for_expert(int expert_id) const {
+    if (expert_id < 0 || expert_id >= config_.expert_num || config_.should_skip_expert(expert_id)) return -1;
+    if (expert_id < static_cast<int>(prefill_static_expert_mask_.size()) &&
+        prefill_static_expert_mask_[expert_id] != 0) {
+      return -1;
+    }
+    if (!prefill_scratch_slot_map_valid_) {
+      rebuild_prefill_scratch_slot_map();
+    }
+    return prefill_scratch_slot_map_[expert_id];
+  }
+
+  void reset_prefill_scratch_preload_metadata() {
+    prefill_scratch_preload_schedule_key_ = std::numeric_limits<int64_t>::min();
+    prefill_scratch_preload_submitted_ = 0;
+    prefill_scratch_preload_candidates_ = 0;
+    last_prefill_scratch_timing_ = PrefillPromotionTiming{};
+  }
+
+  int submit_prefill_scratch_preload(int64_t schedule_key) {
+    const auto queue_start = std::chrono::steady_clock::now();
+    if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || !iouring_enabled() ||
+        cache_capacity_ <= 0) {
+      return 0;
+    }
+    if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) return 0;
+    mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
+    if (prefill_static_capacity_ > 0 && prefill_static_experts_.empty()) {
+      rebuild_prefill_static_expert_set();
+    }
+
+    const std::vector<int> scratch_experts = prefill_scratch_experts_all();
+    const int scratch_slots = prefill_scratch_slot_capacity();
+    if (static_cast<int>(scratch_experts.size()) > scratch_slots) {
+      std::ostringstream oss;
+      oss << "AMX prefill scratch slot plan is undersized layer=" << config_.layer_idx
+          << " tp=" << tp_part_idx
+          << " static_slots=" << prefill_static_slot_count_
+          << " scratch_candidates=" << scratch_experts.size()
+          << " scratch_slots=" << scratch_slots
+          << " capacity=" << cache_capacity_ << resident_debug_summary();
+      throw std::runtime_error(oss.str());
+    }
+
+    if (prefill_scratch_preload_schedule_key_ == schedule_key &&
+        prefill_scratch_preload_candidates_ == static_cast<int>(scratch_experts.size())) {
+      return prefill_scratch_preload_submitted_;
+    }
+
+    if (!release_prefill_scratch_slots(false)) {
+      std::ostringstream oss;
+      oss << "AMX prefill scratch slots are busy before layer preload layer=" << config_.layer_idx
+          << " tp=" << tp_part_idx
+          << " schedule_key=" << schedule_key
+          << " static_slots=" << prefill_static_slot_count_
+          << " scratch_slots=" << scratch_slots
+          << " capacity=" << cache_capacity_ << resident_debug_summary();
+      throw std::runtime_error(oss.str());
+    }
+
+    last_prefill_scratch_timing_ = PrefillPromotionTiming{};
+    mesh::FixedExpertQueueRequest queue_request;
+    queue_request.region = mesh::FixedExpertQueueRegion::PrefillScratch;
+    queue_request.source = ExpertLoadSource::PrefillActive;
+    queue_request.schedule_key = schedule_key;
+    queue_request.slot_begin = prefill_scratch_begin_slot();
+    queue_request.slot_end = cache_capacity_;
+    queue_request.max_to_submit = scratch_slots;
+    queue_request.wait_mode = mesh::FixedExpertQueueWaitMode::Background;
+    mesh::FixedExpertQueueBatch queue_batch(queue_request);
+    queue_batch.reserve_experts(scratch_experts.size());
+
+    try {
+      for (int expert_id : scratch_experts) {
+        const int slot = prefill_scratch_slot_for_expert(expert_id);
+        if (slot < prefill_scratch_begin_slot() || slot >= cache_capacity_) {
+          std::ostringstream oss;
+          oss << "AMX prefill scratch expert has no fixed slot layer=" << config_.layer_idx
+              << " tp=" << tp_part_idx
+              << " expert=" << expert_id
+              << " static_slots=" << prefill_static_slot_count_
+              << " scratch_slots=" << scratch_slots
+              << " capacity=" << cache_capacity_ << resident_debug_summary();
+          throw std::runtime_error(oss.str());
+        }
+        if (!submit_fixed_queue_promotion_to_slot(expert_id, slot, &queue_batch)) {
+          std::ostringstream oss;
+          oss << "AMX prefill scratch preload could not reserve slot layer=" << config_.layer_idx
+              << " tp=" << tp_part_idx
+              << " expert=" << expert_id
+              << " slot=" << slot
+              << " static_slots=" << prefill_static_slot_count_
+              << " scratch_slots=" << scratch_slots
+              << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
+              << " capacity=" << cache_capacity_ << resident_debug_summary();
+          throw std::runtime_error(oss.str());
+        }
+      }
+      submit_fixed_queue_reads(&queue_batch);
+    } catch (...) {
+      // Without this rollback a mid-batch failure leaves earlier experts stuck
+      // in PACKING and their slots stuck in LOADING, permanently wedging this
+      // layer's prefill.
+      rollback_fixed_queue_promotions(&queue_batch);
+      reset_prefill_scratch_preload_metadata();
+      throw;
+    }
+    mark_fixed_queue_pending(&queue_batch);
+    queue_batch.timing.queue_total_us += elapsed_us(queue_start, std::chrono::steady_clock::now());
+    last_prefill_scratch_timing_ = queue_batch.timing;
+    prefill_scratch_preload_schedule_key_ = schedule_key;
+    prefill_scratch_preload_submitted_ = static_cast<int>(queue_batch.submitted_expert_count());
+    prefill_scratch_preload_candidates_ = static_cast<int>(scratch_experts.size());
+
+    if (mesh_prefill_stream_trace_enabled()) {
+      std::fprintf(stderr,
+                   "[MESH_PREFILL_SCRATCH_SUBMIT] layer=%d tp=%d schedule_key=%lld "
+                   "candidates=%d submitted=%d static_slots=%d scratch_slots=%d async=true "
+                   "read_requests=%llu queue_total_us=%llu%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   static_cast<long long>(schedule_key),
+                   prefill_scratch_preload_candidates_,
+                   prefill_scratch_preload_submitted_,
+                   prefill_static_slot_count_,
+                   scratch_slots,
+                   static_cast<unsigned long long>(last_prefill_scratch_timing_.read_requests),
+                   static_cast<unsigned long long>(last_prefill_scratch_timing_.queue_total_us),
+                   resident_debug_summary().c_str());
+    }
+    return prefill_scratch_preload_submitted_;
+  }
+
+  uint64_t wait_for_prefill_scratch_group(const std::vector<int>& group) {
+    if (group.empty()) return 0;
+    const auto wait_start = std::chrono::steady_clock::now();
+    int waited = 0;
+    // Collect every in-flight read id and wait once, instead of paying a
+    // lock/condvar round-trip per expert. Per-expert handling remains only for
+    // scheduler-queued loads and for precise error reporting on failure.
+    std::vector<uint64_t> inflight_request_ids;
+    std::vector<int> inflight_experts;
+    std::vector<int> scheduled_experts;
+    for (int expert_id : group) {
+      if (expert_id < 0 || expert_id >= config_.expert_num) continue;
+      if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
+      const auto& pending = pending_prefetches_[expert_id];
+      if (!pending.requests.empty()) {
+        inflight_request_ids.insert(inflight_request_ids.end(), pending.requests.begin(), pending.requests.end());
+        inflight_experts.push_back(expert_id);
+      } else if (pending.task_id != 0) {
+        scheduled_experts.push_back(expert_id);
+      }
+    }
+    bool batch_ok = inflight_request_ids.empty();
+    if (!batch_ok && iouring_enabled() && config_.async_reader != nullptr) {
+      batch_ok = config_.async_reader->wait_for_requests(inflight_request_ids, 60000);
+    }
+    if (batch_ok) {
+      for (int expert_id : inflight_experts) {
+        mesh::record_cache_prefetch_hit(config_, tp_part_idx, expert_id);
+        finalize_pending_prefetch(expert_id, false);
+        waited += 1;
+      }
+    } else {
+      for (int expert_id : inflight_experts) {
+        if (expert_states_[expert_id].load(std::memory_order_acquire) == EXPERT_PREFETCHING) {
+          wait_for_pending_prefetch(expert_id, false);
+          waited += 1;
+        }
+      }
+    }
+    for (int expert_id : scheduled_experts) {
+      if (expert_states_[expert_id].load(std::memory_order_acquire) == EXPERT_PREFETCHING) {
+        wait_for_pending_prefetch(expert_id, false);
+        waited += 1;
+      }
+    }
+    const uint64_t wait_us = elapsed_us(wait_start, std::chrono::steady_clock::now());
+    if (mesh_prefill_stream_trace_enabled() && waited > 0) {
+      std::fprintf(stderr,
+                   "[MESH_PREFILL_SCRATCH_READY] layer=%d tp=%d schedule_key=%lld "
+                   "active=%zu waited=%d wait_us=%llu%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   static_cast<long long>(current_forward_schedule_key_),
+                   group.size(),
+                   waited,
+                   static_cast<unsigned long long>(wait_us),
+                   resident_debug_summary().c_str());
+    }
+    return wait_us;
+  }
+
+  int ensure_prefill_static_residents(
+      const std::vector<int>* active_static_experts = nullptr,
+      mesh::FixedExpertQueueWaitMode wait_mode = mesh::FixedExpertQueueWaitMode::Blocking) {
     const auto queue_start = std::chrono::steady_clock::now();
     last_prefill_static_timing_ = PrefillPromotionTiming{};
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled() || !iouring_enabled() ||
@@ -2211,16 +2521,10 @@
 
     const std::vector<int>& experts_to_load =
         active_static_experts != nullptr ? *active_static_experts : prefill_static_experts_;
-    mesh::FixedExpertQueueRequest queue_request;
-    queue_request.region = mesh::FixedExpertQueueRegion::PrefillStatic;
-    queue_request.source = ExpertLoadSource::PrefillActive;
-    queue_request.schedule_key = current_forward_schedule_key_;
-    queue_request.slot_begin = 0;
-    queue_request.slot_end = prefill_static_slot_limit();
-    queue_request.max_to_submit = std::min(static_cast<int>(experts_to_load.size()), prefill_static_slot_limit());
-    queue_request.wait_mode = mesh::FixedExpertQueueWaitMode::Blocking;
-    mesh::FixedExpertQueueBatch queue_batch(queue_request);
-    queue_batch.reserve_experts(experts_to_load.size());
+    // Fast path: after the init-time preload the static set is normally fully
+    // resident in its assigned slots. A read-only scan avoids the per-expert
+    // promotion bookkeeping below on the hot per-layer path.
+    bool all_static_ready = true;
     for (int expert_id : experts_to_load) {
       if (expert_id < 0 || expert_id >= config_.expert_num) continue;
       if (active_static_experts != nullptr &&
@@ -2228,35 +2532,73 @@
            prefill_static_expert_mask_[expert_id] == 0)) {
         continue;
       }
-      const int slot = prefill_static_slot_for_expert(expert_id);
-      if (slot < 0 || slot >= prefill_static_slot_limit()) {
-        std::ostringstream oss;
-        oss << "AMX prefill static work expert has no assigned slot layer=" << config_.layer_idx
-            << " tp=" << tp_part_idx << " expert=" << expert_id << " slot=" << slot
-            << " static_capacity=" << prefill_static_capacity_
-            << " static_slots=" << prefill_static_slot_count_
-            << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
-            << " capacity=" << cache_capacity_ << resident_debug_summary();
-        throw std::runtime_error(oss.str());
+      const uint8_t state = expert_states_[expert_id].load(std::memory_order_acquire);
+      if (state != EXPERT_CACHED && state != EXPERT_PINNED) {
+        all_static_ready = false;
+        break;
       }
-      if (!submit_fixed_queue_promotion_to_slot(expert_id, slot, &queue_batch)) {
-        std::ostringstream oss;
-        oss << "AMX prefill static promotion could not reserve slot layer=" << config_.layer_idx
-            << " tp=" << tp_part_idx << " expert=" << expert_id << " slot=" << slot
-            << " static_capacity=" << prefill_static_capacity_
-            << " static_slots=" << prefill_static_slot_count_
-            << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
-            << " capacity=" << cache_capacity_ << resident_debug_summary();
-        throw std::runtime_error(oss.str());
+      const int slot = prefill_static_slot_for_expert(expert_id);
+      const int old_slot = expert_to_slot_[expert_id];
+      if (slot < 0 || slot >= prefill_static_slot_limit() || (old_slot >= 0 && old_slot != slot)) {
+        all_static_ready = false;
+        break;
       }
     }
+    if (all_static_ready) {
+      last_prefill_static_timing_.queue_total_us += elapsed_us(queue_start, std::chrono::steady_clock::now());
+      return static_cast<int>(experts_to_load.size());
+    }
+    mesh::FixedExpertQueueRequest queue_request;
+    queue_request.region = mesh::FixedExpertQueueRegion::PrefillStatic;
+    queue_request.source = ExpertLoadSource::PrefillActive;
+    queue_request.schedule_key = current_forward_schedule_key_;
+    queue_request.slot_begin = 0;
+    queue_request.slot_end = prefill_static_slot_limit();
+    queue_request.max_to_submit = std::min(static_cast<int>(experts_to_load.size()), prefill_static_slot_limit());
+    queue_request.wait_mode = wait_mode;
+    mesh::FixedExpertQueueBatch queue_batch(queue_request);
+    queue_batch.reserve_experts(experts_to_load.size());
     try {
+      for (int expert_id : experts_to_load) {
+        if (expert_id < 0 || expert_id >= config_.expert_num) continue;
+        if (active_static_experts != nullptr &&
+            (expert_id >= static_cast<int>(prefill_static_expert_mask_.size()) ||
+             prefill_static_expert_mask_[expert_id] == 0)) {
+          continue;
+        }
+        const int slot = prefill_static_slot_for_expert(expert_id);
+        if (slot < 0 || slot >= prefill_static_slot_limit()) {
+          std::ostringstream oss;
+          oss << "AMX prefill static work expert has no assigned slot layer=" << config_.layer_idx
+              << " tp=" << tp_part_idx << " expert=" << expert_id << " slot=" << slot
+              << " static_capacity=" << prefill_static_capacity_
+              << " static_slots=" << prefill_static_slot_count_
+              << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
+              << " capacity=" << cache_capacity_ << resident_debug_summary();
+          throw std::runtime_error(oss.str());
+        }
+        if (!submit_fixed_queue_promotion_to_slot(expert_id, slot, &queue_batch)) {
+          std::ostringstream oss;
+          oss << "AMX prefill static promotion could not reserve slot layer=" << config_.layer_idx
+              << " tp=" << tp_part_idx << " expert=" << expert_id << " slot=" << slot
+              << " static_capacity=" << prefill_static_capacity_
+              << " static_slots=" << prefill_static_slot_count_
+              << " resident=" << resident_expert_count_.load(std::memory_order_acquire)
+              << " capacity=" << cache_capacity_ << resident_debug_summary();
+          throw std::runtime_error(oss.str());
+        }
+      }
       submit_fixed_queue_reads(&queue_batch);
     } catch (...) {
+      // Roll back earlier reservations too; see submit_prefill_scratch_preload.
       rollback_fixed_queue_promotions(&queue_batch);
       throw;
     }
-    wait_and_finalize_fixed_queue(&queue_batch, "static");
+    if (wait_mode == mesh::FixedExpertQueueWaitMode::Blocking) {
+      wait_and_finalize_fixed_queue(&queue_batch, "static");
+    } else {
+      mark_fixed_queue_pending(&queue_batch);
+    }
     queue_batch.timing.queue_total_us += elapsed_us(queue_start, std::chrono::steady_clock::now());
     last_prefill_static_timing_ = queue_batch.timing;
     return static_cast<int>(experts_to_load.size());
@@ -2344,16 +2686,46 @@
     current_forward_schedule_key_ = schedule_key;
     mesh_slot_mode_ = MESH_SLOT_PREFILL_LAYER;
     if (!slot_pool_enabled() && !ensure_resident_slot_pool_allocated()) return 0;
-    wait_for_all_pending_prefetches(false);
     if (prefill_static_capacity_ > 0) {
       rebuild_prefill_static_expert_set();
     }
-    return ensure_prefill_static_residents(nullptr);
+    complete_ready_prefetches();
+    const int static_loaded = ensure_prefill_static_residents();
+    const int scratch_submitted = submit_prefill_scratch_preload(schedule_key);
+    if (mesh_prefill_stream_trace_enabled()) {
+      std::fprintf(stderr,
+                   "[MESH_PREFILL_LAYER_PREPARE] layer=%d tp=%d schedule_key=%lld "
+                   "static_loaded=%d scratch_submitted=%d static_slots=%d scratch_slots=%d "
+                   "capacity=%d slot_capacity=%d%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   static_cast<long long>(schedule_key),
+                   static_loaded,
+                   scratch_submitted,
+                   prefill_static_slot_count_,
+                   prefill_scratch_slot_capacity(),
+                   resident_capacity_,
+                   cache_capacity_,
+                   resident_debug_summary().c_str());
+    }
+    return static_loaded + scratch_submitted;
   }
 
   bool release_prefill_layer_window() {
     if (!config_.mesh_prefill_layer_mode_enabled || !resident_io_enabled()) return true;
-    return release_prefill_work_slots();
+    complete_ready_prefetches();
+    for (int expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+      if (expert_states_[expert_id].load(std::memory_order_acquire) != EXPERT_PREFETCHING) continue;
+      auto& pending = pending_prefetches_[expert_id];
+      if (!pending.requests.empty() || pending.task_id != 0) {
+        wait_for_pending_prefetch(expert_id, false);
+      }
+    }
+    const bool ok = release_prefill_scratch_slots(true);
+    if (ok) {
+      reset_prefill_scratch_preload_metadata();
+    }
+    return ok;
   }
 
   bool clear_prefill_work_bindings_for_decode_transition() {
@@ -2376,7 +2748,10 @@
       }
     }
 
-    for (int slot = 0; slot < cache_capacity_; ++slot) {
+    const int scratch_begin = std::max(0, std::min(prefill_static_slot_count_, cache_capacity_));
+    int kept_static = 0;
+    int reusable_scratch = 0;
+    for (int slot = scratch_begin; slot < cache_capacity_; ++slot) {
       const uint8_t state = slot_states_[slot].load(std::memory_order_acquire);
       if (state == SLOT_LOADING) {
         return false;
@@ -2389,6 +2764,18 @@
           slot_to_expert_[slot] < 0 && slot_uses_global_scratch_pool(slot)) {
         release_empty_slot_buffers_if_any(slot);
       }
+      if (slot_states_[slot].load(std::memory_order_acquire) == SLOT_EMPTY &&
+          slot_to_expert_[slot] < 0) {
+        reusable_scratch += 1;
+      }
+    }
+
+    for (int slot = 0; slot < scratch_begin; ++slot) {
+      const int expert_id = slot < static_cast<int>(slot_to_expert_.size()) ? slot_to_expert_[slot] : -1;
+      const uint8_t state = slot_states_[slot].load(std::memory_order_acquire);
+      if (expert_id >= 0 && (state == SLOT_READY || state == SLOT_LOADING)) {
+        kept_static += 1;
+      }
     }
 
     for (auto& pending : pending_prefetches_) {
@@ -2396,9 +2783,23 @@
       pending.task_id = 0;
       pending.requests.clear();
     }
+    reset_prefill_scratch_preload_metadata();
     expert_load_scheduler_.clear_keep_capacity(config_.expert_num);
     resident_policy_.reset(config_.expert_num, config_.resident_cache_policy);
-    clear_prefill_static_work_metadata();
+    if (const char* trace = std::getenv("KT_MESH_PREFILL_HANDOFF_TRACE");
+        trace != nullptr && trace[0] != '\0' && trace[0] != '0') {
+      std::fprintf(stderr,
+                   "[MESH_PREFILL_DECODE_HANDOFF] layer=%d tp=%d kept_static=%d reusable_scratch=%d "
+                   "pending=0 active_readers=0 scratch_begin=%d capacity=%d slot_capacity=%d%s\n",
+                   config_.layer_idx,
+                   tp_part_idx,
+                   kept_static,
+                   reusable_scratch,
+                   scratch_begin,
+                   resident_capacity_,
+                   cache_capacity_,
+                   resident_debug_summary().c_str());
+    }
     return true;
   }
 
@@ -2415,9 +2816,6 @@
       throw std::runtime_error(oss.str());
     }
     mesh_slot_mode_ = MESH_SLOT_DECODE_CACHE;
-    if (requested_decode_capacity > 0) {
-      config_.mesh_decode_resident_experts = requested_decode_capacity;
-    }
     const int target_capacity = decode_cache_capacity();
     int submitted = 0;
     const char* mode = "heat";
@@ -2433,7 +2831,7 @@
         trace != nullptr && trace[0] != '\0' && trace[0] != '0') {
       std::fprintf(stderr,
                    "[MESH_DECODE_TRANSITION] layer=%d tp=%d mode=%s requested=%d target=%d "
-                   "fill_limit=%d submitted=%d resident=%d capacity=%d freq_total=%llu%s\n",
+                   "fill_limit=%d submitted=%d resident=%d capacity=%d slot_capacity=%d freq_total=%llu%s\n",
                    config_.layer_idx,
                    tp_part_idx,
                    mode,
@@ -2442,6 +2840,7 @@
                    fill_limit,
                    submitted,
                    resident_expert_count_.load(std::memory_order_acquire),
+                   resident_capacity_,
                    cache_capacity_,
                    static_cast<unsigned long long>(expert_frequency_total_),
                    resident_debug_summary().c_str());

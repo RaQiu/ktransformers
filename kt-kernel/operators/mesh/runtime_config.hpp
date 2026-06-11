@@ -106,6 +106,10 @@ struct MeshMOEConfigExtension {
   bool mesh_coldstart_prefill_enabled = false;
   int mesh_coldstart_prefill_limit = 0;
   bool mesh_prefill_layer_mode_enabled = false;
+  // Physical slot-pool size. This may exceed max_resident_experts for
+  // layer-mode scratch or early-layer work slots, but it is not the resident
+  // capacity reported as MESH cap.
+  int mesh_slot_capacity = 0;
   int mesh_prefill_static_experts = 0;
   // Rolling Layer Prefetch (RLP): non-default opt-in strategy that pipelines
   // a full per-layer CPU-expert prefetch over `rolling_depth` layers. Driven
