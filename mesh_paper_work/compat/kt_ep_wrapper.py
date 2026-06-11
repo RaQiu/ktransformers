@@ -125,7 +125,9 @@ def _partition_cpu_experts(
 _worker_core_offset_adjusted = False
 
 
-def _maybe_shift_worker_cores(moe_tp_rank: int, moe_tp_size: int, kt_config) -> None:
+def _maybe_shift_worker_cores(
+    moe_tp_rank: int, moe_tp_size: int, cpuinfer_threads: int, threadpool_count: int
+) -> None:
     """Spread each rank's CPUInfer workers onto disjoint core ranges.
 
     kt-kernel's worker_pool.cpp binds subpool thread i to core
@@ -160,8 +162,8 @@ def _maybe_shift_worker_cores(moe_tp_rank: int, moe_tp_size: int, kt_config) -> 
             )
             return
     else:
-        pools = max(1, int(kt_config.threadpool_count or 1))
-        stride = max(1, int(kt_config.cpuinfer_threads) // pools)
+        pools = max(1, int(threadpool_count or 1))
+        stride = max(1, int(cpuinfer_threads) // pools)
     if stride <= 0:
         return
 
@@ -180,6 +182,35 @@ def _maybe_shift_worker_cores(moe_tp_rank: int, moe_tp_size: int, kt_config) -> 
         shifted,
         stride,
     )
+
+
+def _cpuinfer_threads_for_rank(
+    total_threads: int, threadpool_count: int, moe_tp_rank: int, moe_tp_size: int
+) -> int:
+    """Keep CPUInfer's thread budget global when CPU experts are rank-sharded."""
+    if moe_tp_size <= 1:
+        return total_threads
+    if os.environ.get("KT_CPU_EXPERT_PARALLEL", "1") in ("0", "false", "False"):
+        return total_threads
+    if os.environ.get("KT_CPU_EXPERT_PARALLEL_SPLIT_THREADS", "1") in (
+        "0",
+        "false",
+        "False",
+    ):
+        return total_threads
+
+    try:
+        from kt_kernel.utils.mesh.gpu_expert_placement import split_capacity_for_rank
+    except ImportError:
+
+        def split_capacity_for_rank(total: int, rank: int, world_size: int) -> int:
+            base, rem = divmod(total, world_size)
+            return max(1, base + (1 if rank < rem else 0))
+
+    pools = max(1, int(threadpool_count or 1))
+    # WorkerPool divides total threads by subpool count. Keep at least one
+    # thread per subpool so a rank never silently creates an empty NUMA pool.
+    return max(pools, split_capacity_for_rank(total_threads, moe_tp_rank, moe_tp_size))
 
 
 _resident_caps_adjusted = False
@@ -526,16 +557,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             not_mine = sorted(set(cpu_expert_ids) - set(my_cpu_experts))
             if not_mine:
                 skip_mask[torch.tensor(not_mine, dtype=torch.long)] = True
-            _maybe_shift_worker_cores(moe_tp_rank, moe_tp_size, self.kt_config)
+            local_cpuinfer_threads = _cpuinfer_threads_for_rank(
+                self.kt_config.cpuinfer_threads,
+                self.kt_config.threadpool_count,
+                moe_tp_rank,
+                moe_tp_size,
+            )
+            _maybe_shift_worker_cores(
+                moe_tp_rank,
+                moe_tp_size,
+                local_cpuinfer_threads,
+                self.kt_config.threadpool_count,
+            )
             _maybe_split_resident_caps(moe_tp_rank, moe_tp_size)
             if self.kt_config.layer_idx == 0:
                 logger.info(
                     "KT CPU expert parallel: moe-TP rank %d/%d owns %d of %d "
-                    "CPU experts per layer",
+                    "CPU experts per layer; CPUInfer threads %d of %d",
                     moe_tp_rank,
                     moe_tp_size,
                     len(my_cpu_experts),
                     len(cpu_expert_ids),
+                    local_cpuinfer_threads,
+                    self.kt_config.cpuinfer_threads,
                 )
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
@@ -544,7 +588,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
                 gpu_experts_mask=skip_mask,
-                cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                cpuinfer_threads=local_cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
