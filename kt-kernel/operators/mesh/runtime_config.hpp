@@ -111,6 +111,11 @@ struct MeshMOEConfigExtension {
   // capacity reported as MESH cap.
   int mesh_slot_capacity = 0;
   int mesh_prefill_static_experts = 0;
+  // Early-layer "full" residency target, applied during DECODE (not prefill).
+  // Python sets this to the ratio'd _mesh_early_layer_slot_capacity() for the
+  // first few layers (0 otherwise / when not IOURING), which preserves the
+  // KT_MESH_EARLY_LAYER_SLOT_RATIO knob. Consumed by decode_cache_capacity().
+  int mesh_early_layer_resident_experts = 0;
   // Rolling Layer Prefetch (RLP): non-default opt-in strategy that pipelines
   // a full per-layer CPU-expert prefetch over `rolling_depth` layers. Driven
   // by KT_MESH_PREFILL_ROLLING / KT_MESH_PREFILL_ROLLING_DEPTH; ignored when

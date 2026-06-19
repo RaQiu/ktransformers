@@ -232,10 +232,11 @@ def _mesh_slot_pool_capacity(self) -> int:
 def _mesh_prefill_static_resident_capacity(self) -> int:
     if not self._mesh_prefill_layer_mode_enabled():
         return 0
-    configured = self._mesh_config_resident_experts()
-    if int(self.layer_idx) < 5:
-        configured = max(configured, self._mesh_early_layer_slot_capacity())
-    return configured
+    # Early-layer "full" residency belongs to DECODE, not prefill: during prefill
+    # every layer keeps the configured cap (overflow flows through the shared
+    # temporal region). decode_cache_capacity() grants the first layers the full
+    # set via mesh_early_layer_resident_experts (the ratio'd early-layer cap).
+    return self._mesh_config_resident_experts()
 
 
 def _mesh_config_resident_experts(self) -> int:

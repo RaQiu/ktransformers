@@ -121,6 +121,10 @@ def apply_mesh_moe_config(wrapper, moe_config, *, use_iouring: bool, file_slots=
         moe_config.mesh_prefill_layer_mode_enabled = wrapper._mesh_prefill_layer_mode_enabled()
     if hasattr(moe_config, "mesh_prefill_static_experts"):
         moe_config.mesh_prefill_static_experts = wrapper._mesh_prefill_static_resident_capacity()
+    if hasattr(moe_config, "mesh_early_layer_resident_experts"):
+        # Early-layer "full" residency now lives in DECODE, not prefill. This is
+        # the ratio'd early-layer cap (0 for later layers / non-IOURING).
+        moe_config.mesh_early_layer_resident_experts = wrapper._mesh_early_layer_slot_capacity()
     if hasattr(moe_config, "mesh_prefill_rolling_enabled"):
         moe_config.mesh_prefill_rolling_enabled = wrapper._mesh_prefill_rolling_enabled()
     if hasattr(moe_config, "mesh_prefill_rolling_depth"):

@@ -31,7 +31,16 @@ inline int cpu_managed_expert_count(const GeneralMOEConfig& config) {
 
 inline int decode_cache_capacity(const GeneralMOEConfig& config, int resident_capacity) {
   if (resident_capacity <= 0) return 0;
-  return std::min(cpu_managed_expert_count(config), std::min(config.expert_num, resident_capacity));
+  int target = resident_capacity;
+  // Early-layer "full" residency lives in decode (not prefill). Python sets
+  // mesh_early_layer_resident_experts to the ratio'd early-layer capacity for
+  // the first layers (0 otherwise / non-IOURING), preserving the
+  // KT_MESH_EARLY_LAYER_SLOT_RATIO knob. Every caller still clamps the result
+  // to cache_capacity_ via min(..., cache_capacity_).
+  if (config.mesh_early_layer_resident_experts > target) {
+    target = config.mesh_early_layer_resident_experts;
+  }
+  return std::min(cpu_managed_expert_count(config), std::min(config.expert_num, target));
 }
 
 inline ResidentCapacityPlan build_resident_capacity_plan(const GeneralMOEConfig& config) {

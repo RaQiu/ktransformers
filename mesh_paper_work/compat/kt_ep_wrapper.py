@@ -8,6 +8,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -34,6 +35,58 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+_SHARED_STAGING_BUFFER = None
+
+
+class SharedStagingBuffer:
+    """Single per-process GPU buffer reused by all MoE layers for CPU input."""
+
+    def __init__(
+        self,
+        max_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.max_tokens = max_tokens
+        self.hidden_size = hidden_size
+        self.buffer = torch.empty(
+            (max_tokens, hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        buffer_size_mb = self.buffer.numel() * self.buffer.element_size() / 1024**2
+        logger.info(
+            "[KT] Created shared staging buffer: %.1f MiB (shape=%s, dtype=%s)",
+            buffer_size_mb,
+            tuple(self.buffer.shape),
+            dtype,
+        )
+
+    def get_slice(self, num_tokens: int) -> torch.Tensor:
+        assert num_tokens <= self.max_tokens, (
+            f"Batch size {num_tokens} exceeds staging buffer max size "
+            f"{self.max_tokens}"
+        )
+        return self.buffer[:num_tokens]
+
+
+def get_or_create_shared_staging_buffer(
+    max_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> SharedStagingBuffer:
+    global _SHARED_STAGING_BUFFER
+    if _SHARED_STAGING_BUFFER is None:
+        _SHARED_STAGING_BUFFER = SharedStagingBuffer(
+            max_tokens=max_tokens,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+    return _SHARED_STAGING_BUFFER
 
 
 def _select_gpu_expert_ids(
@@ -216,6 +269,38 @@ def _cpuinfer_threads_for_rank(
 _resident_caps_adjusted = False
 
 
+def derive_global_pool_capacity(
+    *,
+    cpu_experts_per_layer_per_rank: int,
+    resident_cap_per_rank: int,
+    moe_tp_size: int,
+    layer_window: int,
+    rolling_depth: int,
+    safety: float = 1.25,
+    headroom: int = 128,
+) -> int:
+    """Derive a machine-wide KT_MESH_GLOBAL_POOL_CAPACITY from model geometry.
+
+    The global scratch pool only backs the *scratch* slots (slot index >=
+    global_scratch_pool_begin_slot). Static/resident slots use their own
+    per-layer numa_alloc and never borrow from the pool, so the pool's peak
+    demand scales with the number of layers concurrently in flight during
+    layer-major prefill (the prefill window), NOT with the total layer count.
+    Sizing by total layers (the old 8960 = 60*149 heuristic) double-counts the
+    per-layer residents into the pool and overshoots ~8x.
+
+    Returns the machine-wide total; the caller hands it to the existing per-rank
+    split (split_capacity_for_rank), which divides it back to per-rank.
+    """
+    concurrency = layer_window if layer_window > 0 else (rolling_depth if rolling_depth > 0 else 2)
+    per_layer_scratch = max(0, int(cpu_experts_per_layer_per_rank) - max(0, int(resident_cap_per_rank)))
+    pool_per_rank = math.ceil(concurrency * per_layer_scratch * safety) + headroom
+    # Floor: must hold at least a double-buffer (one layer loading while one is
+    # in use); below this the steady state thrashes back to per-layer numa_alloc.
+    pool_per_rank = max(pool_per_rank, 2 * per_layer_scratch + headroom)
+    return int(pool_per_rank) * max(1, int(moe_tp_size))
+
+
 def _maybe_split_resident_caps(moe_tp_rank: int, moe_tp_size: int) -> None:
     """Divide process-wide resident-expert caps across moe-TP ranks.
 
@@ -378,6 +463,21 @@ def remap_gpu_expert_ids(
     return torch.where(valid, gpu_local_id_table[safe_ids], -1)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_and_remap_expert_ids(
+    topk_ids: torch.Tensor,
+    gpu_experts_mask: torch.Tensor,
+    logical_to_gpu_index: torch.Tensor,
+) -> torch.Tensor:
+    """Mask CPU expert ids and map GPU global ids to GE-local slots."""
+    num_experts = gpu_experts_mask.shape[0]
+    valid = (topk_ids >= 0) & (topk_ids < num_experts)
+    safe_ids = topk_ids.clamp(0, num_experts - 1)
+    is_gpu_expert = valid & gpu_experts_mask[safe_ids]
+    local_ids = logical_to_gpu_index[safe_ids].to(dtype=topk_ids.dtype)
+    return torch.where(is_gpu_expert, local_ids, -1)
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
@@ -435,6 +535,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._gpu_local_slot_by_global: Optional[Dict[int, int]] = None
         # Lazy per-(device, dtype) lookup tables for remap_gpu_expert_ids.
         self._gpu_local_id_tables: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
+        self.gpu_experts_mask_cuda: Optional[torch.Tensor] = None
+        self.logical_to_gpu_index_cuda: Optional[torch.Tensor] = None
+
+        # CPUInfer submit/sync uses a separate CUDA stream and a shared staging
+        # buffer so D2H handoff does not serialize the main GPU MoE stream.
+        self._cpu_stream: Optional[torch.cuda.Stream] = None
+        self._sync_done_event: Optional[torch.cuda.Event] = None
+        self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
+        self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
 
         # Store parameters needed for KT initialization
         self._layer_params = None
@@ -524,6 +633,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs,
         )
 
+        target_device = next(layer.parameters()).device
+        self.gpu_experts_mask_cuda = gpu_experts_mask.to(device=target_device)
+        self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(
+            device=target_device
+        )
+
         # 2. Initialize the KT/MESH CPU expert backend.
         # GPU experts run as intermediate-dim TP shards on every rank; CPU
         # experts are instead partitioned ACROSS moe-TP ranks: each rank owns
@@ -551,6 +666,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
 
         if my_cpu_experts:
+            self._cpu_stream = torch.cuda.Stream(device=target_device)
+            self._sync_done_event = torch.cuda.Event()
+            self._shared_staging_buffer = get_or_create_shared_staging_buffer(
+                max_tokens=self._staging_buffer_max_size,
+                hidden_size=hidden_size,
+                dtype=params_dtype,
+                device=target_device,
+            )
+
             # The mask handed to kt-kernel means "skip this expert": GPU
             # experts plus every CPU expert owned by another rank.
             skip_mask = gpu_experts_mask.clone()
@@ -569,6 +693,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 local_cpuinfer_threads,
                 self.kt_config.threadpool_count,
             )
+            # Resolve KT_MESH_GLOBAL_POOL_CAPACITY="auto" (or unset/0/-1) to a
+            # geometry-derived total BEFORE the per-rank split runs. Idempotent
+            # across layers: once layer 0 writes a concrete int, later layers
+            # see a positive int and skip. Explicit positive ints pass through
+            # untouched (backward compatible).
+            _pool_raw = os.environ.get("KT_MESH_GLOBAL_POOL_CAPACITY", "").strip().lower()
+            if _pool_raw in ("", "auto", "none", "0", "-1"):
+                _res_raw = os.environ.get("KT_MAX_RESIDENT_EXPERTS", "").strip()
+                _res_per_rank = (int(_res_raw) // max(1, moe_tp_size)) if _res_raw.isdigit() else 0
+                _rolling_on = os.environ.get("KT_MESH_PREFILL_ROLLING", "0") not in (
+                    "0", "", "false", "False", "no", "No",
+                )
+                _pool_total = derive_global_pool_capacity(
+                    cpu_experts_per_layer_per_rank=len(my_cpu_experts),
+                    resident_cap_per_rank=_res_per_rank,
+                    moe_tp_size=moe_tp_size,
+                    layer_window=int(os.environ.get("KT_MESH_PREFILL_LAYER_WINDOW", "0") or 0),
+                    rolling_depth=(int(os.environ.get("KT_MESH_PREFILL_ROLLING_DEPTH", "10") or 10)
+                                   if _rolling_on else 0),
+                )
+                os.environ["KT_MESH_GLOBAL_POOL_CAPACITY"] = str(_pool_total)
+                if self.kt_config.layer_idx == 0:
+                    logger.info(
+                        "KT MESH pool auto-derived total=%d (window=%s cpu/rank=%d "
+                        "res/rank=%d tp=%d)",
+                        _pool_total,
+                        os.environ.get("KT_MESH_PREFILL_LAYER_WINDOW", "0"),
+                        len(my_cpu_experts),
+                        _res_per_rank,
+                        moe_tp_size,
+                    )
             _maybe_split_resident_caps(moe_tp_rank, moe_tp_size)
             if self.kt_config.layer_idx == 0:
                 logger.info(
@@ -650,6 +805,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
+        hidden_states: Optional[torch.Tensor] = None,
     ) -> None:
         """Submit CPU expert computation asynchronously (non-blocking).
 
@@ -667,7 +823,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.wrapper is None:
             return
 
-        x = dispatch_output.hidden_states
+        x = hidden_states if hidden_states is not None else dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
@@ -751,10 +907,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        # Step 1: Submit this rank's CPU expert computation (non-blocking).
-        # Each moe-TP rank owns a disjoint CPU expert subset; ranks without a
-        # wrapper (no CPU experts assigned) contribute GPU shards only.
-        if self.wrapper is not None:
+        # Step 1: stage input and submit this rank's CPU expert computation on
+        # a side stream. The staging buffer decouples CPUInfer's D2H handoff
+        # from the main stream that launches GPU MoE kernels.
+        staging_buffer = None
+        if self.wrapper is not None and self._cpu_stream is not None:
+            assert self._shared_staging_buffer is not None
+            staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
+            staging_buffer.copy_(x, non_blocking=True)
+
+            self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+            with torch.cuda.stream(self._cpu_stream):
+                self.submit(layer, dispatch_output, hidden_states=staging_buffer)
+        elif self.wrapper is not None:
             self.submit(layer, dispatch_output)
 
         # Step 2: Prepare GPU computation by translating topk ids for the GPU kernel
@@ -762,9 +927,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # frequency-based placement, GPU-resident IDs are additionally remapped
         # from global expert IDs to their local weight slots.
         topk_ids = topk_output.topk_ids
-        if self._gpu_local_slot_by_global is not None:
-            masked_topk_ids = remap_gpu_expert_ids(
-                topk_ids, self._gpu_local_id_table(topk_ids)
+        if (
+            self.gpu_experts_mask_cuda is not None
+            and self.logical_to_gpu_index_cuda is not None
+        ):
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
             )
         else:
             masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
@@ -783,7 +951,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # partial output. Expert subsets are disjoint across ranks, so the
         # post-MoE all-reduce sums each CPU expert's output exactly once.
         output = gpu_combine_input.hidden_states
-        if self.wrapper is not None:
+        if (
+            self.wrapper is not None
+            and staging_buffer is not None
+            and self._cpu_stream is not None
+            and self._sync_done_event is not None
+        ):
+            with torch.cuda.stream(self._cpu_stream):
+                cpu_output = self.sync(staging_buffer)
+                self._sync_done_event.record(self._cpu_stream)
+            torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            output = output + cpu_output
+        elif self.wrapper is not None:
             cpu_output = self.sync(x)
             output = output + cpu_output
 

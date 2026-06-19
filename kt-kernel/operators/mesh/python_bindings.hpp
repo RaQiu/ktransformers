@@ -544,6 +544,7 @@ void bind_moe_config_extension(PyClass& cls) {
       .def_readwrite("mesh_prefill_layer_mode_enabled", &GeneralMOEConfig::mesh_prefill_layer_mode_enabled)
       .def_readwrite("mesh_slot_capacity", &GeneralMOEConfig::mesh_slot_capacity)
       .def_readwrite("mesh_prefill_static_experts", &GeneralMOEConfig::mesh_prefill_static_experts)
+      .def_readwrite("mesh_early_layer_resident_experts", &GeneralMOEConfig::mesh_early_layer_resident_experts)
       .def_readwrite("mesh_prefill_rolling_enabled", &GeneralMOEConfig::mesh_prefill_rolling_enabled)
       .def_readwrite("mesh_prefill_rolling_depth", &GeneralMOEConfig::mesh_prefill_rolling_depth)
       .def_readwrite("mesh_decode_resident_experts", &GeneralMOEConfig::mesh_decode_resident_experts)
